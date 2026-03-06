@@ -1,0 +1,263 @@
+"""SIP call management — outbound/inbound calls, DTMF, hold/unhold."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Any
+
+import pjsua2 as pj
+
+from .sip_engine import SipEngine
+from .account_manager import AccountManager
+
+log = logging.getLogger(__name__)
+
+
+class SipCall(pj.Call):
+    """PJSUA2 Call subclass with state and media callbacks."""
+
+    def __init__(self, account: pj.Account, call_id: int = pj.PJSUA_INVALID_ID) -> None:
+        super().__init__(account, call_id)
+        self._lock = threading.Lock()
+        self._info: dict[str, Any] = {
+            "state": "NONE",
+            "state_text": "",
+            "remote_uri": "",
+            "last_status": 0,
+            "last_status_text": "",
+            "duration": 0,
+            "codec": "",
+        }
+
+    def onCallState(self, prm: pj.OnCallStateParam) -> None:
+        ci = self.getInfo()
+        with self._lock:
+            self._info.update({
+                "state": _call_state_name(ci.state),
+                "state_text": ci.stateText,
+                "remote_uri": ci.remoteUri,
+                "last_status": ci.lastStatusCode,
+                "last_status_text": ci.lastReason,
+                "duration": ci.connectDuration.sec,
+            })
+        log.info(
+            "Call %d state: %s (%s) remote=%s",
+            ci.id, ci.stateText, _call_state_name(ci.state), ci.remoteUri,
+        )
+
+    def onCallMediaState(self, prm: pj.OnCallMediaStateParam) -> None:
+        ci = self.getInfo()
+        for i, mi in enumerate(ci.media):
+            if mi.type == pj.PJMEDIA_TYPE_AUDIO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
+                aud_med = self.getAudioMedia(i)
+                # Connect to null audio device (no actual audio in headless Docker)
+                try:
+                    ep = pj.Endpoint.instance()
+                    ep.audDevManager().getCaptureDevMedia().startTransmit(aud_med)
+                    aud_med.startTransmit(ep.audDevManager().getPlaybackDevMedia())
+                except Exception:
+                    log.exception("Error connecting audio media for call %d", ci.id)
+
+                # Try to get codec info
+                try:
+                    si = self.getStreamInfo(i)
+                    with self._lock:
+                        self._info["codec"] = si.codecName
+                except Exception:
+                    pass
+        log.info("Call %d media state updated", ci.id)
+
+    def get_cached_info(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._info)
+
+
+def _call_state_name(state: int) -> str:
+    names = {
+        pj.PJSIP_INV_STATE_NULL: "NULL",
+        pj.PJSIP_INV_STATE_CALLING: "CALLING",
+        pj.PJSIP_INV_STATE_INCOMING: "INCOMING",
+        pj.PJSIP_INV_STATE_EARLY: "EARLY",
+        pj.PJSIP_INV_STATE_CONNECTING: "CONNECTING",
+        pj.PJSIP_INV_STATE_CONFIRMED: "CONFIRMED",
+        pj.PJSIP_INV_STATE_DISCONNECTED: "DISCONNECTED",
+    }
+    return names.get(state, f"UNKNOWN({state})")
+
+
+class CallManager:
+    """High-level call operations."""
+
+    def __init__(self, engine: SipEngine, account_mgr: AccountManager) -> None:
+        self._engine = engine
+        self._account_mgr = account_mgr
+        self._calls: dict[int, SipCall] = {}
+        self._incoming_queue: list[int] = []
+        self._lock = threading.Lock()
+
+        # Wire up incoming call callback
+        # This will be set when account is created
+        self._setup_incoming_handler()
+
+    def _setup_incoming_handler(self) -> None:
+        """Set up the incoming call callback on the account."""
+        acc = self._account_mgr.account
+        if acc:
+            acc.on_incoming_call_cb = self._on_incoming_call
+
+    def _on_incoming_call(self, call_id: int) -> None:
+        """Handle incoming call from account callback."""
+        acc = self._account_mgr.account
+        if not acc:
+            return
+        call = SipCall(acc, call_id)
+        with self._lock:
+            self._calls[call_id] = call
+            self._incoming_queue.append(call_id)
+        log.info("Incoming call %d queued", call_id)
+
+    def _ensure_incoming_handler(self) -> None:
+        """Ensure incoming call handler is connected to current account."""
+        acc = self._account_mgr.account
+        if acc and acc.on_incoming_call_cb is None:
+            acc.on_incoming_call_cb = self._on_incoming_call
+
+    def make_call(
+        self,
+        dest_uri: str,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Place an outbound call."""
+        self._ensure_incoming_handler()
+        acc = self._account_mgr.account
+        if not acc or not acc.isValid():
+            raise RuntimeError("No valid account — register first")
+
+        call = SipCall(acc)
+        prm = pj.CallOpParam(True)  # True = use default call settings
+
+        # Add custom headers
+        if headers:
+            sip_headers = pj.SipHeaderVector()
+            for name, value in headers.items():
+                hdr = pj.SipHeader()
+                hdr.hName = name
+                hdr.hValue = value
+                sip_headers.append(hdr)
+            prm.txOption.headers = sip_headers
+
+        call.makeCall(dest_uri, prm)
+        ci = call.getInfo()
+        call_id = ci.id
+
+        with self._lock:
+            self._calls[call_id] = call
+
+        log.info("Outbound call %d to %s", call_id, dest_uri)
+        return {"call_id": call_id, "state": _call_state_name(ci.state)}
+
+    def answer_call(
+        self,
+        call_id: int | None = None,
+        status_code: int = 200,
+    ) -> dict[str, Any]:
+        """Answer an incoming call."""
+        self._ensure_incoming_handler()
+        call = self._get_call(call_id, from_incoming=True)
+        prm = pj.CallOpParam()
+        prm.statusCode = status_code
+        call.answer(prm)
+        ci = call.getInfo()
+        return {"call_id": ci.id, "state": _call_state_name(ci.state)}
+
+    def hangup(self, call_id: int | None = None) -> None:
+        """Hang up a call."""
+        call = self._get_call(call_id)
+        prm = pj.CallOpParam()
+        prm.statusCode = 603  # Decline
+        try:
+            call.hangup(prm)
+        except pj.Error:
+            log.debug("Call already disconnected")
+
+    def hangup_all(self) -> None:
+        """Hang up all active calls (cleanup)."""
+        with self._lock:
+            calls = list(self._calls.values())
+        for call in calls:
+            try:
+                if call.isActive():
+                    prm = pj.CallOpParam()
+                    prm.statusCode = 603
+                    call.hangup(prm)
+            except Exception:
+                log.debug("Error hanging up call during cleanup")
+
+    def get_call_info(self, call_id: int | None = None) -> dict[str, Any]:
+        """Get info about a call."""
+        call = self._get_call(call_id)
+        info = call.get_cached_info()
+        # Also try to get fresh info
+        try:
+            ci = call.getInfo()
+            info["call_id"] = ci.id
+            info["state"] = _call_state_name(ci.state)
+            info["duration"] = ci.connectDuration.sec
+        except Exception:
+            pass
+        return info
+
+    def send_dtmf(self, call_id: int, digits: str) -> None:
+        """Send DTMF digits on a call."""
+        call = self._get_call_by_id(call_id)
+        prm = pj.CallOpParam()
+        for digit in digits:
+            try:
+                call.dialDtmf(digit)
+            except (pj.Error, AttributeError):
+                # Fallback to INFO method
+                dparam = pj.CallSendDtmfParam()
+                dparam.digits = digit
+                dparam.method = pj.PJSUA_DTMF_METHOD_SIP_INFO
+                call.sendDtmf(dparam)
+
+    def hold(self, call_id: int) -> None:
+        """Put a call on hold."""
+        call = self._get_call_by_id(call_id)
+        prm = pj.CallOpParam()
+        call.setHold(prm)
+
+    def unhold(self, call_id: int) -> None:
+        """Resume a held call."""
+        call = self._get_call_by_id(call_id)
+        prm = pj.CallOpParam()
+        prm.flag = pj.PJSUA_CALL_UNHOLD
+        call.reinvite(prm)
+
+    def _get_call(self, call_id: int | None = None, from_incoming: bool = False) -> SipCall:
+        """Get a call by ID, or the current active/incoming call."""
+        if call_id is not None:
+            return self._get_call_by_id(call_id)
+
+        with self._lock:
+            if from_incoming and self._incoming_queue:
+                cid = self._incoming_queue.pop(0)
+                if cid in self._calls:
+                    return self._calls[cid]
+
+            # Return any active call
+            for call in self._calls.values():
+                try:
+                    if call.isActive():
+                        return call
+                except Exception:
+                    continue
+
+        raise RuntimeError("No active call found")
+
+    def _get_call_by_id(self, call_id: int) -> SipCall:
+        with self._lock:
+            if call_id in self._calls:
+                return self._calls[call_id]
+        raise RuntimeError(f"Call {call_id} not found")

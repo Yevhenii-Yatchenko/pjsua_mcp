@@ -1,0 +1,124 @@
+"""PJSUA2 Endpoint lifecycle, transport, and event loop management."""
+
+from __future__ import annotations
+
+import logging
+import threading
+
+import pjsua2 as pj
+
+from .sip_logger import SipLogWriter
+
+log = logging.getLogger(__name__)
+
+TRANSPORT_MAP = {
+    "udp": pj.PJSIP_TRANSPORT_UDP,
+    "tcp": pj.PJSIP_TRANSPORT_TCP,
+    "tls": pj.PJSIP_TRANSPORT_TLS,
+}
+
+
+class SipEngine:
+    """Manages the PJSUA2 Endpoint singleton."""
+
+    def __init__(self) -> None:
+        self._ep: pj.Endpoint | None = None
+        self._log_writer: SipLogWriter | None = None
+        self._transport_id: int | None = None
+        self._initialized = False
+        self._lock = threading.Lock()
+
+    @property
+    def ep(self) -> pj.Endpoint:
+        assert self._ep is not None, "Endpoint not initialized — call initialize() first"
+        return self._ep
+
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
+
+    def initialize(self, transport: str = "udp", local_port: int = 0) -> int:
+        """Create Endpoint, configure logging, create transport.
+
+        Returns the transport ID.
+        """
+        if self._initialized:
+            raise RuntimeError("SIP engine already initialized")
+
+        transport = transport.lower()
+        if transport not in TRANSPORT_MAP:
+            raise ValueError(f"Unsupported transport: {transport!r} (use udp/tcp/tls)")
+
+        ep = pj.Endpoint()
+        ep.libCreate()
+
+        # Endpoint config
+        ep_cfg = pj.EpConfig()
+
+        # Logging: capture everything via LogWriter.
+        # consoleLevel must match level — pjsua_start() calls pj_log_set_level(consoleLevel)
+        # which sets the GLOBAL log level, suppressing the writer too if set to 0.
+        # C-level stdout is redirected to stderr in server.py so console output is safe.
+        self._log_writer = SipLogWriter()
+        ep_cfg.logConfig.level = 5
+        ep_cfg.logConfig.consoleLevel = 5
+        ep_cfg.logConfig.writer = self._log_writer
+
+        # Threading: 0 internal threads — we poll manually for Python safety
+        ep_cfg.uaConfig.threadCnt = 0
+        ep_cfg.uaConfig.mainThreadOnly = True
+
+        ep.libInit(ep_cfg)
+
+        # Null audio device — headless Docker, no sound card
+        ep.audDevManager().setNullDev()
+
+        # Create transport
+        tp_cfg = pj.TransportConfig()
+        tp_cfg.port = local_port
+
+        tp_type = TRANSPORT_MAP[transport]
+        self._transport_id = ep.transportCreate(tp_type, tp_cfg)
+
+        # Start library
+        ep.libStart()
+
+        self._ep = ep
+        self._initialized = True
+        log.info("SIP engine initialized (transport=%s, port=%d)", transport, local_port)
+        return self._transport_id
+
+    def handle_events(self, msec_timeout: int = 50) -> None:
+        """Poll PJSUA2 event loop. Called from executor thread."""
+        if self._ep and self._initialized:
+            self._register_thread()
+            self._ep.libHandleEvents(msec_timeout)
+
+    def register_current_thread(self) -> None:
+        """Register the calling thread with pjlib (for external threads)."""
+        self._register_thread()
+
+    def _register_thread(self) -> None:
+        """Register current thread with pjlib if not already registered."""
+        if self._ep and not self._ep.libIsThreadRegistered():
+            self._ep.libRegisterThread(threading.current_thread().name)
+
+    def get_log_entries(
+        self,
+        last_n: int | None = None,
+        filter_text: str | None = None,
+    ) -> list[dict]:
+        if self._log_writer is None:
+            return []
+        return self._log_writer.get_entries(last_n=last_n, filter_text=filter_text)
+
+    def shutdown(self) -> None:
+        """Graceful teardown of the PJSUA2 library."""
+        if self._ep and self._initialized:
+            log.info("Destroying PJSUA2 library")
+            try:
+                self._ep.libDestroy()
+            except Exception:
+                log.exception("Error during libDestroy")
+            self._ep = None
+            self._initialized = False

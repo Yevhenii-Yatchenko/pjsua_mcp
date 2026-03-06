@@ -1,0 +1,10 @@
+services:
+  pjsua-mcp:
+    build: .
+    network_mode: host
+    stdin_open: true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ./captures:/captures

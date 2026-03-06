@@ -1,0 +1,40 @@
+# Self-contained integration tests: Asterisk PBX + PJSUA MCP test runner.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml run --build --rm test-runner
+#
+# Asterisk provides two SIP extensions (6001, 6002).
+# The test runner spawns two MCP server subprocesses that register as
+# 6001 and 6002, then exercises call flows between them.
+
+services:
+  asterisk:
+    build:
+      context: tests/asterisk
+    networks:
+      - sipnet
+    healthcheck:
+      test: ["CMD-SHELL", "asterisk -rx 'core waitfullybooted'"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  test-runner:
+    build: .
+    entrypoint: pytest
+    command: ["tests/test_integration.py", "-v", "-x", "--tb=short"]
+    depends_on:
+      asterisk:
+        condition: service_healthy
+    networks:
+      - sipnet
+    environment:
+      - SIP_DOMAIN=asterisk
+      - SIP_USER_A=6001
+      - SIP_PASS_A=test123
+      - SIP_USER_B=6002
+      - SIP_PASS_B=test123
+
+networks:
+  sipnet:

@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "integration: requires a live SIP registrar (deselect with '-m not integration')",
+]

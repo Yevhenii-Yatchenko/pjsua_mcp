@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pjsua": {
+      "command": "docker",
+      "args": ["compose", "run", "--rm", "-i", "pjsua-mcp"]
+    }
+  }
+}
