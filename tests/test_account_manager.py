@@ -64,3 +64,47 @@ class TestRegisterGuards:
         mgr = AccountManager(engine)
         with pytest.raises(RuntimeError, match="not configured"):
             mgr.register()
+
+
+class TestMessageQueue:
+    def test_get_messages_no_account(self):
+        engine = SipEngine()
+        mgr = AccountManager(engine)
+        assert mgr.get_messages() == []
+
+    def test_get_messages_no_account_last_n(self):
+        engine = SipEngine()
+        mgr = AccountManager(engine)
+        assert mgr.get_messages(last_n=5) == []
+
+    def test_send_message_no_account_raises(self):
+        engine = SipEngine()
+        mgr = AccountManager(engine)
+        with pytest.raises(RuntimeError, match="register first"):
+            mgr.send_message("sip:bob@example.com", "hello")
+
+    def test_sip_account_message_queue_empty_on_init(self):
+        from src.account_manager import SipAccount
+        acc = SipAccount()
+        assert acc.get_messages() == []
+
+    def test_sip_account_message_queue_last_n(self):
+        from src.account_manager import SipAccount
+        import pjsua2 as pj
+        acc = SipAccount()
+        # Manually inject messages to test last_n filtering
+        for i in range(5):
+            from datetime import datetime
+            acc._messages.append({
+                "from": f"sip:user{i}@example.com",
+                "to": "sip:me@example.com",
+                "body": f"message {i}",
+                "content_type": "text/plain",
+                "timestamp": datetime.now().isoformat(),
+            })
+        all_msgs = acc.get_messages()
+        assert len(all_msgs) == 5
+        last_2 = acc.get_messages(last_n=2)
+        assert len(last_2) == 2
+        assert last_2[0]["body"] == "message 3"
+        assert last_2[1]["body"] == "message 4"

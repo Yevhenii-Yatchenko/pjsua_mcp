@@ -28,6 +28,7 @@ class SipAccount(pj.Account):
         }
         self._incoming_calls: deque[pj.CallInfo] = deque(maxlen=32)
         self.on_incoming_call_cb: Any = None  # set by CallManager
+        self._messages: deque[dict] = deque(maxlen=100)
 
     def onRegState(self, prm: pj.OnRegStateParam) -> None:
         info = self.getInfo()
@@ -47,6 +48,26 @@ class SipAccount(pj.Account):
         log.info("Incoming call: call_id=%d", prm.callId)
         if self.on_incoming_call_cb:
             self.on_incoming_call_cb(prm.callId)
+
+    def onInstantMessage(self, prm: pj.OnInstantMessageParam) -> None:
+        from datetime import datetime
+        msg = {
+            "from": prm.fromUri,
+            "to": prm.toUri,
+            "body": prm.msgBody,
+            "content_type": prm.contentType,
+            "timestamp": datetime.now().isoformat(),
+        }
+        with self._lock:
+            self._messages.append(msg)
+        log.info("Received MESSAGE from %s: %s", prm.fromUri, prm.msgBody[:50])
+
+    def get_messages(self, last_n: int | None = None) -> list[dict]:
+        with self._lock:
+            msgs = list(self._messages)
+        if last_n:
+            msgs = msgs[-last_n:]
+        return msgs
 
     def get_reg_info(self) -> dict[str, Any]:
         with self._lock:
@@ -155,3 +176,21 @@ class AccountManager:
                 "expires": 0,
             }
         return self._account.get_reg_info()
+
+    def send_message(self, dest_uri: str, body: str, content_type: str = "text/plain") -> None:
+        """Send SIP MESSAGE via a temporary Buddy object."""
+        if not self._account or not self._account.isValid():
+            raise RuntimeError("No valid account — register first")
+        buddy_cfg = pj.BuddyConfig()
+        buddy_cfg.uri = dest_uri
+        buddy = pj.Buddy()
+        buddy.create(self._account, buddy_cfg)
+        prm = pj.SendInstantMessageParam()
+        prm.content = body
+        prm.contentType = content_type
+        buddy.sendInstantMessage(prm)
+
+    def get_messages(self, last_n: int | None = None) -> list[dict]:
+        if self._account is None:
+            return []
+        return self._account.get_messages(last_n=last_n)

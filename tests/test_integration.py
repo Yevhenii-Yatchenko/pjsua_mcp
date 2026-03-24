@@ -380,3 +380,52 @@ class TestCallFlow:
         assert "remote_uri" in entry
         assert "duration" in entry
         assert "recording_file" in entry
+
+
+# ---------------------------------------------------------------------------
+# SIP MESSAGE tests (two accounts)
+# ---------------------------------------------------------------------------
+
+@skip_no_domain
+class TestSipMessage:
+    @pytest.fixture(autouse=True)
+    def mcp_pair(self):
+        with McpClient() as a, McpClient() as b:
+            a.send_initialize()
+            b.send_initialize()
+            self.ua_a = a
+            self.ua_b = b
+            yield
+
+    def test_send_and_receive_message(self):
+        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
+        _configure_and_register(self.ua_b, SIP_USER_B, SIP_PASS_B)
+
+        # A sends message to B
+        result = _parse_tool_result(self.ua_a.call_tool("send_message", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+            "body": "Hello from A",
+        }))
+        assert result["status"] == "ok"
+
+        time.sleep(2)
+
+        # B checks received messages
+        result = _parse_tool_result(self.ua_b.call_tool("get_messages"))
+        assert result["total_count"] > 0
+        assert any("Hello from A" in m["body"] for m in result["messages"])
+
+    def test_get_messages_empty(self):
+        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
+
+        result = _parse_tool_result(self.ua_a.call_tool("get_messages"))
+        assert result["total_count"] == 0
+        assert result["messages"] == []
+
+    def test_send_message_without_registration(self):
+        # No configure/register called — should error
+        result = _parse_tool_result(self.ua_a.call_tool("send_message", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+            "body": "Should fail",
+        }))
+        assert result["status"] == "error"

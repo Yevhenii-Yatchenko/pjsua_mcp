@@ -546,6 +546,42 @@ async def get_call_history(last_n: int | None = None) -> dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# Tool: SIP instant messaging
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def send_message(dest_uri: str, body: str) -> dict[str, Any]:
+    """Send a SIP MESSAGE (instant text message).
+
+    Args:
+        dest_uri: Destination SIP URI (e.g. "sip:6002@asterisk")
+        body: Message text content
+    """
+    assert account_mgr is not None
+    try:
+        account_mgr.send_message(dest_uri, body)
+        return {"status": "ok", "dest_uri": dest_uri}
+    except Exception as e:
+        log.exception("send_message failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+async def get_messages(last_n: int | None = None) -> dict[str, Any]:
+    """Get received SIP instant messages.
+
+    Args:
+        last_n: Return only last N messages (default: all)
+    """
+    assert account_mgr is not None
+    try:
+        msgs = account_mgr.get_messages(last_n=last_n)
+        return {"messages": msgs, "total_count": len(msgs)}
+    except Exception as e:
+        log.exception("get_messages failed")
+        return {"status": "error", "error": str(e)}
+
+
 def main():
     mcp.run(transport="stdio")
 
