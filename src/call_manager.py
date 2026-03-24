@@ -222,6 +222,7 @@ class CallManager:
         self._account_mgr = account_mgr
         self._calls: dict[int, SipCall] = {}
         self._incoming_queue: list[int] = []
+        self._auto_answer_pending: list[int] = []
         self._lock = threading.Lock()
 
         # Wire up incoming call callback
@@ -244,6 +245,30 @@ class CallManager:
             self._calls[call_id] = call
             self._incoming_queue.append(call_id)
         log.info("Incoming call %d queued", call_id)
+
+        if self._account_mgr.auto_answer:
+            self._auto_answer_pending.append(call_id)
+
+    def process_auto_answers(self) -> None:
+        """Process pending auto-answer calls.
+
+        Called from the event poll loop — NOT from inside a pjsua callback.
+        Answering inside onIncomingCall causes disconnects because the call
+        state machine isn't ready yet.
+        """
+        while self._auto_answer_pending:
+            call_id = self._auto_answer_pending.pop(0)
+            with self._lock:
+                call = self._calls.get(call_id)
+            if call is None:
+                continue
+            try:
+                prm = pj.CallOpParam()
+                prm.statusCode = 200
+                call.answer(prm)
+                log.info("Auto-answered call %d", call_id)
+            except Exception:
+                log.exception("Failed to auto-answer call %d", call_id)
 
     def _ensure_incoming_handler(self) -> None:
         """Ensure incoming call handler is connected to current account."""

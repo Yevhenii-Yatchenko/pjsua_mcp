@@ -64,10 +64,15 @@ class AccountManager:
         self._password: str | None = None
         self._realm: str | None = None
         self._srtp: bool = False
+        self._auto_answer: bool = False
 
     @property
     def account(self) -> SipAccount | None:
         return self._account
+
+    @property
+    def auto_answer(self) -> bool:
+        return self._auto_answer
 
     def configure(
         self,
@@ -76,6 +81,7 @@ class AccountManager:
         password: str | None = None,
         realm: str | None = None,
         srtp: bool = False,
+        auto_answer: bool = False,
     ) -> None:
         """Store credentials for later registration."""
         self._domain = domain
@@ -83,6 +89,7 @@ class AccountManager:
         self._password = password
         self._realm = realm or "*"
         self._srtp = srtp
+        self._auto_answer = auto_answer
 
     def register(self) -> None:
         """Create account and send REGISTER."""

@@ -310,3 +310,26 @@ class TestCallFlow:
             "filter_text": "INVITE",
         }))
         assert log["total_count"] > 0
+
+    def test_auto_answer(self):
+        """Callee with auto_answer=True answers automatically."""
+        _configure_and_register(self.caller, SIP_USER_A, SIP_PASS_A)
+        _parse_tool_result(self.callee.call_tool("configure", {
+            "domain": SIP_DOMAIN, "transport": "udp",
+            "username": SIP_USER_B, "password": SIP_PASS_B,
+            "auto_answer": True,
+        }))
+        _parse_tool_result(self.callee.call_tool("register"))
+        _wait_registered(self.callee)
+
+        result = _parse_tool_result(self.caller.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+
+        time.sleep(3)
+        caller_info = _parse_tool_result(
+            self.caller.call_tool("get_call_info", {"call_id": call_id})
+        )
+        assert caller_info["state"] == "CONFIRMED"
+        self.caller.call_tool("hangup", {"call_id": call_id})

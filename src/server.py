@@ -48,6 +48,9 @@ async def _poll_pjsip_events(eng: SipEngine) -> None:
     while True:
         try:
             eng.handle_events(10)
+            # Process deferred actions after pjsip events
+            if call_mgr:
+                call_mgr.process_auto_answers()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -95,6 +98,7 @@ async def configure(
     realm: str | None = None,
     srtp: bool = False,
     local_port: int = 0,
+    auto_answer: bool = False,
 ) -> dict[str, Any]:
     """Configure (or reconfigure) the SIP user agent.
 
@@ -110,6 +114,7 @@ async def configure(
         realm: SIP realm (defaults to "*" if not specified)
         srtp: Enable SRTP media encryption (default False)
         local_port: Local port to bind (0 = auto)
+        auto_answer: Automatically answer incoming calls with 200 OK (default False)
     """
     global _poll_task
     assert engine is not None and account_mgr is not None
@@ -138,6 +143,7 @@ async def configure(
             password=password,
             realm=realm,
             srtp=srtp,
+            auto_answer=auto_answer,
         )
 
         return {
@@ -157,9 +163,11 @@ async def configure(
 @mcp.tool()
 async def register() -> dict[str, Any]:
     """Register the configured SIP account with the registrar."""
-    assert account_mgr is not None
+    assert account_mgr is not None and call_mgr is not None
     try:
         account_mgr.register()
+        # Wire up incoming call handler now that account exists
+        call_mgr._ensure_incoming_handler()
         # Give registration a moment to process
         await asyncio.sleep(1)
         info = account_mgr.get_registration_info()
