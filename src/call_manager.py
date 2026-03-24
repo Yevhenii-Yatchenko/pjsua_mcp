@@ -200,6 +200,10 @@ class SipCall(pj.Call):
             with self._lock:
                 self._info["playing_file"] = None
 
+    @property
+    def audio_media(self) -> pj.AudioMedia | None:
+        return self._aud_med
+
     def get_cached_info(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._info)
@@ -431,6 +435,32 @@ class CallManager:
         """Stop audio playback on a call (resumes default MOH)."""
         call = self._get_call(call_id)
         call.stop_playback()
+
+    def conference(self, call_ids: list[int]) -> dict[str, Any]:
+        """Bridge multiple calls together via the conference bridge.
+
+        Cross-connects audio media of all specified calls so all parties
+        can hear each other.
+        """
+        calls = [self._get_call_by_id(cid) for cid in call_ids]
+        media_ports = []
+        for call in calls:
+            if call.audio_media is not None:
+                media_ports.append(call.audio_media)
+
+        if len(media_ports) < 2:
+            raise RuntimeError("Need at least 2 calls with active audio for conference")
+
+        # Cross-connect all audio ports
+        for i, port_a in enumerate(media_ports):
+            for j, port_b in enumerate(media_ports):
+                if i != j:
+                    try:
+                        port_a.startTransmit(port_b)
+                    except Exception:
+                        log.debug("Conference connect error: %d->%d", i, j)
+
+        return {"call_ids": call_ids, "participants": len(media_ports)}
 
     def hold(self, call_id: int) -> None:
         """Put a call on hold."""

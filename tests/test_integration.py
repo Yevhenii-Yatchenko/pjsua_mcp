@@ -539,3 +539,65 @@ class TestBlindTransfer:
             "filter_text": "BYE",
         }))
         assert b_log["total_count"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Conference / 3-way calling tests (three accounts)
+# ---------------------------------------------------------------------------
+
+@skip_no_domain
+class TestConference:
+    @pytest.fixture(autouse=True)
+    def mcp_trio(self):
+        with McpClient() as a, McpClient() as b, McpClient() as c:
+            a.send_initialize()
+            b.send_initialize()
+            c.send_initialize()
+            self.ua_a = a
+            self.ua_b = b
+            self.ua_c = c
+            yield
+
+    def test_three_way_conference(self):
+        """A calls B, A calls C, then A bridges all into a conference."""
+        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
+        # B and C with auto_answer
+        for ua, user, pwd in [(self.ua_b, SIP_USER_B, SIP_PASS_B),
+                               (self.ua_c, SIP_USER_C, SIP_PASS_C)]:
+            _parse_tool_result(ua.call_tool("configure", {
+                "domain": SIP_DOMAIN, "transport": "udp",
+                "username": user, "password": pwd, "auto_answer": True,
+            }))
+            _parse_tool_result(ua.call_tool("register"))
+            _wait_registered(ua)
+
+        # A calls B
+        r1 = _parse_tool_result(self.ua_a.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        time.sleep(2)
+
+        # A calls C
+        r2 = _parse_tool_result(self.ua_a.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
+        }))
+        time.sleep(2)
+
+        # A bridges both calls
+        result = _parse_tool_result(self.ua_a.call_tool("conference", {
+            "call_ids": [r1["call_id"], r2["call_id"]],
+        }))
+        assert result["status"] == "ok"
+        assert result["participants"] == 2
+
+        time.sleep(1)
+        # All calls should still be CONFIRMED
+        for cid in [r1["call_id"], r2["call_id"]]:
+            info = _parse_tool_result(
+                self.ua_a.call_tool("get_call_info", {"call_id": cid})
+            )
+            assert info["state"] == "CONFIRMED"
+
+        # Cleanup
+        self.ua_a.call_tool("hangup", {"call_id": r1["call_id"]})
+        self.ua_a.call_tool("hangup", {"call_id": r2["call_id"]})

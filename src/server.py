@@ -428,6 +428,25 @@ async def stop_audio(call_id: int | None = None) -> dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
+@mcp.tool()
+async def conference(call_ids: list[int]) -> dict[str, Any]:
+    """Bridge multiple active calls into a conference.
+
+    Cross-connects audio of all specified calls so all parties hear each other.
+    The calling UA acts as a conference bridge host.
+
+    Args:
+        call_ids: List of call IDs to bridge together
+    """
+    assert call_mgr is not None
+    try:
+        info = call_mgr.conference(call_ids)
+        return {"status": "ok", **info}
+    except Exception as e:
+        log.exception("conference failed")
+        return {"status": "error", "error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Tool: SIP log & packet capture
 # ---------------------------------------------------------------------------
