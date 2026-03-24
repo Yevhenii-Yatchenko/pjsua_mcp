@@ -346,6 +346,30 @@ class CallManager:
         call.xfer(dest_uri, prm)
         return {"call_id": call_id, "transfer_to": dest_uri}
 
+    def attended_transfer(self, call_id: int | None = None, dest_call_id: int | None = None) -> dict[str, Any]:
+        """Attended transfer: connect two calls, removing ourselves.
+
+        Uses REFER with Replaces header. call_id is transferred to dest_call_id.
+        """
+        with self._lock:
+            active_calls = [
+                (cid, call) for cid, call in self._calls.items()
+                if call.isActive()
+            ]
+        if len(active_calls) < 2:
+            raise RuntimeError("Need at least 2 active calls for attended transfer")
+
+        if call_id is not None and dest_call_id is not None:
+            src_call = self._get_call_by_id(call_id)
+            dst_call = self._get_call_by_id(dest_call_id)
+        else:
+            src_call = active_calls[0][1]
+            dst_call = active_calls[1][1]
+
+        prm = pj.CallOpParam()
+        src_call.xferReplaces(dst_call, prm)
+        return {"transferred": True}
+
     def hangup(self, call_id: int | None = None) -> None:
         """Hang up a call."""
         call = self._get_call(call_id)

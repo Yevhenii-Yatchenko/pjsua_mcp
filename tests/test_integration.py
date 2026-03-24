@@ -498,3 +498,44 @@ class TestBlindTransfer:
             "filter_text": "BYE",
         }))
         assert b_log["total_count"] > 0
+
+    def test_attended_transfer(self):
+        """A calls B, B consults C, then B transfers A to C."""
+        self._register_all()
+
+        # A calls B
+        r_ab = _parse_tool_result(self.ua_a.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        b_answer = self._wait_and_answer(self.ua_b)
+        ab_call_id_on_b = b_answer["call_id"]
+        time.sleep(1)
+
+        # B puts A on hold
+        _parse_tool_result(self.ua_b.call_tool("hold", {
+            "call_id": ab_call_id_on_b,
+        }))
+        time.sleep(0.5)
+
+        # B calls C for consultation
+        r_bc = _parse_tool_result(self.ua_b.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
+        }))
+        bc_call_id_on_b = r_bc["call_id"]
+        # C auto-answers
+        time.sleep(2)
+
+        # B transfers A to C (attended)
+        result = _parse_tool_result(self.ua_b.call_tool("attended_transfer", {
+            "call_id": ab_call_id_on_b,
+            "dest_call_id": bc_call_id_on_b,
+        }))
+        assert result["status"] == "ok"
+
+        time.sleep(3)
+
+        # B should see BYE in logs (disconnected from both calls)
+        b_log = _parse_tool_result(self.ua_b.call_tool("get_sip_log", {
+            "filter_text": "BYE",
+        }))
+        assert b_log["total_count"] > 0

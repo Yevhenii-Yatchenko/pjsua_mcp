@@ -282,6 +282,29 @@ async def blind_transfer(dest_uri: str, call_id: int | None = None) -> dict[str,
 
 
 @mcp.tool()
+async def attended_transfer(
+    call_id: int | None = None,
+    dest_call_id: int | None = None,
+) -> dict[str, Any]:
+    """Attended transfer: bridge two active calls and disconnect ourselves.
+
+    Must have two active calls (e.g. original call on hold + consultation call).
+    Sends REFER with Replaces to connect the two remote parties directly.
+
+    Args:
+        call_id: Source call to transfer (default: auto-select first active)
+        dest_call_id: Destination call to replace (default: auto-select second active)
+    """
+    assert call_mgr is not None
+    try:
+        info = call_mgr.attended_transfer(call_id=call_id, dest_call_id=dest_call_id)
+        return {"status": "ok", **info}
+    except Exception as e:
+        log.exception("attended_transfer failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
 async def hangup(call_id: int | None = None) -> dict[str, Any]:
     """Hang up a SIP call.
 
