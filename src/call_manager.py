@@ -324,6 +324,14 @@ class CallManager:
         ci = call.getInfo()
         return {"call_id": ci.id, "state": _call_state_name(ci.state)}
 
+    def reject_call(self, call_id: int | None = None, status_code: int = 486) -> dict[str, Any]:
+        """Reject an incoming call with a SIP error code."""
+        call = self._get_call(call_id, from_incoming=True)
+        prm = pj.CallOpParam()
+        prm.statusCode = status_code
+        call.hangup(prm)
+        return {"call_id": call_id, "status_code": status_code}
+
     def hangup(self, call_id: int | None = None) -> None:
         """Hang up a call."""
         call = self._get_call(call_id)

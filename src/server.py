@@ -245,6 +245,23 @@ async def answer_call(
 
 
 @mcp.tool()
+async def reject_call(call_id: int | None = None, status_code: int = 486) -> dict[str, Any]:
+    """Reject an incoming call with a SIP error response.
+
+    Args:
+        call_id: Call ID to reject (default: first incoming call)
+        status_code: SIP response code — 486 (Busy), 603 (Decline), 480 (Unavailable)
+    """
+    assert call_mgr is not None
+    try:
+        info = call_mgr.reject_call(call_id=call_id, status_code=status_code)
+        return {"status": "ok", **info}
+    except Exception as e:
+        log.exception("reject_call failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
 async def hangup(call_id: int | None = None) -> dict[str, Any]:
     """Hang up a SIP call.
 

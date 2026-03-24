@@ -333,3 +333,31 @@ class TestCallFlow:
         )
         assert caller_info["state"] == "CONFIRMED"
         self.caller.call_tool("hangup", {"call_id": call_id})
+
+    def test_reject_call(self):
+        """Callee rejects incoming call with 486 Busy."""
+        self._register_both()
+
+        self.caller.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        })
+
+        # Callee rejects
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            result = _parse_tool_result(self.callee.call_tool("reject_call", {
+                "status_code": 486,
+            }))
+            if result.get("status") == "ok":
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError("reject_call never succeeded")
+
+        time.sleep(1)
+
+        # Caller should see 486 in SIP log
+        log_result = _parse_tool_result(self.caller.call_tool("get_sip_log", {
+            "filter_text": "486",
+        }))
+        assert log_result["total_count"] > 0
