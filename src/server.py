@@ -262,6 +262,26 @@ async def reject_call(call_id: int | None = None, status_code: int = 486) -> dic
 
 
 @mcp.tool()
+async def blind_transfer(dest_uri: str, call_id: int | None = None) -> dict[str, Any]:
+    """Blind transfer: redirect an active call to another SIP URI.
+
+    Sends SIP REFER, causing the remote party to send a new INVITE
+    to dest_uri. Our side of the call is then disconnected.
+
+    Args:
+        dest_uri: Transfer destination (e.g. "sip:6003@asterisk")
+        call_id: Call ID to transfer (default: current active call)
+    """
+    assert call_mgr is not None
+    try:
+        info = call_mgr.blind_transfer(dest_uri, call_id=call_id)
+        return {"status": "ok", **info}
+    except Exception as e:
+        log.exception("blind_transfer failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
 async def hangup(call_id: int | None = None) -> dict[str, Any]:
     """Hang up a SIP call.
 

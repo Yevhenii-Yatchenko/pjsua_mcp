@@ -35,6 +35,8 @@ services:
       - SIP_PASS_A=test123
       - SIP_USER_B=6002
       - SIP_PASS_B=test123
+      - SIP_USER_C=6003
+      - SIP_PASS_C=test123
 
 networks:
   sipnet:

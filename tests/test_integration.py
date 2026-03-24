@@ -32,6 +32,8 @@ SIP_USER_A = os.environ.get("SIP_USER_A", "6001")
 SIP_PASS_A = os.environ.get("SIP_PASS_A", "test123")
 SIP_USER_B = os.environ.get("SIP_USER_B", "6002")
 SIP_PASS_B = os.environ.get("SIP_PASS_B", "test123")
+SIP_USER_C = os.environ.get("SIP_USER_C", "6003")
+SIP_PASS_C = os.environ.get("SIP_PASS_C", "test123")
 
 skip_no_domain = pytest.mark.skipif(
     not SIP_DOMAIN,
@@ -429,3 +431,70 @@ class TestSipMessage:
             "body": "Should fail",
         }))
         assert result["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Blind transfer tests (three accounts)
+# ---------------------------------------------------------------------------
+
+@skip_no_domain
+class TestBlindTransfer:
+    @pytest.fixture(autouse=True)
+    def mcp_trio(self):
+        with McpClient() as a, McpClient() as b, McpClient() as c:
+            a.send_initialize()
+            b.send_initialize()
+            c.send_initialize()
+            self.ua_a = a
+            self.ua_b = b
+            self.ua_c = c
+            yield
+
+    def _register_all(self):
+        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
+        _configure_and_register(self.ua_b, SIP_USER_B, SIP_PASS_B)
+        # C with auto_answer so transfer completes automatically
+        _parse_tool_result(self.ua_c.call_tool("configure", {
+            "domain": SIP_DOMAIN, "transport": "udp",
+            "username": SIP_USER_C, "password": SIP_PASS_C,
+            "auto_answer": True,
+        }))
+        _parse_tool_result(self.ua_c.call_tool("register"))
+        _wait_registered(self.ua_c)
+
+    @staticmethod
+    def _wait_and_answer(client, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            result = _parse_tool_result(client.call_tool("answer_call"))
+            if result.get("status") == "ok":
+                return result
+            time.sleep(0.5)
+        raise AssertionError(f"No incoming call within {timeout}s")
+
+    def test_blind_transfer(self):
+        """A calls B, then B blind-transfers A to C."""
+        self._register_all()
+
+        # A calls B
+        result = _parse_tool_result(self.ua_a.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        assert result["status"] == "ok"
+        self._wait_and_answer(self.ua_b)
+        time.sleep(1)
+
+        # B transfers A to C (blind)
+        result = _parse_tool_result(self.ua_b.call_tool("blind_transfer", {
+            "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
+        }))
+        assert result["status"] == "ok"
+
+        # Wait for transfer to complete — C auto-answers
+        time.sleep(3)
+
+        # B should be disconnected after transfer
+        b_log = _parse_tool_result(self.ua_b.call_tool("get_sip_log", {
+            "filter_text": "BYE",
+        }))
+        assert b_log["total_count"] > 0

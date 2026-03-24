@@ -339,6 +339,13 @@ class CallManager:
         call.hangup(prm)
         return {"call_id": call_id, "status_code": status_code}
 
+    def blind_transfer(self, dest_uri: str, call_id: int | None = None) -> dict[str, Any]:
+        """Blind transfer: send REFER to redirect the call."""
+        call = self._get_call(call_id)
+        prm = pj.CallOpParam()
+        call.xfer(dest_uri, prm)
+        return {"call_id": call_id, "transfer_to": dest_uri}
+
     def hangup(self, call_id: int | None = None) -> None:
         """Hang up a call."""
         call = self._get_call(call_id)
