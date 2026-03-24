@@ -524,6 +524,28 @@ async def list_recordings() -> dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# Tool: call history
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def get_call_history(last_n: int | None = None) -> dict[str, Any]:
+    """Get history of completed calls.
+
+    Returns call records with remote URI, duration, status, codec, recording path.
+
+    Args:
+        last_n: Return only last N calls (default: all)
+    """
+    assert call_mgr is not None
+    try:
+        all_history = call_mgr.get_call_history()
+        filtered = all_history[-last_n:] if last_n else all_history
+        return {"history": filtered, "total_count": len(all_history)}
+    except Exception as e:
+        log.exception("get_call_history failed")
+        return {"status": "error", "error": str(e)}
+
+
 def main():
     mcp.run(transport="stdio")
 

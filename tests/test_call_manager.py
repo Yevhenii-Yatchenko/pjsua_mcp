@@ -32,3 +32,8 @@ class TestHangupAll:
     def test_empty(self, call_mgr):
         # Should not raise with no calls
         call_mgr.hangup_all()
+
+
+class TestCallHistory:
+    def test_empty_history(self, call_mgr):
+        assert call_mgr.get_call_history() == []

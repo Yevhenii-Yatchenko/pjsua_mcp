@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ class SipCall(pj.Call):
         self._player: pj.AudioMediaPlayer | None = None
         self._player_file: str | None = None
         self._aud_med: pj.AudioMedia | None = None  # cached for play/stop
+        self.on_disconnected_cb: Any = None
         self._info: dict[str, Any] = {
             "state": "NONE",
             "state_text": "",
@@ -56,6 +58,8 @@ class SipCall(pj.Call):
         if ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
             self._stop_recording()
             self._stop_player()
+            if self.on_disconnected_cb:
+                self.on_disconnected_cb(self.get_cached_info())
         log.info(
             "Call %d state: %s (%s) remote=%s",
             ci.id, ci.stateText, _call_state_name(ci.state), ci.remoteUri,
@@ -224,6 +228,7 @@ class CallManager:
         self._incoming_queue: list[int] = []
         self._auto_answer_pending: list[int] = []
         self._lock = threading.Lock()
+        self._call_history: deque[dict] = deque(maxlen=100)
 
         # Wire up incoming call callback
         # This will be set when account is created
@@ -241,6 +246,7 @@ class CallManager:
         if not acc:
             return
         call = SipCall(acc, call_id)
+        call.on_disconnected_cb = self._on_call_disconnected
         with self._lock:
             self._calls[call_id] = call
             self._incoming_queue.append(call_id)
@@ -288,6 +294,7 @@ class CallManager:
             raise RuntimeError("No valid account — register first")
 
         call = SipCall(acc)
+        call.on_disconnected_cb = self._on_call_disconnected
         prm = pj.CallOpParam(True)  # True = use default call settings
 
         # Add custom headers
@@ -406,6 +413,24 @@ class CallManager:
         prm = pj.CallOpParam()
         prm.flag = pj.PJSUA_CALL_UNHOLD
         call.reinvite(prm)
+
+    def _on_call_disconnected(self, info: dict) -> None:
+        """Record call to history when disconnected."""
+        self._call_history.append({
+            "remote_uri": info.get("remote_uri", ""),
+            "duration": info.get("duration", 0),
+            "last_status": info.get("last_status", 0),
+            "last_status_text": info.get("last_status_text", ""),
+            "codec": info.get("codec", ""),
+            "recording_file": info.get("recording_file"),
+            "timestamp": datetime.now().isoformat(),
+        })
+
+    def get_call_history(self, last_n: int | None = None) -> list[dict]:
+        history = list(self._call_history)
+        if last_n:
+            history = history[-last_n:]
+        return history
 
     def _get_call(self, call_id: int | None = None, from_incoming: bool = False) -> SipCall:
         """Get a call by ID, or the current active/incoming call."""

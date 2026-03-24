@@ -361,3 +361,22 @@ class TestCallFlow:
             "filter_text": "486",
         }))
         assert log_result["total_count"] > 0
+
+    def test_call_history(self):
+        """After a call, history contains the call record."""
+        self._register_both()
+
+        self.caller.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        })
+        self._wait_and_answer(self.callee)
+        time.sleep(1)
+        self.caller.call_tool("hangup")
+        time.sleep(1)
+
+        result = _parse_tool_result(self.caller.call_tool("get_call_history"))
+        assert result["total_count"] >= 1
+        entry = result["history"][0]
+        assert "remote_uri" in entry
+        assert "duration" in entry
+        assert "recording_file" in entry
