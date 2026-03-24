@@ -96,7 +96,11 @@ async def configure(
     srtp: bool = False,
     local_port: int = 0,
 ) -> dict[str, Any]:
-    """Initialize the SIP engine: create endpoint, set transport, and prepare for registration.
+    """Configure (or reconfigure) the SIP user agent.
+
+    On first call: initializes the SIP engine, creates transport, stores credentials.
+    On subsequent calls: unregisters the current account and updates credentials
+    without restarting the engine — useful for changing domain, username, or password.
 
     Args:
         domain: SIP domain / registrar address (e.g. "sip.example.com")
@@ -111,10 +115,23 @@ async def configure(
     assert engine is not None and account_mgr is not None
 
     try:
-        transport_id = engine.initialize(
-            transport=transport,
-            local_port=local_port,
-        )
+        transport_id: int | None = None
+
+        if engine.initialized:
+            # Reconfiguration: tear down the old account, keep the engine
+            log.info("Reconfiguring — unregistering old account")
+            call_mgr.hangup_all()
+            account_mgr.unregister_all()
+            await asyncio.sleep(0.5)
+        else:
+            # First-time initialization
+            transport_id = engine.initialize(
+                transport=transport,
+                local_port=local_port,
+            )
+            if _poll_task is None or _poll_task.done():
+                _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
+
         account_mgr.configure(
             domain=domain,
             username=username,
@@ -122,9 +139,6 @@ async def configure(
             realm=realm,
             srtp=srtp,
         )
-        # Start polling pjsip events after initialization
-        if _poll_task is None or _poll_task.done():
-            _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
 
         return {
             "status": "configured",
@@ -303,6 +317,50 @@ async def unhold(call_id: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool: audio playback
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def play_audio(
+    file_path: str,
+    call_id: int | None = None,
+    loop: bool = False,
+) -> dict[str, Any]:
+    """Play a WAV file into an active call (replaces current audio/MOH).
+
+    By default, all calls play Music-on-Hold automatically. Use this tool to
+    play a specific file (e.g. TTS output, IVR prompts, pre-recorded messages).
+
+    Args:
+        file_path: Path to WAV file inside the container (e.g. "/recordings/call_1_20260306.wav")
+        call_id: Call ID (default: current active call)
+        loop: Loop the file (default False — plays once, then resumes MOH)
+    """
+    assert call_mgr is not None
+    try:
+        info = call_mgr.play_audio(file_path, call_id=call_id, loop=loop)
+        return {"status": "ok", **info}
+    except Exception as e:
+        log.exception("play_audio failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+async def stop_audio(call_id: int | None = None) -> dict[str, Any]:
+    """Stop audio playback and resume default Music-on-Hold.
+
+    Args:
+        call_id: Call ID (default: current active call)
+    """
+    assert call_mgr is not None
+    try:
+        call_mgr.stop_audio(call_id=call_id)
+        return {"status": "ok"}
+    except Exception as e:
+        log.exception("stop_audio failed")
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Tool: SIP log & packet capture
 # ---------------------------------------------------------------------------
 @mcp.tool()
@@ -373,6 +431,71 @@ async def get_pcap(filename: str | None = None) -> dict[str, Any]:
         return info
     except Exception as e:
         log.exception("get_pcap failed")
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Tool: call recordings
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def get_recording(call_id: int | None = None) -> dict[str, Any]:
+    """Get the WAV recording file path for a call.
+
+    Every call is automatically recorded to /recordings/call_{id}_{timestamp}.wav.
+    Returns the file path, size, and duration so external tools can access the file.
+
+    Args:
+        call_id: Call ID to get recording for (default: current/last call)
+    """
+    assert call_mgr is not None
+    try:
+        info = call_mgr.get_call_info(call_id=call_id)
+        rec_file = info.get("recording_file")
+        if not rec_file:
+            return {"status": "error", "error": "No recording available for this call"}
+
+        from pathlib import Path
+        path = Path(rec_file)
+        if not path.exists():
+            return {"status": "error", "error": f"Recording file not found: {rec_file}"}
+
+        return {
+            "recording_file": rec_file,
+            "filename": path.name,
+            "file_size": path.stat().st_size,
+        }
+    except Exception as e:
+        log.exception("get_recording failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+async def list_recordings() -> dict[str, Any]:
+    """List all call recording files in /recordings/.
+
+    Returns recordings sorted by modification time (newest first).
+    """
+    from pathlib import Path
+    recordings_dir = Path("/recordings")
+    try:
+        if not recordings_dir.exists():
+            return {"recordings": [], "total_count": 0}
+        files = sorted(
+            recordings_dir.glob("call_*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        recordings = [
+            {
+                "filename": f.name,
+                "file_path": str(f),
+                "file_size": f.stat().st_size,
+            }
+            for f in files
+        ]
+        return {"recordings": recordings, "total_count": len(recordings)}
+    except Exception as e:
+        log.exception("list_recordings failed")
         return {"status": "error", "error": str(e)}
 
 

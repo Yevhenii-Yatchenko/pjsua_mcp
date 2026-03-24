@@ -31,6 +31,15 @@ class TestConfigure:
         mgr.configure(domain="sip.example.com")
         assert mgr._realm == "*"
 
+    def test_reconfigure_updates_credentials(self):
+        engine = SipEngine()
+        mgr = AccountManager(engine)
+        mgr.configure(domain="old.example.com", username="alice", password="old")
+        mgr.configure(domain="new.example.com", username="bob", password="new")
+        assert mgr._domain == "new.example.com"
+        assert mgr._username == "bob"
+        assert mgr._password == "new"
+
 
 class TestGetRegistrationInfo:
     def test_no_account(self):

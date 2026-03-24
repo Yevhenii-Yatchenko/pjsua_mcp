@@ -1,9 +1,11 @@
-"""SIP call management — outbound/inbound calls, DTMF, hold/unhold."""
+"""SIP call management — outbound/inbound calls, DTMF, hold/unhold, recording."""
 
 from __future__ import annotations
 
 import logging
 import threading
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pjsua2 as pj
@@ -13,13 +15,21 @@ from .account_manager import AccountManager
 
 log = logging.getLogger(__name__)
 
+RECORDINGS_DIR = Path("/recordings")
+DEFAULT_MOH_FILE = Path("/app/audio/moh.wav")
+
 
 class SipCall(pj.Call):
-    """PJSUA2 Call subclass with state and media callbacks."""
+    """PJSUA2 Call subclass with state, media, recording, and playback callbacks."""
 
     def __init__(self, account: pj.Account, call_id: int = pj.PJSUA_INVALID_ID) -> None:
         super().__init__(account, call_id)
         self._lock = threading.Lock()
+        self._recorder: pj.AudioMediaRecorder | None = None
+        self._recording_file: str | None = None
+        self._player: pj.AudioMediaPlayer | None = None
+        self._player_file: str | None = None
+        self._aud_med: pj.AudioMedia | None = None  # cached for play/stop
         self._info: dict[str, Any] = {
             "state": "NONE",
             "state_text": "",
@@ -28,6 +38,8 @@ class SipCall(pj.Call):
             "last_status_text": "",
             "duration": 0,
             "codec": "",
+            "recording_file": None,
+            "playing_file": None,
         }
 
     def onCallState(self, prm: pj.OnCallStateParam) -> None:
@@ -41,6 +53,9 @@ class SipCall(pj.Call):
                 "last_status_text": ci.lastReason,
                 "duration": ci.connectDuration.sec,
             })
+        if ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
+            self._stop_recording()
+            self._stop_player()
         log.info(
             "Call %d state: %s (%s) remote=%s",
             ci.id, ci.stateText, _call_state_name(ci.state), ci.remoteUri,
@@ -51,13 +66,23 @@ class SipCall(pj.Call):
         for i, mi in enumerate(ci.media):
             if mi.type == pj.PJMEDIA_TYPE_AUDIO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
                 aud_med = self.getAudioMedia(i)
-                # Connect to null audio device (no actual audio in headless Docker)
+                self._aud_med = aud_med
+                # Connect remote audio to playback device (for recording/monitoring)
                 try:
                     ep = pj.Endpoint.instance()
-                    ep.audDevManager().getCaptureDevMedia().startTransmit(aud_med)
                     aud_med.startTransmit(ep.audDevManager().getPlaybackDevMedia())
                 except Exception:
-                    log.exception("Error connecting audio media for call %d", ci.id)
+                    log.exception("Error connecting playback for call %d", ci.id)
+
+                # Start default MOH FIRST (player → call audio)
+                if self._player is None:
+                    self._start_default_moh()
+
+                # Start/reconnect recording AFTER player setup.
+                # player.startTransmit(aud_med) can disrupt existing
+                # connections on the conference bridge, so recorder must
+                # be connected last and reconnected on every media state change.
+                self._ensure_recording(ci.id, aud_med)
 
                 # Try to get codec info
                 try:
@@ -67,6 +92,109 @@ class SipCall(pj.Call):
                 except Exception:
                     pass
         log.info("Call %d media state updated", ci.id)
+
+    # --- Recording ---
+
+    def _ensure_recording(self, call_id: int, aud_med: pj.AudioMedia) -> None:
+        """Create recorder once, (re)connect it to aud_med every time.
+
+        Must be called AFTER the player is set up — player.startTransmit()
+        can disrupt existing conference bridge connections.
+        """
+        # Create recorder file once per call
+        if self._recorder is None:
+            try:
+                RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"call_{call_id}_{timestamp}.wav"
+                filepath = RECORDINGS_DIR / filename
+
+                recorder = pj.AudioMediaRecorder()
+                recorder.createRecorder(str(filepath))
+                self._recorder = recorder
+                self._recording_file = str(filepath)
+                with self._lock:
+                    self._info["recording_file"] = str(filepath)
+                log.info("Created recorder for call %d: %s", call_id, filepath)
+            except Exception:
+                log.exception("Failed to create recorder for call %d", call_id)
+                return
+
+        # (Re)connect: remote audio → recorder
+        try:
+            aud_med.startTransmit(self._recorder)
+        except Exception:
+            log.exception("Failed to connect recorder for call %d", call_id)
+
+        # Also connect local audio (player/MOH) → recorder for full mix
+        if self._player is not None:
+            try:
+                self._player.startTransmit(self._recorder)
+            except Exception:
+                log.exception("Failed to connect player to recorder for call %d", call_id)
+
+    def _stop_recording(self) -> None:
+        """Stop recording (called on DISCONNECTED)."""
+        if self._recorder is not None:
+            log.info("Stopping recording: %s", self._recording_file)
+            self._recorder = None
+
+    # --- Audio playback ---
+
+    def _start_default_moh(self) -> None:
+        """Start playing default MOH into the call."""
+        if DEFAULT_MOH_FILE.exists():
+            self.play_file(str(DEFAULT_MOH_FILE), loop=True)
+        else:
+            log.warning("Default MOH file not found: %s", DEFAULT_MOH_FILE)
+
+    def play_file(self, file_path: str, loop: bool = True) -> None:
+        """Play a WAV file into the call audio stream.
+
+        Stops any currently playing file first.
+        """
+        if self._aud_med is None:
+            raise RuntimeError("Call has no active audio media")
+
+        # Stop previous player
+        self._stop_player()
+
+        options = 0 if loop else pj.PJMEDIA_FILE_NO_LOOP
+        player = pj.AudioMediaPlayer()
+        player.createPlayer(file_path, options)
+        player.startTransmit(self._aud_med)
+
+        # Also feed player into recorder for full call mix
+        if self._recorder is not None:
+            try:
+                player.startTransmit(self._recorder)
+            except Exception:
+                log.debug("Could not connect new player to recorder")
+
+        self._player = player
+        self._player_file = file_path
+        with self._lock:
+            self._info["playing_file"] = file_path
+        log.info("Playing %s (loop=%s) into call", file_path, loop)
+
+    def stop_playback(self) -> None:
+        """Stop audio playback and resume default MOH."""
+        self._stop_player()
+        # Resume default MOH
+        self._start_default_moh()
+
+    def _stop_player(self) -> None:
+        """Stop the current audio player."""
+        if self._player is not None:
+            try:
+                if self._aud_med is not None:
+                    self._player.stopTransmit(self._aud_med)
+            except Exception:
+                pass
+            self._player = None
+            self._player_file = None
+            with self._lock:
+                self._info["playing_file"] = None
 
     def get_cached_info(self) -> dict[str, Any]:
         with self._lock:
@@ -221,6 +349,17 @@ class CallManager:
                 dparam.digits = digit
                 dparam.method = pj.PJSUA_DTMF_METHOD_SIP_INFO
                 call.sendDtmf(dparam)
+
+    def play_audio(self, file_path: str, call_id: int | None = None, loop: bool = False) -> dict[str, Any]:
+        """Play a WAV file into a call's audio stream."""
+        call = self._get_call(call_id)
+        call.play_file(file_path, loop=loop)
+        return {"call_id": call_id, "playing_file": file_path, "loop": loop}
+
+    def stop_audio(self, call_id: int | None = None) -> None:
+        """Stop audio playback on a call (resumes default MOH)."""
+        call = self._get_call(call_id)
+        call.stop_playback()
 
     def hold(self, call_id: int) -> None:
         """Put a call on hold."""

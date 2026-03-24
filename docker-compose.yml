@@ -8,3 +8,4 @@ services:
       - NET_ADMIN
     volumes:
       - ./captures:/captures
+      - ./recordings:/recordings

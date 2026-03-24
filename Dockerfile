@@ -68,12 +68,13 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Copy application
 COPY src/ /app/src/
 COPY tests/ /app/tests/
+COPY audio/ /app/audio/
 COPY pyproject.toml /app/pyproject.toml
 
 WORKDIR /app
 
-# Ensure captures dir exists for pcap output
-RUN mkdir -p /captures
+# Ensure output dirs exist
+RUN mkdir -p /captures /recordings
 
 # Unbuffered output to protect MCP stdio channel
 ENV PYTHONUNBUFFERED=1
