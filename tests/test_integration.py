@@ -601,3 +601,110 @@ class TestConference:
         # Cleanup
         self.ua_a.call_tool("hangup", {"call_id": r1["call_id"]})
         self.ua_a.call_tool("hangup", {"call_id": r2["call_id"]})
+
+
+# ---------------------------------------------------------------------------
+# Codec management tests
+# ---------------------------------------------------------------------------
+
+@skip_no_domain
+class TestCodecs:
+    @pytest.fixture(autouse=True)
+    def mcp_pair(self):
+        with McpClient() as caller, McpClient() as callee:
+            caller.send_initialize()
+            callee.send_initialize()
+            self.caller = caller
+            self.callee = callee
+            yield
+
+    def _register_both(self):
+        _configure_and_register(self.caller, SIP_USER_A, SIP_PASS_A)
+        _configure_and_register(self.callee, SIP_USER_B, SIP_PASS_B)
+
+    @staticmethod
+    def _wait_and_answer(client, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            result = _parse_tool_result(client.call_tool("answer_call"))
+            if result.get("status") == "ok":
+                return result
+            time.sleep(0.5)
+        raise AssertionError(f"No incoming call within {timeout}s")
+
+    def test_configure_with_codecs(self):
+        """Configure with specific codec, verify it's used in call."""
+        # Caller uses only PCMU
+        _parse_tool_result(self.caller.call_tool("configure", {
+            "domain": SIP_DOMAIN, "transport": "udp",
+            "username": SIP_USER_A, "password": SIP_PASS_A,
+            "codecs": ["PCMU"],
+        }))
+        _parse_tool_result(self.caller.call_tool("register"))
+        _wait_registered(self.caller)
+
+        _configure_and_register(self.callee, SIP_USER_B, SIP_PASS_B)
+
+        # Make call
+        result = _parse_tool_result(self.caller.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        self._wait_and_answer(self.callee)
+        time.sleep(1)
+
+        # Verify codec is PCMU
+        info = _parse_tool_result(
+            self.caller.call_tool("get_call_info", {"call_id": call_id})
+        )
+        assert "PCMU" in info.get("codec", "")
+
+        self.caller.call_tool("hangup", {"call_id": call_id})
+
+    def test_get_codecs(self):
+        """get_codecs returns available codecs with priorities."""
+        _configure_and_register(self.caller, SIP_USER_A, SIP_PASS_A)
+
+        result = _parse_tool_result(self.caller.call_tool("get_codecs"))
+        assert "codecs" in result
+        assert len(result["codecs"]) > 0
+        # Should have at least PCMU and PCMA
+        codec_names = [c["codec"] for c in result["codecs"]]
+        assert any("PCMU" in c for c in codec_names)
+
+    def test_set_codecs_midcall(self):
+        """Change codec mid-call via set_codecs with re-INVITE."""
+        # Start with PCMU only
+        _parse_tool_result(self.caller.call_tool("configure", {
+            "domain": SIP_DOMAIN, "transport": "udp",
+            "username": SIP_USER_A, "password": SIP_PASS_A,
+            "codecs": ["PCMU", "PCMA"],
+        }))
+        _parse_tool_result(self.caller.call_tool("register"))
+        _wait_registered(self.caller)
+        _configure_and_register(self.callee, SIP_USER_B, SIP_PASS_B)
+
+        result = _parse_tool_result(self.caller.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        self._wait_and_answer(self.callee)
+        time.sleep(1)
+
+        # Change to PCMA only via re-INVITE
+        result = _parse_tool_result(self.caller.call_tool("set_codecs", {
+            "codecs": ["PCMA"],
+            "call_id": call_id,
+        }))
+        assert result["status"] == "ok"
+        assert result["reinvite"] is True
+
+        time.sleep(2)
+
+        # Verify codec changed
+        info = _parse_tool_result(
+            self.caller.call_tool("get_call_info", {"call_id": call_id})
+        )
+        assert "PCMA" in info.get("codec", "")
+
+        self.caller.call_tool("hangup", {"call_id": call_id})

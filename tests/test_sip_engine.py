@@ -44,3 +44,9 @@ class TestInitializedProperty:
     def test_default_false(self):
         engine = SipEngine()
         assert engine.initialized is False
+
+
+class TestCodecs:
+    def test_get_codecs_before_init(self):
+        engine = SipEngine()
+        assert engine.get_codecs() == []

@@ -78,8 +78,15 @@ class SipCall(pj.Call):
                 except Exception:
                     log.exception("Error connecting playback for call %d", ci.id)
 
-                # Start default MOH FIRST (player → call audio)
-                if self._player is None:
+                # (Re)connect audio source → call.
+                # After re-INVITE, aud_med is a NEW port — existing
+                # player/capture connections are lost. Must reconnect.
+                if self._player is not None:
+                    try:
+                        self._player.startTransmit(aud_med)
+                    except Exception:
+                        log.debug("Player reconnect to new aud_med failed")
+                else:
                     self._start_default_moh()
 
                 # Start/reconnect recording AFTER player setup.
