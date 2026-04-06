@@ -336,6 +336,32 @@ class TestCallFlow:
         assert caller_info["state"] == "CONFIRMED"
         self.caller.call_tool("hangup", {"call_id": call_id})
 
+    def test_call_info_contacts(self):
+        """get_call_info returns remote_contact and local_contact."""
+        self._register_both()
+
+        result = _parse_tool_result(self.caller.call_tool("make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        self._wait_and_answer(self.callee)
+        time.sleep(0.5)
+
+        info = _parse_tool_result(
+            self.caller.call_tool("get_call_info", {"call_id": call_id})
+        )
+        # remote_contact should contain callee's address
+        assert "remote_contact" in info
+        assert info["remote_contact"]  # non-empty
+        assert "sip:" in info["remote_contact"]
+
+        # local_contact should contain our own address
+        assert "local_contact" in info
+        assert info["local_contact"]
+        assert "sip:" in info["local_contact"]
+
+        self.caller.call_tool("hangup", {"call_id": call_id})
+
     def test_reject_call(self):
         """Callee rejects incoming call with 486 Busy."""
         self._register_both()

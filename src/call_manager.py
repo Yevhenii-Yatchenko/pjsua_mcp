@@ -414,6 +414,8 @@ class CallManager:
             info["call_id"] = ci.id
             info["state"] = _call_state_name(ci.state)
             info["duration"] = ci.connectDuration.sec
+            info["remote_contact"] = ci.remoteContact
+            info["local_contact"] = ci.localContact
         except Exception:
             pass
         # RTP/RTCP statistics from the media stream
