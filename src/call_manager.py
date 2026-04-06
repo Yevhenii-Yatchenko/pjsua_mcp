@@ -398,7 +398,7 @@ class CallManager:
                 log.debug("Error hanging up call during cleanup")
 
     def get_call_info(self, call_id: int | None = None) -> dict[str, Any]:
-        """Get info about a call."""
+        """Get info about a call including RTP statistics."""
         call = self._get_call(call_id)
         info = call.get_cached_info()
         # Also try to get fresh info
@@ -407,6 +407,24 @@ class CallManager:
             info["call_id"] = ci.id
             info["state"] = _call_state_name(ci.state)
             info["duration"] = ci.connectDuration.sec
+        except Exception:
+            pass
+        # RTP/RTCP statistics from the media stream
+        try:
+            stat = call.getStreamStat(0)
+            rtcp = stat.rtcp
+            info["rtp"] = {
+                "tx_packets": rtcp.txStat.pkt,
+                "tx_bytes": rtcp.txStat.bytes,
+                "rx_packets": rtcp.rxStat.pkt,
+                "rx_bytes": rtcp.rxStat.bytes,
+                "rx_loss": rtcp.rxStat.loss,
+                "rx_dup": rtcp.rxStat.dup,
+                "rx_reorder": rtcp.rxStat.reorder,
+                "rx_discard": rtcp.rxStat.discard,
+                "rx_jitter_usec": rtcp.rxStat.jitterUsec.last,
+                "rtt_usec": rtcp.rttUsec.last,
+            }
         except Exception:
             pass
         return info
