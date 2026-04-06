@@ -99,6 +99,7 @@ async def configure(
     srtp: bool = False,
     local_port: int = 0,
     auto_answer: bool = False,
+    codecs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Configure (or reconfigure) the SIP user agent.
 
@@ -115,6 +116,7 @@ async def configure(
         srtp: Enable SRTP media encryption (default False)
         local_port: Local port to bind (0 = auto)
         auto_answer: Automatically answer incoming calls with 200 OK (default False)
+        codecs: List of codecs in priority order, e.g. ["PCMU", "G722"]. Others disabled. Default: all enabled.
     """
     global _poll_task
     assert engine is not None and account_mgr is not None
@@ -146,11 +148,17 @@ async def configure(
             auto_answer=auto_answer,
         )
 
+        # Set codec priorities if specified
+        enabled_codecs = None
+        if codecs and engine.initialized:
+            enabled_codecs = engine.set_codecs(codecs)
+
         return {
             "status": "configured",
             "transport": transport,
             "transport_id": transport_id,
             "domain": domain,
+            "codecs": enabled_codecs,
         }
     except Exception as e:
         log.exception("configure failed")
@@ -444,6 +452,51 @@ async def conference(call_ids: list[int]) -> dict[str, Any]:
         return {"status": "ok", **info}
     except Exception as e:
         log.exception("conference failed")
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Tool: codec management
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def set_codecs(
+    codecs: list[str],
+    call_id: int | None = None,
+) -> dict[str, Any]:
+    """Set codec priorities and optionally renegotiate an active call.
+
+    Codecs are specified in priority order (first = highest). All unlisted
+    codecs are disabled. If call_id is provided (or a call is active),
+    sends a re-INVITE to renegotiate media with the new codec set.
+
+    Args:
+        codecs: Codec names in priority order, e.g. ["PCMU", "G722", "PCMA"]
+        call_id: If set, renegotiate this active call with re-INVITE
+    """
+    assert engine is not None and call_mgr is not None
+    try:
+        if call_id is not None:
+            info = call_mgr.reinvite_with_codecs(codecs, call_id=call_id)
+        else:
+            enabled = engine.set_codecs(codecs)
+            info = {"codecs": enabled, "reinvite": False}
+        return {"status": "ok", **info}
+    except Exception as e:
+        log.exception("set_codecs failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+async def get_codecs() -> dict[str, Any]:
+    """List all available codecs with their current priorities.
+
+    Priority 0 means disabled. Higher priority = preferred in SDP negotiation.
+    """
+    assert engine is not None
+    try:
+        return {"codecs": engine.get_codecs()}
+    except Exception as e:
+        log.exception("get_codecs failed")
         return {"status": "error", "error": str(e)}
 
 

@@ -103,6 +103,55 @@ class SipEngine:
         if self._ep and not self._ep.libIsThreadRegistered():
             self._ep.libRegisterThread(threading.current_thread().name)
 
+    def set_codecs(self, codecs: list[str]) -> list[dict]:
+        """Set codec priorities. Codecs in the list are enabled in order;
+        all others are disabled (priority=0).
+
+        Codec names can be short ("PCMU", "G722") or full ("PCMU/8000/1").
+        Returns the resulting codec list with priorities.
+        """
+        if not self._ep:
+            raise RuntimeError("SIP engine not initialized")
+
+        # Get all available codecs
+        all_codecs = self._ep.codecEnum2()
+        all_ids = [c.codecId for c in all_codecs]
+
+        # Resolve short names to full codec IDs
+        def _resolve(name: str) -> str | None:
+            name_upper = name.upper()
+            for cid in all_ids:
+                if cid.upper().startswith(name_upper):
+                    return cid
+            return None
+
+        # Disable all codecs first
+        for cid in all_ids:
+            self._ep.codecSetPriority(cid, 0)
+
+        # Enable requested codecs in priority order (first = highest)
+        enabled = []
+        for i, name in enumerate(codecs):
+            cid = _resolve(name)
+            if cid:
+                priority = 255 - i  # first codec gets 255, second 254, etc.
+                self._ep.codecSetPriority(cid, priority)
+                enabled.append({"codec": cid, "priority": priority})
+                log.info("Codec %s priority=%d", cid, priority)
+            else:
+                log.warning("Codec not found: %s", name)
+
+        return enabled
+
+    def get_codecs(self) -> list[dict]:
+        """Return all codecs with their current priorities."""
+        if not self._ep:
+            return []
+        return [
+            {"codec": c.codecId, "priority": c.priority}
+            for c in self._ep.codecEnum2()
+        ]
+
     def get_log_entries(
         self,
         last_n: int | None = None,

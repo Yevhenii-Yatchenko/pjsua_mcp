@@ -443,6 +443,18 @@ class CallManager:
                 dparam.method = pj.PJSUA_DTMF_METHOD_SIP_INFO
                 call.sendDtmf(dparam)
 
+    def reinvite_with_codecs(self, codecs: list[str], call_id: int | None = None) -> dict[str, Any]:
+        """Change codecs on an active call via re-INVITE.
+
+        Sets codec priorities on the endpoint, then sends re-INVITE
+        to renegotiate media with the new SDP.
+        """
+        enabled = self._engine.set_codecs(codecs)
+        call = self._get_call(call_id)
+        prm = pj.CallOpParam()
+        call.reinvite(prm)
+        return {"codecs": enabled, "reinvite": True}
+
     def play_audio(self, file_path: str, call_id: int | None = None, loop: bool = False) -> dict[str, Any]:
         """Play a WAV file into a call's audio stream."""
         call = self._get_call(call_id)
