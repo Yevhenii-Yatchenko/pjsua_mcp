@@ -543,6 +543,43 @@ class CallManager:
             self._incoming_queue.clear()
             self._auto_answer_pending.clear()
 
+    def list_calls(self) -> list[dict]:
+        """List all tracked calls with basic status."""
+        result = []
+        with self._lock:
+            for cid, call in self._calls.items():
+                info = call.get_cached_info()
+                entry = {
+                    "call_id": cid,
+                    "state": info.get("state", "UNKNOWN"),
+                    "remote_uri": info.get("remote_uri", ""),
+                    "duration": info.get("duration", 0),
+                    "codec": info.get("codec", ""),
+                }
+                # Try fresh state
+                try:
+                    ci = call.getInfo()
+                    entry["state"] = _call_state_name(ci.state)
+                    entry["call_id"] = ci.id
+                    entry["duration"] = ci.connectDuration.sec
+                except Exception:
+                    pass
+                result.append(entry)
+        return result
+
+    def get_active_calls(self) -> list[dict]:
+        """List only active (non-DISCONNECTED) calls with full info + RTP."""
+        result = []
+        for entry in self.list_calls():
+            if entry["state"] not in ("DISCONNECTED", "NONE", "NULL"):
+                # Get full info including RTP
+                try:
+                    full = self.get_call_info(call_id=entry["call_id"])
+                    result.append(full)
+                except Exception:
+                    result.append(entry)
+        return result
+
     def get_call_history(self, last_n: int | None = None) -> list[dict]:
         history = list(self._call_history)
         if last_n:

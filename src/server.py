@@ -188,6 +188,73 @@ async def register() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def setup(
+    domain: str,
+    username: str,
+    password: str,
+    transport: str = "udp",
+    codecs: list[str] | None = None,
+    auto_answer: bool = False,
+    local_port: int = 0,
+) -> dict[str, Any]:
+    """All-in-one: configure + set codecs + register in a single call.
+
+    Equivalent to calling configure(), set_codecs(), register() separately
+    but saves 2-3 tool calls per phone.
+
+    Args:
+        domain: SIP domain / registrar address
+        username: SIP username
+        password: SIP password
+        transport: "udp", "tcp", or "tls"
+        codecs: Codec priority list, e.g. ["PCMA"]. Default: all enabled.
+        auto_answer: Auto-answer incoming calls
+        local_port: Local SIP port (0 = auto)
+    """
+    assert engine is not None and account_mgr is not None and call_mgr is not None
+    global _poll_task
+    try:
+        # Configure engine
+        transport_id: int | None = None
+        if engine.initialized:
+            call_mgr.hangup_all()
+            account_mgr.unregister_all()
+            await asyncio.sleep(0.5)
+        else:
+            transport_id = engine.initialize(transport=transport, local_port=local_port)
+            if _poll_task is None or _poll_task.done():
+                _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
+
+        account_mgr.configure(
+            domain=domain, username=username, password=password,
+            auto_answer=auto_answer,
+        )
+
+        # Set codecs
+        enabled_codecs = None
+        if codecs:
+            enabled_codecs = engine.set_codecs(codecs)
+
+        # Register
+        call_mgr.cleanup()
+        account_mgr.register()
+        call_mgr._ensure_incoming_handler()
+        await asyncio.sleep(1)
+        reg_info = account_mgr.get_registration_info()
+
+        return {
+            "status": "ok",
+            "domain": domain,
+            "username": username,
+            "codecs": enabled_codecs,
+            **reg_info,
+        }
+    except Exception as e:
+        log.exception("setup failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
 async def unregister() -> dict[str, Any]:
     """Unregister the current SIP account."""
     assert account_mgr is not None
@@ -638,6 +705,41 @@ async def list_recordings() -> dict[str, Any]:
         return {"recordings": recordings, "total_count": len(recordings)}
     except Exception as e:
         log.exception("list_recordings failed")
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Tool: call listing
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def list_calls() -> dict[str, Any]:
+    """List all tracked calls with their current state.
+
+    Returns a compact summary of every call_id: state, remote URI, duration, codec.
+    Includes DISCONNECTED calls that haven't been cleaned up yet.
+    """
+    assert call_mgr is not None
+    try:
+        calls = call_mgr.list_calls()
+        return {"calls": calls, "total_count": len(calls)}
+    except Exception as e:
+        log.exception("list_calls failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+async def get_active_calls() -> dict[str, Any]:
+    """List only active calls with full info including RTP stats.
+
+    Filters out DISCONNECTED/NONE calls. Returns the same data as
+    get_call_info but for all active calls at once.
+    """
+    assert call_mgr is not None
+    try:
+        calls = call_mgr.get_active_calls()
+        return {"calls": calls, "active_count": len(calls)}
+    except Exception as e:
+        log.exception("get_active_calls failed")
         return {"status": "error", "error": str(e)}
 
 
