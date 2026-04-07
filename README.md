@@ -21,8 +21,8 @@ An AI can register with a SIP PBX, place and receive phone calls, transfer calls
 │  │ SipEngine   │  │ AccountManager│  │  CallManager   │  │
 │  │ (Endpoint,  │  │ (credentials, │  │  (dial, answer,│  │
 │  │  transport, │  │  REGISTER,    │  │   hangup, DTMF,│  │
-│  │  event loop)│  │  SIP MESSAGE) │  │   hold, xfer,  │  │
-│  │             │  │               │  │   conference,  │  │
+│  │  codecs,    │  │  SIP MESSAGE) │  │   hold, xfer,  │  │
+│  │  event loop)│  │               │  │   conference,  │  │
 │  │             │  │               │  │   record, play)│  │
 │  └──────┬─────┘  └───────┬───────┘  └───────┬────────┘  │
 │         │                │                   │           │
@@ -45,13 +45,14 @@ An AI can register with a SIP PBX, place and receive phone calls, transfer calls
         └─────────────┘
 ```
 
-## MCP Tools (26)
+## MCP Tools (31)
 
 ### Setup & Registration
 
 | Tool | Description |
 |------|-------------|
-| `configure` | Initialize SIP engine — transport (UDP/TCP/TLS), domain, credentials, SRTP, `auto_answer` flag |
+| `setup` | **All-in-one**: configure + set codecs + register in a single call |
+| `configure` | Initialize SIP engine — transport, domain, credentials, SRTP, `auto_answer`, `codecs` |
 | `register` | Send SIP REGISTER to the configured registrar |
 | `unregister` | Send un-REGISTER |
 | `get_registration_status` | Check current registration state, status code, expiry |
@@ -64,8 +65,10 @@ An AI can register with a SIP PBX, place and receive phone calls, transfer calls
 | `answer_call` | Answer an incoming call (auto-selects first ringing, or by call ID) |
 | `reject_call` | Reject an incoming call with SIP status code (486 Busy, 603 Decline) |
 | `hangup` | Hang up a call |
-| `get_call_info` | Get call state (CALLING, EARLY, CONFIRMED, DISCONNECTED), codec, duration, recording path |
-| `get_call_history` | List completed calls with duration, status, codec, recording path |
+| `get_call_info` | Call state, codec, duration, recording path, remote/local Contact, RTP stats |
+| `get_active_calls` | **All active calls** with full info + RTP stats (no blind scanning) |
+| `list_calls` | Compact summary of every tracked call_id with state |
+| `get_call_history` | Completed calls with duration, status, codec, recording path |
 | `send_dtmf` | Send DTMF digits on an active call |
 | `hold` | Put a call on hold |
 | `unhold` | Resume a held call |
@@ -77,6 +80,13 @@ An AI can register with a SIP PBX, place and receive phone calls, transfer calls
 | `blind_transfer` | Blind transfer — send SIP REFER to redirect a call to another URI |
 | `attended_transfer` | Attended transfer — bridge two active calls via REFER with Replaces |
 | `conference` | Bridge multiple calls into a conference (3-way+) via the PJSUA2 conference bridge |
+
+### Codec Management
+
+| Tool | Description |
+|------|-------------|
+| `set_codecs` | Set codec priorities + optional re-INVITE to change codec mid-call |
+| `get_codecs` | List all available codecs with current priorities |
 
 ### Audio Playback & Recording
 
@@ -129,12 +139,45 @@ Add to your MCP client config (e.g. `.mcp.json`):
 ### 3. Use it
 
 ```
-configure(domain="sip.example.com", username="alice", password="secret")
-register()
+setup(domain="sip.example.com", username="alice", password="secret", codecs=["PCMU"])
 make_call(dest_uri="sip:bob@sip.example.com")
 get_call_info()
 hangup()
 get_sip_log(filter_text="INVITE")
+```
+
+## Multi-Instance Setup
+
+To run multiple UA instances in one Claude Code session (for call testing, transfers, conferences):
+
+```json
+{
+  "mcpServers": {
+    "pjsua_a": {
+      "command": "docker",
+      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "-i", "pjsua-mcp"]
+    },
+    "pjsua_b": {
+      "command": "docker",
+      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "-i", "pjsua-mcp"]
+    },
+    "pjsua_c": {
+      "command": "docker",
+      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "-i", "pjsua-mcp"]
+    }
+  }
+}
+```
+
+Each instance is an independent SIP UA with its own endpoint, registration, and calls. The AI sees them as `pjsua_a`, `pjsua_b`, `pjsua_c` and can orchestrate multi-party scenarios:
+
+```
+pjsua_a → setup(domain="pbx", username="6001", password="x", codecs=["PCMA"])
+pjsua_b → setup(domain="pbx", username="6002", password="x", auto_answer=True)
+pjsua_a → make_call(dest_uri="sip:6002@pbx")
+pjsua_a → get_active_calls()        # see call state + RTP stats
+pjsua_b → get_active_calls()        # see the other side
+pjsua_a → blind_transfer(dest_uri="sip:6003@pbx")
 ```
 
 ## Call Scenarios
@@ -142,19 +185,18 @@ get_sip_log(filter_text="INVITE")
 ### Basic call
 
 ```
-configure(domain="pbx.local", username="6001", password="secret")
-register()
+setup(domain="pbx.local", username="6001", password="secret")
 make_call(dest_uri="sip:6002@pbx.local")
-# ... call is active, MOH plays automatically ...
+# ... MOH plays automatically, call is recorded ...
+get_call_info()       # state, codec, duration, remote_contact, RTP stats
 hangup()
-get_call_history()    # see completed call with recording path
+get_call_history()    # completed call with recording path
 ```
 
 ### Auto-answer (IVR/bot mode)
 
 ```
-configure(domain="pbx.local", username="6001", password="secret", auto_answer=True)
-register()
+setup(domain="pbx.local", username="6001", password="secret", auto_answer=True)
 # Incoming calls are answered automatically with 200 OK
 # play_audio("/app/audio/greeting.wav") to play a prompt
 ```
@@ -173,7 +215,7 @@ blind_transfer(dest_uri="sip:6003@pbx.local")
 # B has active call with A:
 hold(call_id=1)                                    # put A on hold
 make_call(dest_uri="sip:6003@pbx.local")           # consult with C
-attended_transfer(call_id=1, dest_call_id=2)        # bridge A↔C, B exits
+attended_transfer(call_id=1, dest_call_id=2)        # bridge A<>C, B exits
 ```
 
 ### 3-way conference
@@ -185,12 +227,62 @@ conference(call_ids=[0, 1])                         # bridge all together
 # All three parties can hear each other
 ```
 
+### Codec selection & mid-call change
+
+```
+setup(domain="pbx.local", username="6001", password="x", codecs=["G722"])
+make_call(dest_uri="sip:6002@pbx.local")
+get_codecs()                                        # see current priorities
+set_codecs(codecs=["PCMA"], call_id=0)              # re-INVITE with new codec
+get_call_info()                                     # verify codec changed
+```
+
 ### SIP messaging
 
 ```
 send_message(dest_uri="sip:6002@pbx.local", body="Hello!")
 get_messages()    # check received messages
 ```
+
+### Monitoring active calls
+
+```
+get_active_calls()     # all active calls with RTP stats in one call
+list_calls()           # compact summary including DISCONNECTED
+get_call_history()     # completed calls with metadata
+```
+
+## Call Info & RTP Statistics
+
+`get_call_info` returns comprehensive call data including real-time RTP statistics:
+
+```json
+{
+  "call_id": 0,
+  "state": "CONFIRMED",
+  "remote_uri": "sip:6002@pbx",
+  "remote_contact": "<sip:6002@172.20.0.3:5060;ob>",
+  "local_contact": "<sip:6001@172.20.0.2:5060>",
+  "codec": "PCMA",
+  "duration": 45,
+  "recording_file": "/recordings/call_0_20260407_141603.wav",
+  "playing_file": "/app/audio/moh.wav",
+  "rtp": {
+    "tx_packets": 2250,
+    "tx_bytes": 360000,
+    "rx_packets": 2248,
+    "rx_bytes": 359680,
+    "rx_loss": 0,
+    "rx_dup": 0,
+    "rx_reorder": 0,
+    "rx_discard": 0,
+    "rx_jitter_usec": 875,
+    "rtt_usec": 6362
+  }
+}
+```
+
+`get_active_calls` returns this data for all active calls at once — no need to scan call_ids.
 
 ## Call Recording & Audio
 
@@ -222,7 +314,7 @@ Each entry contains:
 docker compose run --rm --entrypoint pytest pjsua-mcp tests/ -m "not integration" -v
 ```
 
-32 tests covering all modules — log writer, engine guards, account config, call lookup, pcap file lookup, message queue, call history.
+33 tests covering all modules — log writer, engine guards, account config, call lookup, pcap file lookup, message queue, call history, codecs.
 
 ### Integration tests (self-contained)
 
@@ -232,7 +324,7 @@ The integration tests run a complete SIP environment inside Docker Compose — n
 docker compose -f docker-compose.test.yml run --build --rm test-runner
 ```
 
-18 integration tests using 2-3 MCP UA instances communicating via Asterisk PBX:
+22 integration tests using 2-3 MCP UA instances communicating via Asterisk PBX:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -251,7 +343,8 @@ docker compose -f docker-compose.test.yml run --build --rm test-runner
 │  │          ▼                  ▼                   ▼            │   │
 │  │  ┌──────────────────────────────────────────────────────┐   │   │
 │  │  │  pytest test orchestrator                             │   │   │
-│  │  │  Registration, calls, transfers, conference, msgs     │   │   │
+│  │  │  Registration, calls, transfers, conference, msgs,    │   │   │
+│  │  │  codecs, auto-answer, reject, call history            │   │   │
 │  │  └──────────────────────────────────────────────────────┘   │   │
 │  └──────────────────────────┬──────────────────────────────────┘   │
 │                    SIP/UDP  │                                       │
@@ -273,40 +366,44 @@ docker compose -f docker-compose.test.yml run --build --rm test-runner
 | `test_get_sip_log_has_entries` | SIP log captures real signaling |
 | `test_get_sip_log_filter` | Text filtering works |
 | `test_unregister` | Clean un-REGISTER |
-| `test_call_and_hangup` | Full call: INVITE → 200 OK → CONFIRMED → BYE |
+| `test_call_and_hangup` | Full call: INVITE, 200 OK, CONFIRMED, BYE |
 | `test_callee_hangup` | Callee-initiated BYE |
 | `test_sip_log_shows_invite` | INVITE appears in SIP log after call |
 | `test_auto_answer` | auto_answer=True answers without manual answer_call |
+| `test_call_info_contacts` | remote_contact and local_contact returned |
 | `test_reject_call` | Reject with 486 Busy, verify in caller's SIP log |
 | `test_call_history` | Completed call appears in history with metadata |
 | `test_send_and_receive_message` | SIP MESSAGE round-trip between two UAs |
 | `test_get_messages_empty` | Empty message queue on fresh account |
 | `test_send_message_without_registration` | Error when sending without register |
-| `test_blind_transfer` | A↔B call, B sends REFER to redirect A to C |
-| `test_attended_transfer` | A↔B, B holds, B↔C consult, B bridges A↔C via REFER/Replaces |
-| `test_three_way_conference` | A calls B and C, bridges via conference bridge, all CONFIRMED |
+| `test_blind_transfer` | A calls B, B sends REFER to redirect A to C |
+| `test_attended_transfer` | A calls B, B holds, B calls C, B bridges A to C |
+| `test_three_way_conference` | A calls B and C, bridges via conference bridge |
+| `test_configure_with_codecs` | Configure with specific codec, verify in call |
+| `test_get_codecs` | List codecs with priorities |
+| `test_set_codecs_midcall` | Change codec mid-call via re-INVITE |
 
 ## Project Structure
 
 ```
 pjsua_mcp/
 ├── src/
-│   ├── server.py            # MCP entry point, 26 tool definitions
-│   ├── sip_engine.py        # PJSUA2 Endpoint lifecycle
+│   ├── server.py            # MCP entry point, 31 tool definitions
+│   ├── sip_engine.py        # PJSUA2 Endpoint lifecycle, codec management
 │   ├── account_manager.py   # SIP registration, credentials, messaging
 │   ├── call_manager.py      # Call control, transfer, conference, recording, playback
-│   ├── sip_logger.py        # Custom LogWriter → bounded deque
+│   ├── sip_logger.py        # Custom LogWriter -> bounded deque
 │   └── pcap_manager.py      # tcpdump subprocess management
 ├── audio/
 │   └── moh.wav              # Default MOH (CC0, FreeSWITCH/MUSOPEN)
 ├── tests/
 │   ├── conftest.py           # Shared fixtures
 │   ├── test_sip_logger.py    # 7 unit tests
-│   ├── test_sip_engine.py    # 5 unit tests
+│   ├── test_sip_engine.py    # 6 unit tests
 │   ├── test_account_manager.py  # 11 unit tests
 │   ├── test_call_manager.py  # 4 unit tests
 │   ├── test_pcap_manager.py  # 5 unit tests
-│   ├── test_integration.py   # 18 integration tests
+│   ├── test_integration.py   # 22 integration tests
 │   └── asterisk/
 │       ├── Dockerfile        # Asterisk PBX image for testing
 │       ├── pjsip.conf        # Three extensions (6001-6003) with digest auth
@@ -328,5 +425,7 @@ pjsua_mcp/
 - **stdout protection** — C-level fd 1 is redirected to stderr at startup. MCP JSON-RPC uses a saved copy of the original stdout fd. This prevents pjlib console output from corrupting the MCP channel.
 - **SIP log** — `consoleLevel=5` (matching `level=5`) ensures the global log level isn't suppressed. The LogWriter captures everything into a thread-safe bounded deque.
 - **Auto-answer** — deferred to the event poll loop (not inside `onIncomingCall` callback) to avoid PJSUA2 call state machine issues.
-- **Recording** — recorder connected AFTER player setup to avoid conference bridge disruption; reconnected on every `onCallMediaState` for robustness.
+- **Recording** — recorder connected AFTER player setup to avoid conference bridge disruption; reconnected on every `onCallMediaState` for robustness. Both local and remote audio mixed into one mono WAV.
+- **Re-INVITE handling** — audio player is reconnected to the new `aud_med` port after re-INVITE (codec change, conference conversion) to maintain TX.
+- **Stale call cleanup** — disconnected calls are removed from tracking; accounts are shut down before re-registration to prevent ghost sessions.
 - **MOH** — Suite Espanola Op. 47 — Leyenda (Albeniz), classical guitar, CC0 public domain from FreeSWITCH/MUSOPEN.
