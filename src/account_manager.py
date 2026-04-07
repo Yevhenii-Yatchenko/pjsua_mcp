@@ -119,6 +119,15 @@ class AccountManager:
         if self._domain is None:
             raise RuntimeError("Account not configured — call configure tool first")
 
+        # Shut down old account to prevent ghost sessions
+        if self._account:
+            try:
+                if self._account.isValid():
+                    self._account.shutdown()
+            except Exception:
+                log.debug("Error shutting down old account")
+            self._account = None
+
         acc_cfg = pj.AccountConfig()
 
         # Build SIP ID and registrar URI

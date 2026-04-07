@@ -173,6 +173,8 @@ async def register() -> dict[str, Any]:
     """Register the configured SIP account with the registrar."""
     assert account_mgr is not None and call_mgr is not None
     try:
+        # Clean stale call state before re-registration
+        call_mgr.cleanup()
         account_mgr.register()
         # Wire up incoming call handler now that account exists
         call_mgr._ensure_incoming_handler()

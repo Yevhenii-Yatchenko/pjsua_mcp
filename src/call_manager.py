@@ -515,7 +515,7 @@ class CallManager:
         call.reinvite(prm)
 
     def _on_call_disconnected(self, info: dict) -> None:
-        """Record call to history when disconnected."""
+        """Record call to history and remove from active calls."""
         self._call_history.append({
             "remote_uri": info.get("remote_uri", ""),
             "duration": info.get("duration", 0),
@@ -525,6 +525,23 @@ class CallManager:
             "recording_file": info.get("recording_file"),
             "timestamp": datetime.now().isoformat(),
         })
+        # Remove disconnected calls from _calls dict to prevent stale entries
+        with self._lock:
+            stale = [cid for cid, c in self._calls.items()
+                     if c.get_cached_info().get("state") == "DISCONNECTED"]
+            for cid in stale:
+                del self._calls[cid]
+            # Clean incoming queue of stale IDs
+            self._incoming_queue = [
+                cid for cid in self._incoming_queue if cid in self._calls
+            ]
+
+    def cleanup(self) -> None:
+        """Clear all call state — called before re-registration."""
+        with self._lock:
+            self._calls.clear()
+            self._incoming_queue.clear()
+            self._auto_answer_pending.clear()
 
     def get_call_history(self, last_n: int | None = None) -> list[dict]:
         history = list(self._call_history)
