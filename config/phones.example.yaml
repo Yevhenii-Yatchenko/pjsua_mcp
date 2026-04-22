@@ -20,10 +20,17 @@ defaults:
   auto_answer: false
   register: true
   srtp: false
+  # Call recording is OFF by default. To enable it, set `recordings_dir`
+  # either here (same dir for every phone) or per-phone. The directory
+  # is created if missing. Recordings land as
+  # <recordings_dir>/call_<phone_id>_<call_id>_<ts>.wav.
+  # recordings_dir: /recordings
 
 phones:
   - phone_id: a
     username: "1001"
+    # Enable recording just for phone a:
+    # recordings_dir: /recordings/a
 
   - phone_id: b
     username: "1002"

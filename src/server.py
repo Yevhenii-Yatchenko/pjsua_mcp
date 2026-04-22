@@ -70,10 +70,17 @@ defaults:
   auto_answer: false
   register: true
   srtp: false
+  # Call recording is OFF by default. To enable it, set `recordings_dir`
+  # either here (same dir for every phone) or per-phone. The directory
+  # is created if missing. Recordings land as
+  # <recordings_dir>/call_<phone_id>_<call_id>_<ts>.wav.
+  # recordings_dir: /recordings
 
 phones:
   - phone_id: a
     username: "1001"
+    # Enable recording just for phone a:
+    # recordings_dir: /recordings/a
 
   - phone_id: b
     username: "1002"
@@ -186,6 +193,7 @@ def _add_phone_impl(
     local_port: int = 0,
     codecs: list[str] | None = None,
     register: bool = True,
+    recordings_dir: str | None = None,
 ) -> dict[str, Any]:
     """Common add-phone routine — no client notification, no async."""
     assert registry is not None and engine is not None
@@ -213,6 +221,7 @@ def _add_phone_impl(
         local_port=local_port,
         codecs=codecs,
         register=register,
+        recordings_dir=recordings_dir,
     )
 
     tool_names = register_phone_tools(mcp, phone_id, call_mgr, registry)
@@ -227,6 +236,7 @@ def _add_phone_impl(
         "auto_answer": auto_answer,
         "transport": transport,
         "transport_id": cfg.transport_id if cfg else None,
+        "recordings_dir": cfg.recordings_dir if cfg else None,
         "tools_registered": len(tool_names),
         **reg,
     }
@@ -286,12 +296,18 @@ async def add_phone(
     srtp: bool = False,
     realm: str | None = None,
     register: bool = True,
+    recordings_dir: str | None = None,
 ) -> dict[str, Any]:
     """Add a new phone (SIP account) and register its per-phone action tools.
 
     After a successful add, new tools named `<phone_id>_make_call`,
     `<phone_id>_hangup`, etc. become visible via
     `notifications/tools/list_changed`.
+
+    Call recording is **off by default**. Pass `recordings_dir` to enable it:
+    every call on this phone will be recorded to
+    `<recordings_dir>/call_<phone_id>_<call_id>_<ts>.wav`. The directory is
+    created if missing. Example: `recordings_dir="/recordings/a"`.
     """
     try:
         result = _add_phone_impl(
@@ -300,6 +316,7 @@ async def add_phone(
             realm=realm, srtp=srtp, auto_answer=auto_answer,
             transport=transport, local_port=local_port,
             codecs=codecs, register=register,
+            recordings_dir=recordings_dir,
         )
         await asyncio.sleep(1.0)  # give REGISTER a moment
         result.update(registry.get_registration_info(phone_id))
@@ -346,6 +363,7 @@ async def get_phone(phone_id: str) -> dict[str, Any]:
             "local_port": cfg.local_port,
             "transport_id": cfg.transport_id,
             "codecs": cfg.codecs,
+            "recordings_dir": cfg.recordings_dir,
             "active_calls": active_calls,
             "tools": _phone_tools.get(phone_id, []),
             **reg,
@@ -407,6 +425,7 @@ async def update_phone(
 _PHONE_FIELDS = {
     "phone_id", "domain", "username", "password", "realm", "srtp",
     "auto_answer", "transport", "local_port", "codecs", "register",
+    "recordings_dir",
 }
 
 
@@ -722,41 +741,62 @@ async def list_recordings(
     phone_id: str | None = None,
     call_id: int | None = None,
 ) -> dict[str, Any]:
-    """List call recordings in /recordings/, optionally filtered by phone_id / call_id.
+    """List call recordings across every phone's configured recordings_dir.
 
-    Recordings are named `call_<phone_id>_<call_id>_<timestamp>.wav`.
+    Recording is off by default — only phones created with `recordings_dir=...`
+    (or with `recordings_dir:` set in the YAML profile) produce files.
+
+    Recordings are named `call_<phone_id>_<call_id>_<timestamp>.wav`. With
+    `phone_id`, the result is narrowed to that phone's directory. With
+    `call_id` (optionally combined), narrowed further to one call.
     """
-    recordings_dir = Path("/recordings")
+    assert registry is not None
     try:
-        if not recordings_dir.exists():
-            return {"recordings": [], "total_count": 0}
-        files = sorted(
-            recordings_dir.glob("call_*.wav"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        recordings = []
-        for f in files:
-            parts = f.stem.split("_")  # ['call', '<phone_id>', '<call_id>', 'YYYYMMDD', 'HHMMSS']
-            file_phone = parts[1] if len(parts) >= 3 else None
-            file_call = None
-            if len(parts) >= 3:
-                try:
-                    file_call = int(parts[2])
-                except ValueError:
-                    pass
-            if phone_id is not None and file_phone != phone_id:
+        # Collect every configured recordings directory, paired with its phone_id.
+        dirs: list[tuple[str, Path]] = []
+        for pid in registry.list_phone_ids():
+            if phone_id is not None and pid != phone_id:
                 continue
-            if call_id is not None and file_call != call_id:
+            cfg = registry.get_config(pid)
+            if cfg and cfg.recordings_dir:
+                dirs.append((pid, Path(cfg.recordings_dir)))
+
+        recordings: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()  # guards against two phones sharing a dir
+        for owner_pid, d in dirs:
+            if not d.exists():
                 continue
-            recordings.append({
-                "filename": f.name,
-                "file_path": str(f),
-                "file_size": f.stat().st_size,
-                "phone_id": file_phone,
-                "call_id": file_call,
-            })
-        return {"recordings": recordings, "total_count": len(recordings)}
+            for f in d.glob("call_*.wav"):
+                if str(f) in seen_paths:
+                    continue
+                seen_paths.add(str(f))
+                parts = f.stem.split("_")  # ['call', '<phone_id>', '<call_id>', 'YYYYMMDD', 'HHMMSS']
+                file_phone = parts[1] if len(parts) >= 3 else None
+                file_call = None
+                if len(parts) >= 3:
+                    try:
+                        file_call = int(parts[2])
+                    except ValueError:
+                        pass
+                if phone_id is not None and file_phone != phone_id:
+                    continue
+                if call_id is not None and file_call != call_id:
+                    continue
+                recordings.append({
+                    "filename": f.name,
+                    "file_path": str(f),
+                    "file_size": f.stat().st_size,
+                    "phone_id": file_phone,
+                    "call_id": file_call,
+                    "owner_phone_id": owner_pid,
+                })
+
+        recordings.sort(key=lambda r: r["file_path"], reverse=True)
+        return {
+            "recordings": recordings,
+            "total_count": len(recordings),
+            "searched_dirs": sorted({str(d) for _, d in dirs}),
+        }
     except Exception as e:
         log.exception("list_recordings failed")
         return {"status": "error", "error": str(e)}

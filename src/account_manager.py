@@ -6,6 +6,7 @@ import logging
 import threading
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 import pjsua2 as pj
@@ -15,6 +16,22 @@ from .sip_engine import SipEngine
 log = logging.getLogger(__name__)
 
 DEFAULT_PHONE_ID = "default"
+
+
+def _prepare_recordings_dir(phone_id: str, path: str | None) -> str | None:
+    """Validate + mkdir a per-phone recordings directory. None = feature disabled."""
+    if path is None:
+        return None
+    p = Path(path)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise ValueError(
+            f"[{phone_id}] cannot create recordings_dir {path!r}: {e}"
+        ) from e
+    if not p.is_dir():
+        raise ValueError(f"[{phone_id}] recordings_dir {path!r} is not a directory")
+    return str(p)
 
 
 @dataclass
@@ -31,6 +48,10 @@ class PhoneConfig:
     local_port: int = 0
     codecs: list[str] | None = None
     transport_id: int | None = None
+    # Per-phone call-recording directory. None = recording disabled (default).
+    # If set, every call on this phone is recorded to
+    # `<recordings_dir>/call_<phone_id>_<call_id>_<ts>.wav`.
+    recordings_dir: str | None = None
 
 
 class SipAccount(pj.Account):
@@ -129,6 +150,7 @@ class PhoneRegistry:
         local_port: int = 0,
         codecs: list[str] | None = None,
         register: bool = True,
+        recordings_dir: str | None = None,
     ) -> SipAccount:
         """Create a transport, a SipAccount, and (optionally) REGISTER.
 
@@ -153,6 +175,7 @@ class PhoneRegistry:
             transport=transport,
             local_port=local_port,
             codecs=codecs,
+            recordings_dir=_prepare_recordings_dir(phone_id, recordings_dir),
         )
 
         # Per-phone transport
@@ -279,6 +302,7 @@ class PhoneRegistry:
                 "transport": cfg.transport if cfg else "udp",
                 "local_port": cfg.local_port if cfg else 0,
                 "transport_id": cfg.transport_id if cfg else None,
+                "recordings_dir": cfg.recordings_dir if cfg else None,
                 **reg,
             }
             result.append(entry)
@@ -308,6 +332,7 @@ class PhoneRegistry:
             local_port=cfg.local_port,
             codecs=cfg.codecs,
             register=True,
+            recordings_dir=cfg.recordings_dir,
         )
 
     def send_message(

@@ -272,6 +272,110 @@ class TestDynamicTools:
         assert "invalid" in result["error"].lower()
 
 
+class TestRecordingConfig:
+    """Per-phone call-recording opt-in. No SIP_DOMAIN needed."""
+
+    @pytest.fixture(autouse=True)
+    def mcp(self, tmp_path):
+        self.tmp_path = tmp_path
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            yield
+
+    def test_recording_disabled_by_default(self):
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+        assert result["recordings_dir"] is None
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
+        assert info["recordings_dir"] is None
+
+    def test_recording_enabled_with_recordings_dir(self):
+        rec_dir = str(self.tmp_path / "rec_z")
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+            "recordings_dir": rec_dir,
+        }))
+        assert result["recordings_dir"] == rec_dir
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
+        assert info["recordings_dir"] == rec_dir
+
+    def test_recording_dir_is_created_if_missing(self):
+        """add_phone auto-creates a missing recordings_dir."""
+        rec_dir = self.tmp_path / "deeply" / "nested" / "rec"
+        assert not rec_dir.exists()
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+            "recordings_dir": str(rec_dir),
+        }))
+        assert result["status"] == "ok"
+        assert rec_dir.exists()
+        assert rec_dir.is_dir()
+
+    def test_get_recording_errors_when_disabled(self):
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+        result = _parse_tool_result(self.client.call_tool("z_get_recording"))
+        assert result["status"] == "error"
+        assert result["recordings_dir"] is None
+        assert "disabled" in result["error"].lower()
+
+    def test_list_recordings_covers_only_enabled_phones(self):
+        # Phone z has no recordings_dir, phone w has one with a fake file
+        w_dir = self.tmp_path / "rec_w"
+        w_dir.mkdir()
+        (w_dir / "call_w_0_20260101_120000.wav").write_bytes(b"fake wav")
+
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "w",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+            "recordings_dir": str(w_dir),
+        }))
+
+        result = _parse_tool_result(self.client.call_tool("list_recordings"))
+        assert result["total_count"] == 1
+        assert result["recordings"][0]["phone_id"] == "w"
+        assert str(w_dir) in result["searched_dirs"]
+
+    def test_load_phone_profile_with_recordings_dir(self):
+        rec_dir = self.tmp_path / "profile_rec"
+        profile = self.tmp_path / "p.yaml"
+        profile.write_text(f"""
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+phones:
+  - {{phone_id: p1, username: u1}}
+  - {{phone_id: p2, username: u2, recordings_dir: {rec_dir}}}
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": str(profile)}))
+        assert result["status"] == "ok"
+
+        p1 = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "p1"}))
+        p2 = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "p2"}))
+        assert p1["recordings_dir"] is None
+        assert p2["recordings_dir"] == str(rec_dir)
+
+
 class TestLoadPhoneProfile:
     """Profile loader — no SIP_DOMAIN needed (all phones use register=False)."""
 

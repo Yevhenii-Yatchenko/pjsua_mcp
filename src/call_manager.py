@@ -16,7 +16,6 @@ from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 
 log = logging.getLogger(__name__)
 
-RECORDINGS_DIR = Path("/recordings")
 DEFAULT_MOH_FILE = Path("/app/audio/moh.wav")
 
 
@@ -28,9 +27,11 @@ class SipCall(pj.Call):
         account: pj.Account,
         call_id: int = pj.PJSUA_INVALID_ID,
         phone_id: str = DEFAULT_PHONE_ID,
+        recordings_dir: str | None = None,
     ) -> None:
         super().__init__(account, call_id)
         self.phone_id = phone_id
+        self._recordings_dir = recordings_dir
         self._lock = threading.Lock()
         self._recorder: pj.AudioMediaRecorder | None = None
         self._recording_file: str | None = None
@@ -116,17 +117,22 @@ class SipCall(pj.Call):
     def _ensure_recording(self, call_id: int, aud_med: pj.AudioMedia) -> None:
         """Create recorder once, (re)connect it to aud_med every time.
 
+        No-op if the phone's `recordings_dir` is None (recording disabled).
         Must be called AFTER the player is set up — player.startTransmit()
         can disrupt existing conference bridge connections.
         """
+        if self._recordings_dir is None:
+            return  # recording disabled for this phone
+
         # Create recorder file once per call
         if self._recorder is None:
             try:
-                RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+                recordings_path = Path(self._recordings_dir)
+                recordings_path.mkdir(parents=True, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                # Embed phone_id in filename for multi-phone disambiguation
+                # Embed phone_id in filename for disambiguation within a shared dir.
                 filename = f"call_{self.phone_id}_{call_id}_{timestamp}.wav"
-                filepath = RECORDINGS_DIR / filename
+                filepath = recordings_path / filename
 
                 recorder = pj.AudioMediaRecorder()
                 recorder.createRecorder(str(filepath))
@@ -297,7 +303,9 @@ class CallManager:
         if acc is None:
             log.warning("[%s] Incoming call %d for unknown phone", phone_id, call_id)
             return
-        call = SipCall(acc, call_id, phone_id=phone_id)
+        cfg = self._registry.get_config(phone_id)
+        recordings_dir = cfg.recordings_dir if cfg else None
+        call = SipCall(acc, call_id, phone_id=phone_id, recordings_dir=recordings_dir)
         call.on_disconnected_cb = self._on_call_disconnected
         with self._lock:
             self._calls[call_id] = call
@@ -369,7 +377,9 @@ class CallManager:
         self._ensure_incoming_handler(pid)
         acc = self._registry.require_account(pid)
 
-        call = SipCall(acc, phone_id=pid)
+        cfg = self._registry.get_config(pid)
+        recordings_dir = cfg.recordings_dir if cfg else None
+        call = SipCall(acc, phone_id=pid, recordings_dir=recordings_dir)
         call.on_disconnected_cb = self._on_call_disconnected
         prm = pj.CallOpParam(True)  # True = use default call settings
 
