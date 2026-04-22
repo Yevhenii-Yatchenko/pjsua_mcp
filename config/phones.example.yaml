@@ -1,15 +1,17 @@
 # Phone profile for load_phone_profile.
 #
-# Copy this file to phones.yaml (gitignored) and fill in the credentials
-# for your test stand, then invoke the tool:
+# Save this file on the host at ./config/phones.yaml (the docker-compose
+# bind mounts ./config to /config inside the container), fill in the
+# credentials for your SIP stand, then invoke the MCP tool:
 #
-#   mcp__pjsua__load_phone_profile(path="/config/phones.yaml")
+#   mcp__pjsua__load_phone_profile()                               # /config/phones.yaml
+#   mcp__pjsua__load_phone_profile(path="/config/other.yaml")      # another profile
 #
-# Keep multiple profiles side-by-side (e.g. test-stand.yaml, prod.yaml,
-# asterisk.yaml) and pass the right path when loading.
+# This file is the canonical template; get_phone_profile_example() returns
+# the same content over MCP for callers who don't have filesystem access.
 
-# Keys under `defaults` are merged into each phone entry — override per-phone
-# by setting the same key on the phone.
+# Keys under `defaults` are merged into every phone entry.
+# Phone-level keys win over defaults.
 defaults:
   domain: sip.example.com
   password: change_me
@@ -30,6 +32,6 @@ phones:
   - phone_id: c
     username: "1003"
     auto_answer: true
-    # Per-phone override of defaults:
+    # Per-phone override:
     # password: "c_specific_pw"
     # realm: "example.realm"

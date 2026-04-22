@@ -45,6 +45,47 @@ _poll_task: asyncio.Task | None = None
 _phone_tools: dict[str, list[str]] = {}
 
 DEFAULT_PROFILE_PATH = "/config/phones.yaml"
+EXAMPLE_PROFILE_PATH = "/config/phones.example.yaml"
+
+# Authoritative template returned by `get_phone_profile_example`. Kept here
+# (not in a separate file) so the MCP tool is self-contained — callers don't
+# need filesystem access to the repo to discover the schema.
+PHONE_PROFILE_TEMPLATE = """\
+# Phone profile for load_phone_profile.
+#
+# Save this file on the host at ./config/phones.yaml (the docker-compose
+# bind mounts ./config to /config inside the container), fill in the
+# credentials for your SIP stand, then invoke the MCP tool:
+#
+#   mcp__pjsua__load_phone_profile()                               # /config/phones.yaml
+#   mcp__pjsua__load_phone_profile(path="/config/other.yaml")      # another profile
+
+# Keys under `defaults` are merged into every phone entry.
+# Phone-level keys win over defaults.
+defaults:
+  domain: sip.example.com
+  password: change_me
+  codecs: [PCMA]
+  transport: udp
+  auto_answer: false
+  register: true
+  srtp: false
+
+phones:
+  - phone_id: a
+    username: "1001"
+
+  - phone_id: b
+    username: "1002"
+    auto_answer: true
+
+  - phone_id: c
+    username: "1003"
+    auto_answer: true
+    # Per-phone override:
+    # password: "c_specific_pw"
+    # realm: "example.realm"
+"""
 
 
 async def _poll_pjsip_events(eng: SipEngine) -> None:
@@ -122,7 +163,7 @@ def _validate_phone_id(phone_id: str) -> None:
     # Guard against phone_id producing a collision with static tool names.
     static_tool_names = {
         "add_phone", "drop_phone", "list_phones", "get_phone", "update_phone",
-        "reregister_phone", "load_phone_profile",
+        "reregister_phone", "load_phone_profile", "get_phone_profile_example",
         "get_codecs", "set_codecs", "get_sip_log",
         "start_capture", "stop_capture", "get_pcap", "list_recordings",
     }
@@ -402,8 +443,9 @@ def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(
-            f"Profile not found: {path}. Place it in ./config/ on the host "
-            f"(mounted to /config in the container)."
+            f"Profile not found: {path}. Call get_phone_profile_example() "
+            f"for a template, save it to ./config/phones.yaml on the host "
+            f"(mounted read-only to /config in the container), then retry."
         )
 
     with file_path.open("r", encoding="utf-8") as f:
@@ -448,6 +490,38 @@ def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
         raise ValueError(f"{path}: duplicate phone_id(s): {dups}")
 
     return resolved
+
+
+@mcp.tool()
+async def get_phone_profile_example() -> dict[str, Any]:
+    """Return a YAML template for `load_phone_profile`.
+
+    Use this when you don't know the phone-profile format — the returned
+    `template` field is a ready-to-edit YAML. Save it as ./config/phones.yaml
+    on the host, fill in your SIP credentials, then call `load_phone_profile`.
+
+    Returns a dict with:
+      - template: YAML string (copy to phones.yaml and edit)
+      - save_to: Where to put the file (host path + container path)
+      - next_step: The MCP tool to call after saving
+      - example_file_in_container: Canonical path of the example on disk
+        (accessible via the ./config bind mount)
+    """
+    return {
+        "template": PHONE_PROFILE_TEMPLATE,
+        "save_to": {
+            "host_path": "./config/phones.yaml (in the pjsua_mcp repo)",
+            "container_path": DEFAULT_PROFILE_PATH,
+        },
+        "next_step": f"mcp__pjsua__load_phone_profile(path='{DEFAULT_PROFILE_PATH}')",
+        "example_file_in_container": EXAMPLE_PROFILE_PATH,
+        "notes": [
+            "phones.yaml is gitignored; phones.example.yaml is the tracked template.",
+            "/config is mounted read-only — edit the file on the host, not in the container.",
+            "load_phone_profile defaults to replace mode (drops existing phones + calls).",
+            "Pass merge=True to keep phones not listed in the profile.",
+        ],
+    }
 
 
 @mcp.tool()

@@ -136,48 +136,66 @@ Add to your MCP client config (e.g. `.mcp.json`):
 }
 ```
 
-### 3. Use it
+### 3. Describe your phones (YAML profile)
+
+The server has no built-in SIP credentials — you describe your phones in a YAML profile. Two ways to get the template:
+
+**(a) From MCP** — any AI client can ask the server directly:
 
 ```
-setup(domain="sip.example.com", username="alice", password="secret", codecs=["PCMU"])
-make_call(dest_uri="sip:bob@sip.example.com")
-get_call_info()
-hangup()
-get_sip_log(filter_text="INVITE")
+mcp__pjsua__get_phone_profile_example()
 ```
 
-## Multi-Instance Setup
+This returns the template YAML plus a `save_to` hint. Save the `template` field as `./config/phones.yaml` on the host.
 
-To run multiple UA instances in one Claude Code session (for call testing, transfers, conferences):
+**(b) From the repo** — copy the tracked example:
 
-```json
-{
-  "mcpServers": {
-    "pjsua_a": {
-      "command": "docker",
-      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "-i", "pjsua-mcp"]
-    },
-    "pjsua_b": {
-      "command": "docker",
-      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "-i", "pjsua-mcp"]
-    },
-    "pjsua_c": {
-      "command": "docker",
-      "args": ["compose", "-f", "/path/to/docker-compose.yml", "run", "--rm", "-i", "pjsua-mcp"]
-    }
-  }
-}
+```bash
+cp config/phones.example.yaml config/phones.yaml
+$EDITOR config/phones.yaml
 ```
 
-Each instance is an independent SIP UA with its own endpoint, registration, and calls. The AI sees them as `pjsua_a`, `pjsua_b`, `pjsua_c` and can orchestrate multi-party scenarios:
+`config/phones.yaml` is gitignored; only `phones.example.yaml` is tracked. The file gets mounted into the container at `/config/phones.yaml` (read-only) via docker-compose.
+
+Minimal profile shape:
+
+```yaml
+defaults:                 # optional — merged into every phone, phone-level keys win
+  domain: sip.example.com
+  password: change_me
+  codecs: [PCMA]
+  auto_answer: false
+
+phones:
+  - phone_id: a
+    username: "1001"
+  - phone_id: b
+    username: "1002"
+    auto_answer: true
+```
+
+### 4. Load the profile and run scenarios
+
+Once `./config/phones.yaml` exists:
 
 ```
-pjsua_a → setup(domain="pbx", username="6001", password="x", codecs=["PCMA"])
-pjsua_b → setup(domain="pbx", username="6002", password="x", auto_answer=True)
-pjsua_a → make_call(dest_uri="sip:6002@pbx")
-pjsua_a → get_active_calls()        # see call state + RTP stats
-pjsua_b → get_active_calls()        # see the other side
-pjsua_a → blind_transfer(dest_uri="sip:6003@pbx")
+mcp__pjsua__load_phone_profile()                   # default /config/phones.yaml
+# → every phone listed in the file is registered and its per-phone tools
+#   (a_make_call, b_hangup, …) become visible via tools/list_changed.
+
+mcp__pjsua__a_make_call(dest_uri="sip:002@sip.example.com")
+mcp__pjsua__a_get_call_info(call_id=0)
+mcp__pjsua__a_hangup(call_id=0)
+```
+
+`load_phone_profile` is atomic replace by default: existing calls are hung up and existing phones are dropped before the new profile is applied. Pass `merge=True` to keep phones not listed in the new profile.
+
+For ad-hoc additions without touching the profile:
+
+```
+mcp__pjsua__add_phone(phone_id="alice", domain="sip.example.com",
+                      username="1099", password="x", codecs=["PCMA"])
+mcp__pjsua__drop_phone(phone_id="alice")
 ```
 
 ## Call Scenarios
