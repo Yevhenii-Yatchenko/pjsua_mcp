@@ -158,12 +158,13 @@ def _validate_phone_id(phone_id: str) -> None:
         "get_call_info", "get_call_history", "list_calls", "get_active_calls",
         "send_dtmf", "hold", "unhold", "blind_transfer", "attended_transfer",
         "conference", "play_audio", "stop_audio", "get_recording",
-        "send_message", "get_messages", "get_registration_status", "unregister",
+        "send_message", "get_messages", "get_registration_status",
+        "register", "unregister",
     }
     # Guard against phone_id producing a collision with static tool names.
     static_tool_names = {
         "add_phone", "drop_phone", "list_phones", "get_phone", "update_phone",
-        "reregister_phone", "load_phone_profile", "get_phone_profile_example",
+        "load_phone_profile", "get_phone_profile_example",
         "get_codecs", "set_codecs", "get_sip_log",
         "start_capture", "stop_capture", "get_pcap", "list_recordings",
     }
@@ -400,23 +401,6 @@ async def update_phone(
                 **registry.get_registration_info(phone_id)}
     except Exception as e:
         log.exception("update_phone failed")
-        return {"status": "error", "error": str(e), "phone_id": phone_id}
-
-
-@mcp.tool()
-async def reregister_phone(
-    phone_id: str,
-    force_unregister_first: bool = True,
-) -> dict[str, Any]:
-    """Force a fresh REGISTER cycle — fix stale registrar bindings."""
-    assert registry is not None
-    try:
-        registry.reregister_phone(phone_id, force_unregister_first=force_unregister_first)
-        await asyncio.sleep(1.0)
-        return {"status": "ok", "phone_id": phone_id,
-                **registry.get_registration_info(phone_id)}
-    except Exception as e:
-        log.exception("reregister_phone failed")
         return {"status": "error", "error": str(e), "phone_id": phone_id}
 
 

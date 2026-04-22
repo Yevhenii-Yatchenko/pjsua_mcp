@@ -219,7 +219,7 @@ class TestDynamicTools:
             "register": False,
         }))
         assert result["status"] == "ok"
-        assert result["tools_registered"] == 21
+        assert result["tools_registered"] == 22
 
         tools = self.client.list_tools()
         assert "z_make_call" in tools
@@ -227,6 +227,9 @@ class TestDynamicTools:
         assert "z_get_call_info" in tools
         assert "z_attended_transfer" in tools
         assert "z_get_registration_status" in tools
+        # Symmetric register / unregister per-phone tools
+        assert "z_register" in tools
+        assert "z_unregister" in tools
 
     def test_drop_phone_removes_phone_tools(self):
         _parse_tool_result(self.client.call_tool("add_phone", {
@@ -240,7 +243,7 @@ class TestDynamicTools:
 
         result = _parse_tool_result(self.client.call_tool("drop_phone", {"phone_id": "z"}))
         assert result["status"] == "ok"
-        assert result["tools_removed"] == 21
+        assert result["tools_removed"] == 22
 
         tools = self.client.list_tools()
         assert "z_make_call" not in tools
@@ -539,6 +542,20 @@ class TestPhoneRegistration:
         _wait_phone_registered(self.client, "a")
         result = _parse_tool_result(self.client.call_tool("a_unregister"))
         assert result["status"] == "ok"
+
+    def test_register_phone_tool_refreshes_binding(self):
+        """a_register forces a fresh REGISTER cycle — symmetric to a_unregister."""
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+        _wait_phone_registered(self.client, "a")
+
+        result = _parse_tool_result(self.client.call_tool("a_register"))
+        assert result["status"] == "ok"
+        assert result["is_registered"] is True
+        # Per-phone tools stay alive after reregister (same phone_id, same tool set)
+        tools = self.client.list_tools()
+        assert "a_make_call" in tools
+        assert "a_register" in tools
+        assert "a_unregister" in tools
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,13 @@
 """Dynamic per-phone tool factory.
 
-Each registered phone gets ~21 MCP tools named `<phone_id>_<action>` — these
+Each registered phone gets ~22 MCP tools named `<phone_id>_<action>` — these
 are added/removed at runtime via `mcp.add_tool()` / `mcp.remove_tool()` and the
 client is notified with `notifications/tools/list_changed`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -285,6 +286,20 @@ def register_phone_tools(
 
     _add(unregister, "unregister",
          f"Send de-REGISTER for phone {phone_id!r} (keep account in registry).")
+
+    async def register() -> dict[str, Any]:
+        try:
+            registry.reregister_phone(phone_id)
+            await asyncio.sleep(1.0)  # let REGISTER 200 OK land
+            return {"status": "ok", "phone_id": phone_id, **registry.get_registration_info(phone_id)}
+        except Exception as e:
+            return _error_response("register", phone_id, e)
+
+    _add(register, "register",
+         f"Force a fresh REGISTER cycle on phone {phone_id!r} — drops the current "
+         f"pj.Account and recreates it, so the registrar sees a brand-new binding. "
+         f"Use after a mu-bundle/edgeproxy restart or when a_get_registration_status "
+         f"claims active but the real binding is stale.")
 
     log.info("[%s] Registered %d per-phone tools", phone_id, len(names))
     return names
