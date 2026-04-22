@@ -1,4 +1,4 @@
-"""PJSUA MCP Server — FastMCP entry point."""
+"""PJSUA MCP Server — FastMCP entry point (multi-phone, dynamic tools)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 # --- Protect MCP stdio channel from pjlib C-level console output ---
@@ -16,12 +17,15 @@ _mcp_stdout_fd = os.dup(1)          # save original stdout fd for MCP
 os.dup2(2, 1)                       # C stdout (fd 1) → stderr
 sys.stdout = os.fdopen(_mcp_stdout_fd, "w", buffering=1)  # line-buffered
 
+import yaml
 from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel import NotificationOptions
 
 from .sip_engine import SipEngine
-from .account_manager import AccountManager
+from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 from .call_manager import CallManager
 from .pcap_manager import PcapManager
+from .phone_tool_factory import register_phone_tools, unregister_phone_tools
 
 # All Python logging goes to stderr — stdout is the MCP channel
 logging.basicConfig(
@@ -32,43 +36,47 @@ logging.basicConfig(
 log = logging.getLogger("pjsua_mcp")
 
 engine: SipEngine | None = None
-account_mgr: AccountManager | None = None
+registry: PhoneRegistry | None = None
 call_mgr: CallManager | None = None
 pcap_mgr: PcapManager | None = None
 _poll_task: asyncio.Task | None = None
 
+# Tracks dynamically-registered per-phone tool names so drop_phone can remove them.
+_phone_tools: dict[str, list[str]] = {}
+
+DEFAULT_PROFILE_PATH = "/config/phones.yaml"
+
 
 async def _poll_pjsip_events(eng: SipEngine) -> None:
-    """Background task: poll pjsip event loop from asyncio thread.
-
-    Calls libHandleEvents(10) directly (not via executor) because SWIG director
-    callbacks for LogWriter don't work from executor threads (GIL issue).
-    The short timeout keeps the event loop responsive.
-    """
+    """Background task: poll pjsip event loop from asyncio thread."""
     while True:
         try:
             eng.handle_events(10)
-            # Process deferred actions after pjsip events
             if call_mgr:
                 call_mgr.process_auto_answers()
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Error in pjsip event poll")
-        await asyncio.sleep(0.02)  # ~50 polls/sec, yields to MCP handlers
+        await asyncio.sleep(0.02)  # ~50 polls/sec
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     """Manage PJSUA2 lifecycle alongside MCP server."""
-    global engine, account_mgr, call_mgr, pcap_mgr, _poll_task
+    global engine, registry, call_mgr, pcap_mgr, _poll_task
     log.info("PJSUA MCP server starting")
     engine = SipEngine()
-    account_mgr = AccountManager(engine)
-    call_mgr = CallManager(engine, account_mgr)
+    registry = PhoneRegistry(engine)
+    call_mgr = CallManager(engine, registry)
     pcap_mgr = PcapManager()
+
+    # Start engine up-front so add_phone works immediately.
+    engine.initialize()
+    _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
+
     yield
-    # Shutdown
+
     log.info("PJSUA MCP server shutting down")
     if _poll_task and not _poll_task.done():
         _poll_task.cancel()
@@ -78,7 +86,7 @@ async def lifespan(server: FastMCP):
             pass
     await pcap_mgr.cleanup()
     call_mgr.hangup_all()
-    account_mgr.unregister_all()
+    registry.drop_all()
     engine.shutdown()
     log.info("PJSUA MCP server stopped")
 
@@ -87,465 +95,484 @@ mcp = FastMCP("pjsua", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# Tool: configure
+# Helpers
 # ---------------------------------------------------------------------------
-@mcp.tool()
-async def configure(
+async def _notify_tools_changed() -> None:
+    """Send notifications/tools/list_changed to the MCP client."""
+    try:
+        ctx = mcp.get_context()
+        await ctx.session.send_tool_list_changed()
+    except Exception:
+        log.debug("send_tool_list_changed failed (context not ready?)")
+
+
+def _validate_phone_id(phone_id: str) -> None:
+    import re
+    if not re.fullmatch(r"[a-z0-9_]{1,32}", phone_id):
+        raise ValueError(
+            f"phone_id {phone_id!r} invalid — must match ^[a-z0-9_]{{1,32}}$"
+        )
+    RESERVED_ACTIONS = {
+        "make_call", "answer_call", "reject_call", "hangup",
+        "get_call_info", "get_call_history", "list_calls", "get_active_calls",
+        "send_dtmf", "hold", "unhold", "blind_transfer", "attended_transfer",
+        "conference", "play_audio", "stop_audio", "get_recording",
+        "send_message", "get_messages", "get_registration_status", "unregister",
+    }
+    # Guard against phone_id producing a collision with static tool names.
+    static_tool_names = {
+        "add_phone", "drop_phone", "list_phones", "get_phone", "update_phone",
+        "reregister_phone", "load_phone_profile",
+        "get_codecs", "set_codecs", "get_sip_log",
+        "start_capture", "stop_capture", "get_pcap", "list_recordings",
+    }
+    for action in RESERVED_ACTIONS:
+        if f"{phone_id}_{action}" in static_tool_names:
+            raise ValueError(f"phone_id {phone_id!r} would collide with static tool")
+
+
+def _add_phone_impl(
+    phone_id: str,
     domain: str,
-    transport: str = "udp",
-    username: str | None = None,
-    password: str | None = None,
+    username: str | None,
+    password: str | None,
+    *,
     realm: str | None = None,
     srtp: bool = False,
-    local_port: int = 0,
     auto_answer: bool = False,
+    transport: str = "udp",
+    local_port: int = 0,
     codecs: list[str] | None = None,
+    register: bool = True,
 ) -> dict[str, Any]:
-    """Configure (or reconfigure) the SIP user agent.
+    """Common add-phone routine — no client notification, no async."""
+    assert registry is not None and engine is not None
 
-    On first call: initializes the SIP engine, creates transport, stores credentials.
-    On subsequent calls: unregisters the current account and updates credentials
-    without restarting the engine — useful for changing domain, username, or password.
+    _validate_phone_id(phone_id)
 
-    Args:
-        domain: SIP domain / registrar address (e.g. "sip.example.com")
-        transport: Transport protocol — "udp", "tcp", or "tls" (default "udp")
-        username: SIP username for authentication
-        password: SIP password for authentication
-        realm: SIP realm (defaults to "*" if not specified)
-        srtp: Enable SRTP media encryption (default False)
-        local_port: Local port to bind (0 = auto)
-        auto_answer: Automatically answer incoming calls with 200 OK (default False)
-        codecs: List of codecs in priority order, e.g. ["PCMU", "G722"]. Others disabled. Default: all enabled.
-    """
-    global _poll_task
-    assert engine is not None and account_mgr is not None
+    # If this phone already exists, drop its tools first so we don't leave
+    # orphans when PhoneRegistry.add_phone internally replaces the account.
+    if phone_id in _phone_tools:
+        unregister_phone_tools(mcp, _phone_tools.pop(phone_id))
 
-    try:
-        transport_id: int | None = None
+    # Optionally apply endpoint-wide codec priorities before REGISTER.
+    if codecs:
+        engine.set_codecs(codecs)
 
-        if engine.initialized:
-            # Reconfiguration: tear down the old account, keep the engine
-            log.info("Reconfiguring — unregistering old account")
-            call_mgr.hangup_all()
-            account_mgr.unregister_all()
-            await asyncio.sleep(0.5)
-        else:
-            # First-time initialization
-            transport_id = engine.initialize(
-                transport=transport,
-                local_port=local_port,
-            )
-            if _poll_task is None or _poll_task.done():
-                _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
+    registry.add_phone(
+        phone_id,
+        domain=domain,
+        username=username,
+        password=password,
+        realm=realm,
+        srtp=srtp,
+        auto_answer=auto_answer,
+        transport=transport,
+        local_port=local_port,
+        codecs=codecs,
+        register=register,
+    )
 
-        account_mgr.configure(
-            domain=domain,
-            username=username,
-            password=password,
-            realm=realm,
-            srtp=srtp,
-            auto_answer=auto_answer,
-        )
+    tool_names = register_phone_tools(mcp, phone_id, call_mgr, registry)
+    _phone_tools[phone_id] = tool_names
 
-        # Set codec priorities if specified
-        enabled_codecs = None
-        if codecs and engine.initialized:
-            enabled_codecs = engine.set_codecs(codecs)
+    cfg = registry.get_config(phone_id)
+    reg = registry.get_registration_info(phone_id)
+    return {
+        "phone_id": phone_id,
+        "domain": domain,
+        "username": username,
+        "auto_answer": auto_answer,
+        "transport": transport,
+        "transport_id": cfg.transport_id if cfg else None,
+        "tools_registered": len(tool_names),
+        **reg,
+    }
 
-        return {
-            "status": "configured",
-            "transport": transport,
-            "transport_id": transport_id,
-            "domain": domain,
-            "codecs": enabled_codecs,
-        }
-    except Exception as e:
-        log.exception("configure failed")
-        return {"status": "error", "error": str(e)}
+
+def _drop_phone_impl(phone_id: str, *, hangup_calls: bool = True) -> dict[str, Any]:
+    assert registry is not None and call_mgr is not None
+
+    if not registry.has_phone(phone_id):
+        return {"status": "error", "error": f"Phone {phone_id!r} not registered"}
+
+    if hangup_calls:
+        call_mgr.hangup_all(phone_id=phone_id)
+
+    tool_names = _phone_tools.pop(phone_id, [])
+    removed = unregister_phone_tools(mcp, tool_names) if tool_names else 0
+
+    registry.drop_phone(phone_id)
+    return {"status": "ok", "phone_id": phone_id, "tools_removed": removed}
 
 
 # ---------------------------------------------------------------------------
-# Tool: register / unregister / get_registration_status
+# Phone CRUD (static)
 # ---------------------------------------------------------------------------
 @mcp.tool()
-async def register() -> dict[str, Any]:
-    """Register the configured SIP account with the registrar."""
-    assert account_mgr is not None and call_mgr is not None
+async def list_phones() -> dict[str, Any]:
+    """List all registered phones with their registration state and transport info."""
+    assert registry is not None
     try:
-        # Clean stale call state before re-registration
-        call_mgr.cleanup()
-        account_mgr.register()
-        # Wire up incoming call handler now that account exists
-        call_mgr._ensure_incoming_handler()
-        # Give registration a moment to process
-        await asyncio.sleep(1)
-        info = account_mgr.get_registration_info()
-        return {"status": "ok", **info}
+        phones = registry.list_phones()
+        # Enrich with active-call count per phone
+        active_by_phone: dict[str, int] = {}
+        if call_mgr is not None:
+            for call in call_mgr.list_calls():
+                pid = call.get("phone_id")
+                if pid:
+                    active_by_phone[pid] = active_by_phone.get(pid, 0) + 1
+        for p in phones:
+            p["active_call_count"] = active_by_phone.get(p["phone_id"], 0)
+            p["tools"] = _phone_tools.get(p["phone_id"], [])
+        return {"phones": phones, "total_count": len(phones)}
     except Exception as e:
-        log.exception("register failed")
+        log.exception("list_phones failed")
         return {"status": "error", "error": str(e)}
 
 
 @mcp.tool()
-async def setup(
+async def add_phone(
+    phone_id: str,
     domain: str,
     username: str,
     password: str,
     transport: str = "udp",
+    local_port: int = 0,
     codecs: list[str] | None = None,
     auto_answer: bool = False,
-    local_port: int = 0,
+    srtp: bool = False,
+    realm: str | None = None,
+    register: bool = True,
 ) -> dict[str, Any]:
-    """All-in-one: configure + set codecs + register in a single call.
+    """Add a new phone (SIP account) and register its per-phone action tools.
 
-    Equivalent to calling configure(), set_codecs(), register() separately
-    but saves 2-3 tool calls per phone.
-
-    Args:
-        domain: SIP domain / registrar address
-        username: SIP username
-        password: SIP password
-        transport: "udp", "tcp", or "tls"
-        codecs: Codec priority list, e.g. ["PCMA"]. Default: all enabled.
-        auto_answer: Auto-answer incoming calls
-        local_port: Local SIP port (0 = auto)
+    After a successful add, new tools named `<phone_id>_make_call`,
+    `<phone_id>_hangup`, etc. become visible via
+    `notifications/tools/list_changed`.
     """
-    assert engine is not None and account_mgr is not None and call_mgr is not None
-    global _poll_task
     try:
-        # Configure engine
-        transport_id: int | None = None
-        if engine.initialized:
-            call_mgr.hangup_all()
-            account_mgr.unregister_all()
-            await asyncio.sleep(0.5)
-        else:
-            transport_id = engine.initialize(transport=transport, local_port=local_port)
-            if _poll_task is None or _poll_task.done():
-                _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
-
-        account_mgr.configure(
+        result = _add_phone_impl(
+            phone_id=phone_id,
             domain=domain, username=username, password=password,
-            auto_answer=auto_answer,
+            realm=realm, srtp=srtp, auto_answer=auto_answer,
+            transport=transport, local_port=local_port,
+            codecs=codecs, register=register,
         )
+        await asyncio.sleep(1.0)  # give REGISTER a moment
+        result.update(registry.get_registration_info(phone_id))
+        await _notify_tools_changed()
+        return {"status": "ok", **result}
+    except Exception as e:
+        log.exception("add_phone failed")
+        return {"status": "error", "error": str(e), "phone_id": phone_id}
 
-        # Set codecs
-        enabled_codecs = None
-        if codecs:
-            enabled_codecs = engine.set_codecs(codecs)
 
-        # Register
-        call_mgr.cleanup()
-        account_mgr.register()
-        call_mgr._ensure_incoming_handler()
-        await asyncio.sleep(1)
-        reg_info = account_mgr.get_registration_info()
+@mcp.tool()
+async def drop_phone(
+    phone_id: str,
+    hangup_calls: bool = True,
+) -> dict[str, Any]:
+    """Drop a phone: hang up its calls, unregister, close transport, unload tools."""
+    try:
+        result = _drop_phone_impl(phone_id, hangup_calls=hangup_calls)
+        await _notify_tools_changed()
+        return result
+    except Exception as e:
+        log.exception("drop_phone failed")
+        return {"status": "error", "error": str(e), "phone_id": phone_id}
 
+
+@mcp.tool()
+async def get_phone(phone_id: str) -> dict[str, Any]:
+    """Return detailed info for one phone — reg state, credentials, active calls, tools."""
+    assert registry is not None
+    try:
+        cfg = registry.get_config(phone_id)
+        if cfg is None:
+            return {"status": "error", "error": f"Phone {phone_id!r} not registered"}
+        reg = registry.get_registration_info(phone_id)
+        active_calls = call_mgr.list_calls(phone_id=phone_id) if call_mgr else []
         return {
-            "status": "ok",
-            "domain": domain,
-            "username": username,
-            "codecs": enabled_codecs,
-            **reg_info,
+            "phone_id": phone_id,
+            "domain": cfg.domain,
+            "username": cfg.username,
+            "realm": cfg.realm,
+            "srtp": cfg.srtp,
+            "auto_answer": cfg.auto_answer,
+            "transport": cfg.transport,
+            "local_port": cfg.local_port,
+            "transport_id": cfg.transport_id,
+            "codecs": cfg.codecs,
+            "active_calls": active_calls,
+            "tools": _phone_tools.get(phone_id, []),
+            **reg,
         }
     except Exception as e:
-        log.exception("setup failed")
-        return {"status": "error", "error": str(e)}
+        log.exception("get_phone failed")
+        return {"status": "error", "error": str(e), "phone_id": phone_id}
 
 
 @mcp.tool()
-async def unregister() -> dict[str, Any]:
-    """Unregister the current SIP account."""
-    assert account_mgr is not None
-    try:
-        account_mgr.unregister()
-        await asyncio.sleep(0.5)
-        return {"status": "ok"}
-    except Exception as e:
-        log.exception("unregister failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def get_registration_status() -> dict[str, Any]:
-    """Get current SIP registration status."""
-    assert account_mgr is not None
-    try:
-        return account_mgr.get_registration_info()
-    except Exception as e:
-        log.exception("get_registration_status failed")
-        return {"status": "error", "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Tool: make_call / answer_call / hangup / get_call_info
-# ---------------------------------------------------------------------------
-@mcp.tool()
-async def make_call(
-    dest_uri: str,
-    headers: dict[str, str] | None = None,
+async def update_phone(
+    phone_id: str,
+    auto_answer: bool | None = None,
+    codecs: list[str] | None = None,
+    password: str | None = None,
+    realm: str | None = None,
+    srtp: bool | None = None,
 ) -> dict[str, Any]:
-    """Place an outbound SIP call.
+    """Mutate runtime-parameters of an existing phone.
 
-    Args:
-        dest_uri: Destination SIP URI (e.g. "sip:1001@sip.example.com")
-        headers: Optional extra SIP headers as key-value pairs
+    auto_answer — instantaneous.
+    codecs — endpoint-wide priorities (affects all phones).
+    password / realm / srtp — force a fresh REGISTER cycle.
     """
-    assert call_mgr is not None
+    assert registry is not None and engine is not None
     try:
-        info = call_mgr.make_call(dest_uri, headers=headers)
-        return {"status": "ok", **info}
+        cfg = registry.get_config(phone_id)
+        if cfg is None:
+            return {"status": "error", "error": f"Phone {phone_id!r} not registered"}
+
+        reregister_needed = False
+        if auto_answer is not None:
+            cfg.auto_answer = auto_answer
+        if codecs is not None:
+            engine.set_codecs(codecs)
+            cfg.codecs = codecs
+        if password is not None:
+            cfg.password = password
+            reregister_needed = True
+        if realm is not None:
+            cfg.realm = realm
+            reregister_needed = True
+        if srtp is not None:
+            cfg.srtp = srtp
+            reregister_needed = True
+
+        if reregister_needed:
+            registry.reregister_phone(phone_id)
+            await asyncio.sleep(1.0)
+
+        return {"status": "ok", "phone_id": phone_id,
+                "reregistered": reregister_needed,
+                **registry.get_registration_info(phone_id)}
     except Exception as e:
-        log.exception("make_call failed")
-        return {"status": "error", "error": str(e)}
+        log.exception("update_phone failed")
+        return {"status": "error", "error": str(e), "phone_id": phone_id}
 
 
 @mcp.tool()
-async def answer_call(
-    call_id: int | None = None,
-    status_code: int = 200,
+async def reregister_phone(
+    phone_id: str,
+    force_unregister_first: bool = True,
 ) -> dict[str, Any]:
-    """Answer an incoming SIP call.
-
-    Args:
-        call_id: Call ID to answer (default: first incoming call)
-        status_code: SIP response code (default 200 OK)
-    """
-    assert call_mgr is not None
+    """Force a fresh REGISTER cycle — fix stale registrar bindings."""
+    assert registry is not None
     try:
-        info = call_mgr.answer_call(call_id=call_id, status_code=status_code)
-        return {"status": "ok", **info}
+        registry.reregister_phone(phone_id, force_unregister_first=force_unregister_first)
+        await asyncio.sleep(1.0)
+        return {"status": "ok", "phone_id": phone_id,
+                **registry.get_registration_info(phone_id)}
     except Exception as e:
-        log.exception("answer_call failed")
-        return {"status": "error", "error": str(e)}
+        log.exception("reregister_phone failed")
+        return {"status": "error", "error": str(e), "phone_id": phone_id}
+
+
+_PHONE_FIELDS = {
+    "phone_id", "domain", "username", "password", "realm", "srtp",
+    "auto_answer", "transport", "local_port", "codecs", "register",
+}
+
+
+def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
+    """Read a YAML profile and return a list of resolved phone specs.
+
+    Top-level shape:
+        defaults: {domain, password, codecs, ...}   # optional
+        phones:
+          - phone_id: a
+            username: "1001"
+          - ...
+
+    `defaults` keys are merged into each phone (phone-level values override).
+    Every phone must have `phone_id`, `domain`, `username`, `password` after
+    the merge.
+    """
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Profile not found: {path}. Place it in ./config/ on the host "
+            f"(mounted to /config in the container)."
+        )
+
+    with file_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top-level YAML must be a mapping, got {type(data).__name__}")
+
+    defaults = data.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        raise ValueError(f"{path}: 'defaults' must be a mapping")
+
+    phones = data.get("phones") or []
+    if not isinstance(phones, list):
+        raise ValueError(f"{path}: 'phones' must be a list")
+    if not phones:
+        raise ValueError(f"{path}: 'phones' list is empty — nothing to load")
+
+    resolved = []
+    for i, entry in enumerate(phones):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: phones[{i}] must be a mapping")
+        merged = {**defaults, **entry}
+        unknown = set(merged) - _PHONE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"{path}: phones[{i}] has unknown keys: {sorted(unknown)}. "
+                f"Allowed: {sorted(_PHONE_FIELDS)}"
+            )
+        for required in ("phone_id", "domain", "username", "password"):
+            if not merged.get(required):
+                raise ValueError(
+                    f"{path}: phones[{i}] missing required field {required!r} "
+                    f"(not provided directly and not inherited from defaults)"
+                )
+        resolved.append(merged)
+
+    ids = [p["phone_id"] for p in resolved]
+    if len(set(ids)) != len(ids):
+        seen = set()
+        dups = [x for x in ids if x in seen or seen.add(x)]
+        raise ValueError(f"{path}: duplicate phone_id(s): {dups}")
+
+    return resolved
 
 
 @mcp.tool()
-async def reject_call(call_id: int | None = None, status_code: int = 486) -> dict[str, Any]:
-    """Reject an incoming call with a SIP error response.
-
-    Args:
-        call_id: Call ID to reject (default: first incoming call)
-        status_code: SIP response code — 486 (Busy), 603 (Decline), 480 (Unavailable)
-    """
-    assert call_mgr is not None
-    try:
-        info = call_mgr.reject_call(call_id=call_id, status_code=status_code)
-        return {"status": "ok", **info}
-    except Exception as e:
-        log.exception("reject_call failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def blind_transfer(dest_uri: str, call_id: int | None = None) -> dict[str, Any]:
-    """Blind transfer: redirect an active call to another SIP URI.
-
-    Sends SIP REFER, causing the remote party to send a new INVITE
-    to dest_uri. Our side of the call is then disconnected.
-
-    Args:
-        dest_uri: Transfer destination (e.g. "sip:6003@asterisk")
-        call_id: Call ID to transfer (default: current active call)
-    """
-    assert call_mgr is not None
-    try:
-        info = call_mgr.blind_transfer(dest_uri, call_id=call_id)
-        return {"status": "ok", **info}
-    except Exception as e:
-        log.exception("blind_transfer failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def attended_transfer(
-    call_id: int | None = None,
-    dest_call_id: int | None = None,
+async def load_phone_profile(
+    path: str = DEFAULT_PROFILE_PATH,
+    merge: bool = False,
 ) -> dict[str, Any]:
-    """Attended transfer: bridge two active calls and disconnect ourselves.
+    """Load a YAML phone profile and apply it atomically.
 
-    Must have two active calls (e.g. original call on hold + consultation call).
-    Sends REFER with Replaces to connect the two remote parties directly.
+    Default (`merge=False`): **replace** semantics — the profile becomes
+    the full phone roster. Active calls on existing phones are hung up,
+    existing phones are dropped (transports closed, tools unloaded), then
+    the profile is loaded. YAML parse/validation happens first — on any
+    error the existing state is untouched.
 
-    Args:
-        call_id: Source call to transfer (default: auto-select first active)
-        dest_call_id: Destination call to replace (default: auto-select second active)
-    """
-    assert call_mgr is not None
-    try:
-        info = call_mgr.attended_transfer(call_id=call_id, dest_call_id=dest_call_id)
-        return {"status": "ok", **info}
-    except Exception as e:
-        log.exception("attended_transfer failed")
-        return {"status": "error", "error": str(e)}
+    With `merge=True`: upsert — only phone_ids present in the profile are
+    (re)created; phones not mentioned in the profile are left alone.
 
+    The file is read from inside the container (the host's `./config/`
+    directory is mounted to `/config` read-only in docker-compose.yml).
 
-@mcp.tool()
-async def hangup(call_id: int | None = None) -> dict[str, Any]:
-    """Hang up a SIP call.
+    YAML shape:
+        defaults:                    # optional — merged into every phone
+          domain: sip.example.com
+          password: xxx
+          codecs: [PCMA]
+          auto_answer: false
+        phones:
+          - phone_id: a
+            username: "1001"
+          - phone_id: b
+            username: "1002"
+            auto_answer: true
 
-    Args:
-        call_id: Call ID to hang up (default: current active call)
-    """
-    assert call_mgr is not None
-    try:
-        call_mgr.hangup(call_id=call_id)
-        return {"status": "ok"}
-    except Exception as e:
-        log.exception("hangup failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def get_call_info(call_id: int | None = None) -> dict[str, Any]:
-    """Get information about a SIP call.
+    A single `tools/list_changed` notification fires after all changes.
 
     Args:
-        call_id: Call ID to query (default: current active call)
+        path: Profile path as seen from the container (default: /config/phones.yaml).
+        merge: If True, keep phones not listed in the profile. Default False = replace.
     """
-    assert call_mgr is not None
+    assert registry is not None and call_mgr is not None
+
+    # 1. Parse + validate BEFORE touching any state — fail fast.
     try:
-        return call_mgr.get_call_info(call_id=call_id)
+        specs = _load_profile_yaml(path)
     except Exception as e:
-        log.exception("get_call_info failed")
-        return {"status": "error", "error": str(e)}
+        log.exception("load_phone_profile: parse failed")
+        return {"status": "error", "error": str(e), "path": path}
 
+    dropped: list[str] = []
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
 
-@mcp.tool()
-async def send_dtmf(call_id: int, digits: str) -> dict[str, Any]:
-    """Send DTMF digits on an active call.
+    # 2. In replace mode, tear down all existing phones + their calls first.
+    if not merge:
+        existing_ids = list(registry.list_phone_ids())
+        if existing_ids:
+            call_mgr.hangup_all()  # cancel every phone's active calls
+            # Give pjsip a moment to emit BYE before we rip the accounts out.
+            await asyncio.sleep(0.3)
+            for pid in existing_ids:
+                try:
+                    _drop_phone_impl(pid, hangup_calls=True)
+                    dropped.append(pid)
+                except Exception as e:
+                    log.exception("load_phone_profile: drop %s failed", pid)
+                    errors.append({"phone_id": pid, "error": f"drop failed: {e}"})
 
-    Args:
-        call_id: Call ID
-        digits: DTMF digits to send (e.g. "1234#")
-    """
-    assert call_mgr is not None
-    try:
-        call_mgr.send_dtmf(call_id, digits)
-        return {"status": "ok", "digits": digits}
-    except Exception as e:
-        log.exception("send_dtmf failed")
-        return {"status": "error", "error": str(e)}
+    # 3. Add phones from the profile. _add_phone_impl handles per-phone_id
+    # replacement too, so merge mode still overwrites matching phone_ids.
+    for spec in specs:
+        try:
+            res = _add_phone_impl(**spec)
+            results.append(res)
+        except Exception as e:
+            log.exception("load_phone_profile[%s] failed", spec.get("phone_id"))
+            errors.append({"phone_id": spec.get("phone_id"), "error": str(e)})
 
+    # 4. Let REGISTER responses land, then refresh registration state in the report.
+    await asyncio.sleep(1.5)
+    for r in results:
+        r.update(registry.get_registration_info(r["phone_id"]))
 
-@mcp.tool()
-async def hold(call_id: int) -> dict[str, Any]:
-    """Put a call on hold.
+    # 5. Single tools/list_changed notification covering the whole replace.
+    await _notify_tools_changed()
 
-    Args:
-        call_id: Call ID to hold
-    """
-    assert call_mgr is not None
-    try:
-        call_mgr.hold(call_id)
-        return {"status": "ok"}
-    except Exception as e:
-        log.exception("hold failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def unhold(call_id: int) -> dict[str, Any]:
-    """Resume a held call.
-
-    Args:
-        call_id: Call ID to resume
-    """
-    assert call_mgr is not None
-    try:
-        call_mgr.unhold(call_id)
-        return {"status": "ok"}
-    except Exception as e:
-        log.exception("unhold failed")
-        return {"status": "error", "error": str(e)}
+    return {
+        "status": "ok" if not errors else "partial",
+        "path": path,
+        "mode": "merge" if merge else "replace",
+        "dropped": dropped,
+        "added": results,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Tool: audio playback
+# Codecs (global, endpoint-wide)
 # ---------------------------------------------------------------------------
 @mcp.tool()
-async def play_audio(
-    file_path: str,
-    call_id: int | None = None,
-    loop: bool = False,
-) -> dict[str, Any]:
-    """Play a WAV file into an active call (replaces current audio/MOH).
-
-    By default, all calls play Music-on-Hold automatically. Use this tool to
-    play a specific file (e.g. TTS output, IVR prompts, pre-recorded messages).
-
-    Args:
-        file_path: Path to WAV file inside the container (e.g. "/recordings/call_1_20260306.wav")
-        call_id: Call ID (default: current active call)
-        loop: Loop the file (default False — plays once, then resumes MOH)
-    """
-    assert call_mgr is not None
+async def get_codecs() -> dict[str, Any]:
+    """List all endpoint codecs with their current priorities."""
+    assert engine is not None
     try:
-        info = call_mgr.play_audio(file_path, call_id=call_id, loop=loop)
-        return {"status": "ok", **info}
+        return {"codecs": engine.get_codecs()}
     except Exception as e:
-        log.exception("play_audio failed")
+        log.exception("get_codecs failed")
         return {"status": "error", "error": str(e)}
 
 
-@mcp.tool()
-async def stop_audio(call_id: int | None = None) -> dict[str, Any]:
-    """Stop audio playback and resume default Music-on-Hold.
-
-    Args:
-        call_id: Call ID (default: current active call)
-    """
-    assert call_mgr is not None
-    try:
-        call_mgr.stop_audio(call_id=call_id)
-        return {"status": "ok"}
-    except Exception as e:
-        log.exception("stop_audio failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def conference(call_ids: list[int]) -> dict[str, Any]:
-    """Bridge multiple active calls into a conference.
-
-    Cross-connects audio of all specified calls so all parties hear each other.
-    The calling UA acts as a conference bridge host.
-
-    Args:
-        call_ids: List of call IDs to bridge together
-    """
-    assert call_mgr is not None
-    try:
-        info = call_mgr.conference(call_ids)
-        return {"status": "ok", **info}
-    except Exception as e:
-        log.exception("conference failed")
-        return {"status": "error", "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Tool: codec management
-# ---------------------------------------------------------------------------
 @mcp.tool()
 async def set_codecs(
     codecs: list[str],
+    phone_id: str | None = None,
     call_id: int | None = None,
 ) -> dict[str, Any]:
-    """Set codec priorities and optionally renegotiate an active call.
+    """Set endpoint-wide codec priorities (affects all phones).
 
-    Codecs are specified in priority order (first = highest). All unlisted
-    codecs are disabled. If call_id is provided (or a call is active),
-    sends a re-INVITE to renegotiate media with the new codec set.
-
-    Args:
-        codecs: Codec names in priority order, e.g. ["PCMU", "G722", "PCMA"]
-        call_id: If set, renegotiate this active call with re-INVITE
+    If `phone_id` + `call_id` are both provided, also send a re-INVITE on
+    that call to renegotiate media using the new codec set.
     """
     assert engine is not None and call_mgr is not None
     try:
-        if call_id is not None:
-            info = call_mgr.reinvite_with_codecs(codecs, call_id=call_id)
+        if phone_id is not None and call_id is not None:
+            info = call_mgr.reinvite_with_codecs(codecs, phone_id=phone_id, call_id=call_id)
         else:
             enabled = engine.set_codecs(codecs)
             info = {"codecs": enabled, "reinvite": False}
@@ -555,61 +582,55 @@ async def set_codecs(
         return {"status": "error", "error": str(e)}
 
 
-@mcp.tool()
-async def get_codecs() -> dict[str, Any]:
-    """List all available codecs with their current priorities.
-
-    Priority 0 means disabled. Higher priority = preferred in SDP negotiation.
-    """
-    assert engine is not None
-    try:
-        return {"codecs": engine.get_codecs()}
-    except Exception as e:
-        log.exception("get_codecs failed")
-        return {"status": "error", "error": str(e)}
-
-
 # ---------------------------------------------------------------------------
-# Tool: SIP log & packet capture
+# SIP log (global with optional per-phone filter)
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def get_sip_log(
     last_n: int | None = None,
     filter_text: str | None = None,
+    phone_id: str | None = None,
 ) -> dict[str, Any]:
-    """Retrieve SIP log entries from the PJSUA2 logger.
-
-    Args:
-        last_n: Return only the last N entries (default: all)
-        filter_text: Filter entries containing this text
-    """
-    assert engine is not None
+    """Retrieve pjsua SIP log entries. With `phone_id`, also filter by username substring."""
+    assert engine is not None and registry is not None
     try:
-        entries = engine.get_log_entries(last_n=last_n, filter_text=filter_text)
-        return {
-            "entries": entries,
-            "total_count": len(entries),
-        }
+        # Combine filter_text with phone-specific username match.
+        extra_filter: str | None = None
+        if phone_id is not None:
+            cfg = registry.get_config(phone_id)
+            if cfg and cfg.username:
+                extra_filter = f"sip:{cfg.username}@"
+
+        entries = engine.get_log_entries(last_n=None, filter_text=filter_text)
+        if extra_filter:
+            entries = [e for e in entries if extra_filter in e["msg"]]
+        if last_n is not None:
+            entries = entries[-last_n:]
+        return {"entries": entries, "total_count": len(entries)}
     except Exception as e:
         log.exception("get_sip_log failed")
         return {"status": "error", "error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# Packet capture (global; phone_id resolves to transport port for BPF filter)
+# ---------------------------------------------------------------------------
 @mcp.tool()
 async def start_capture(
+    phone_id: str | None = None,
     interface: str = "any",
     port: int | None = None,
 ) -> dict[str, Any]:
-    """Start a packet capture using tcpdump.
-
-    Args:
-        interface: Network interface to capture on (default "any")
-        port: Filter by port number (default: capture all SIP ports)
-    """
-    assert pcap_mgr is not None
+    """Start tcpdump. Without phone_id — host-wide. With phone_id — BPF filters by that phone's local port."""
+    assert pcap_mgr is not None and engine is not None and registry is not None
     try:
+        if phone_id is not None and port is None:
+            cfg = registry.get_config(phone_id)
+            if cfg is None or cfg.transport_id is None:
+                return {"status": "error", "error": f"Phone {phone_id!r} has no transport"}
+            port = engine.get_transport_port(cfg.transport_id)
         info = await pcap_mgr.start(interface=interface, port=port)
-        return {"status": "ok", **info}
+        return {"status": "ok", "phone_id": phone_id, "port": port, **info}
     except Exception as e:
         log.exception("start_capture failed")
         return {"status": "error", "error": str(e)}
@@ -629,62 +650,24 @@ async def stop_capture() -> dict[str, Any]:
 
 @mcp.tool()
 async def get_pcap(filename: str | None = None) -> dict[str, Any]:
-    """Get information about a captured pcap file.
-
-    Args:
-        filename: Specific pcap filename (default: most recent capture)
-    """
+    """Get info about a pcap file (defaults to most recent capture)."""
     assert pcap_mgr is not None
     try:
-        info = pcap_mgr.get_pcap_info(filename=filename)
-        return info
+        return pcap_mgr.get_pcap_info(filename=filename)
     except Exception as e:
         log.exception("get_pcap failed")
         return {"status": "error", "error": str(e)}
 
 
-# ---------------------------------------------------------------------------
-# Tool: call recordings
-# ---------------------------------------------------------------------------
 @mcp.tool()
-async def get_recording(call_id: int | None = None) -> dict[str, Any]:
-    """Get the WAV recording file path for a call.
+async def list_recordings(
+    phone_id: str | None = None,
+    call_id: int | None = None,
+) -> dict[str, Any]:
+    """List call recordings in /recordings/, optionally filtered by phone_id / call_id.
 
-    Every call is automatically recorded to /recordings/call_{id}_{timestamp}.wav.
-    Returns the file path, size, and duration so external tools can access the file.
-
-    Args:
-        call_id: Call ID to get recording for (default: current/last call)
+    Recordings are named `call_<phone_id>_<call_id>_<timestamp>.wav`.
     """
-    assert call_mgr is not None
-    try:
-        info = call_mgr.get_call_info(call_id=call_id)
-        rec_file = info.get("recording_file")
-        if not rec_file:
-            return {"status": "error", "error": "No recording available for this call"}
-
-        from pathlib import Path
-        path = Path(rec_file)
-        if not path.exists():
-            return {"status": "error", "error": f"Recording file not found: {rec_file}"}
-
-        return {
-            "recording_file": rec_file,
-            "filename": path.name,
-            "file_size": path.stat().st_size,
-        }
-    except Exception as e:
-        log.exception("get_recording failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def list_recordings() -> dict[str, Any]:
-    """List all call recording files in /recordings/.
-
-    Returns recordings sorted by modification time (newest first).
-    """
-    from pathlib import Path
     recordings_dir = Path("/recordings")
     try:
         if not recordings_dir.exists():
@@ -694,14 +677,27 @@ async def list_recordings() -> dict[str, Any]:
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
-        recordings = [
-            {
+        recordings = []
+        for f in files:
+            parts = f.stem.split("_")  # ['call', '<phone_id>', '<call_id>', 'YYYYMMDD', 'HHMMSS']
+            file_phone = parts[1] if len(parts) >= 3 else None
+            file_call = None
+            if len(parts) >= 3:
+                try:
+                    file_call = int(parts[2])
+                except ValueError:
+                    pass
+            if phone_id is not None and file_phone != phone_id:
+                continue
+            if call_id is not None and file_call != call_id:
+                continue
+            recordings.append({
                 "filename": f.name,
                 "file_path": str(f),
                 "file_size": f.stat().st_size,
-            }
-            for f in files
-        ]
+                "phone_id": file_phone,
+                "call_id": file_call,
+            })
         return {"recordings": recordings, "total_count": len(recordings)}
     except Exception as e:
         log.exception("list_recordings failed")
@@ -709,99 +705,23 @@ async def list_recordings() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Tool: call listing
+# Entrypoint
 # ---------------------------------------------------------------------------
-@mcp.tool()
-async def list_calls() -> dict[str, Any]:
-    """List all tracked calls with their current state.
+def main() -> None:
+    # Enable tools_changed capability so the MCP client honours
+    # notifications/tools/list_changed events after add_phone/drop_phone.
+    _orig_init_options = mcp._mcp_server.create_initialization_options
 
-    Returns a compact summary of every call_id: state, remote URI, duration, codec.
-    Includes DISCONNECTED calls that haven't been cleaned up yet.
-    """
-    assert call_mgr is not None
-    try:
-        calls = call_mgr.list_calls()
-        return {"calls": calls, "total_count": len(calls)}
-    except Exception as e:
-        log.exception("list_calls failed")
-        return {"status": "error", "error": str(e)}
+    def _create_with_tools_changed(
+        notification_options: NotificationOptions | None = None,
+        experimental_capabilities: dict | None = None,
+    ):
+        return _orig_init_options(
+            notification_options=NotificationOptions(tools_changed=True),
+            experimental_capabilities=experimental_capabilities,
+        )
 
-
-@mcp.tool()
-async def get_active_calls() -> dict[str, Any]:
-    """List only active calls with full info including RTP stats.
-
-    Filters out DISCONNECTED/NONE calls. Returns the same data as
-    get_call_info but for all active calls at once.
-    """
-    assert call_mgr is not None
-    try:
-        calls = call_mgr.get_active_calls()
-        return {"calls": calls, "active_count": len(calls)}
-    except Exception as e:
-        log.exception("get_active_calls failed")
-        return {"status": "error", "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Tool: call history
-# ---------------------------------------------------------------------------
-@mcp.tool()
-async def get_call_history(last_n: int | None = None) -> dict[str, Any]:
-    """Get history of completed calls.
-
-    Returns call records with remote URI, duration, status, codec, recording path.
-
-    Args:
-        last_n: Return only last N calls (default: all)
-    """
-    assert call_mgr is not None
-    try:
-        all_history = call_mgr.get_call_history()
-        filtered = all_history[-last_n:] if last_n else all_history
-        return {"history": filtered, "total_count": len(all_history)}
-    except Exception as e:
-        log.exception("get_call_history failed")
-        return {"status": "error", "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Tool: SIP instant messaging
-# ---------------------------------------------------------------------------
-@mcp.tool()
-async def send_message(dest_uri: str, body: str) -> dict[str, Any]:
-    """Send a SIP MESSAGE (instant text message).
-
-    Args:
-        dest_uri: Destination SIP URI (e.g. "sip:6002@asterisk")
-        body: Message text content
-    """
-    assert account_mgr is not None
-    try:
-        account_mgr.send_message(dest_uri, body)
-        return {"status": "ok", "dest_uri": dest_uri}
-    except Exception as e:
-        log.exception("send_message failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def get_messages(last_n: int | None = None) -> dict[str, Any]:
-    """Get received SIP instant messages.
-
-    Args:
-        last_n: Return only last N messages (default: all)
-    """
-    assert account_mgr is not None
-    try:
-        msgs = account_mgr.get_messages(last_n=last_n)
-        return {"messages": msgs, "total_count": len(msgs)}
-    except Exception as e:
-        log.exception("get_messages failed")
-        return {"status": "error", "error": str(e)}
-
-
-def main():
+    mcp._mcp_server.create_initialization_options = _create_with_tools_changed
     mcp.run(transport="stdio")
 
 

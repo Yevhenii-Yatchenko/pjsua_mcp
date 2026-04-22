@@ -74,7 +74,7 @@ COPY pyproject.toml /app/pyproject.toml
 WORKDIR /app
 
 # Ensure output dirs exist
-RUN mkdir -p /captures /recordings
+RUN mkdir -p /captures /recordings /config
 
 # Unbuffered output to protect MCP stdio channel
 ENV PYTHONUNBUFFERED=1

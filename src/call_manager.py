@@ -7,12 +7,12 @@ import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pjsua2 as pj
 
 from .sip_engine import SipEngine
-from .account_manager import AccountManager
+from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 
 log = logging.getLogger(__name__)
 
@@ -23,8 +23,14 @@ DEFAULT_MOH_FILE = Path("/app/audio/moh.wav")
 class SipCall(pj.Call):
     """PJSUA2 Call subclass with state, media, recording, and playback callbacks."""
 
-    def __init__(self, account: pj.Account, call_id: int = pj.PJSUA_INVALID_ID) -> None:
+    def __init__(
+        self,
+        account: pj.Account,
+        call_id: int = pj.PJSUA_INVALID_ID,
+        phone_id: str = DEFAULT_PHONE_ID,
+    ) -> None:
         super().__init__(account, call_id)
+        self.phone_id = phone_id
         self._lock = threading.Lock()
         self._recorder: pj.AudioMediaRecorder | None = None
         self._recording_file: str | None = None
@@ -33,6 +39,7 @@ class SipCall(pj.Call):
         self._aud_med: pj.AudioMedia | None = None  # cached for play/stop
         self.on_disconnected_cb: Any = None
         self._info: dict[str, Any] = {
+            "phone_id": phone_id,
             "state": "NONE",
             "state_text": "",
             "remote_uri": "",
@@ -61,8 +68,8 @@ class SipCall(pj.Call):
             if self.on_disconnected_cb:
                 self.on_disconnected_cb(self.get_cached_info())
         log.info(
-            "Call %d state: %s (%s) remote=%s",
-            ci.id, ci.stateText, _call_state_name(ci.state), ci.remoteUri,
+            "[%s] Call %d state: %s (%s) remote=%s",
+            self.phone_id, ci.id, ci.stateText, _call_state_name(ci.state), ci.remoteUri,
         )
 
     def onCallMediaState(self, prm: pj.OnCallMediaStateParam) -> None:
@@ -102,7 +109,7 @@ class SipCall(pj.Call):
                         self._info["codec"] = si.codecName
                 except Exception:
                     pass
-        log.info("Call %d media state updated", ci.id)
+        log.info("[%s] Call %d media state updated", self.phone_id, ci.id)
 
     # --- Recording ---
 
@@ -117,7 +124,8 @@ class SipCall(pj.Call):
             try:
                 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"call_{call_id}_{timestamp}.wav"
+                # Embed phone_id in filename for multi-phone disambiguation
+                filename = f"call_{self.phone_id}_{call_id}_{timestamp}.wav"
                 filepath = RECORDINGS_DIR / filename
 
                 recorder = pj.AudioMediaRecorder()
@@ -126,7 +134,7 @@ class SipCall(pj.Call):
                 self._recording_file = str(filepath)
                 with self._lock:
                     self._info["recording_file"] = str(filepath)
-                log.info("Created recorder for call %d: %s", call_id, filepath)
+                log.info("[%s] Created recorder for call %d: %s", self.phone_id, call_id, filepath)
             except Exception:
                 log.exception("Failed to create recorder for call %d", call_id)
                 return
@@ -147,7 +155,7 @@ class SipCall(pj.Call):
     def _stop_recording(self) -> None:
         """Stop recording (called on DISCONNECTED)."""
         if self._recorder is not None:
-            log.info("Stopping recording: %s", self._recording_file)
+            log.info("[%s] Stopping recording: %s", self.phone_id, self._recording_file)
             self._recorder = None
 
     # --- Audio playback ---
@@ -186,7 +194,7 @@ class SipCall(pj.Call):
         self._player_file = file_path
         with self._lock:
             self._info["playing_file"] = file_path
-        log.info("Playing %s (loop=%s) into call", file_path, loop)
+        log.info("[%s] Playing %s (loop=%s) into call", self.phone_id, file_path, loop)
 
     def stop_playback(self) -> None:
         """Stop audio playback and resume default MOH."""
@@ -230,51 +238,88 @@ def _call_state_name(state: int) -> str:
 
 
 class CallManager:
-    """High-level call operations."""
+    """High-level call operations across multiple phones."""
 
-    def __init__(self, engine: SipEngine, account_mgr: AccountManager) -> None:
+    def __init__(self, engine: SipEngine, registry: PhoneRegistry) -> None:
         self._engine = engine
-        self._account_mgr = account_mgr
+        self._registry = registry
         self._calls: dict[int, SipCall] = {}
-        self._incoming_queue: list[int] = []
-        self._auto_answer_pending: list[int] = []
+        # Per-phone queues for incoming calls and pending auto-answers
+        self._incoming_queue: dict[str, list[int]] = {}
+        self._auto_answer_pending: dict[str, list[int]] = {}
+        self._call_phone: dict[int, str] = {}
         self._lock = threading.Lock()
         self._call_history: deque[dict] = deque(maxlen=100)
 
-        # Wire up incoming call callback
-        # This will be set when account is created
-        self._setup_incoming_handler()
+        # Wire registry hooks so callbacks attach to every new phone
+        registry.on_phone_added = self._on_phone_added
+        registry.on_phone_dropped = self._on_phone_dropped
 
-    def _setup_incoming_handler(self) -> None:
-        """Set up the incoming call callback on the account."""
-        acc = self._account_mgr.account
-        if acc:
-            acc.on_incoming_call_cb = self._on_incoming_call
+    # Legacy back-compat — AccountManager/PhoneRegistry alias.
+    @property
+    def _account_mgr(self) -> PhoneRegistry:
+        return self._registry
 
-    def _on_incoming_call(self, call_id: int) -> None:
-        """Handle incoming call from account callback."""
-        acc = self._account_mgr.account
-        if not acc:
+    # ------------------------------------------------------------------
+    # Phone-registry hooks
+    # ------------------------------------------------------------------
+    def _on_phone_added(self, phone_id: str) -> None:
+        """Attach the incoming-call callback for a newly added phone."""
+        acc = self._registry.get_account(phone_id)
+        if acc is None:
             return
-        call = SipCall(acc, call_id)
+        acc.on_incoming_call_cb = self._make_incoming_handler(phone_id)
+        # Initialise per-phone queues lazily.
+        with self._lock:
+            self._incoming_queue.setdefault(phone_id, [])
+            self._auto_answer_pending.setdefault(phone_id, [])
+
+    def _on_phone_dropped(self, phone_id: str) -> None:
+        """Clean call/queue state associated with a dropped phone."""
+        with self._lock:
+            self._incoming_queue.pop(phone_id, None)
+            self._auto_answer_pending.pop(phone_id, None)
+            stale_calls = [cid for cid, pid in self._call_phone.items() if pid == phone_id]
+            for cid in stale_calls:
+                self._call_phone.pop(cid, None)
+                self._calls.pop(cid, None)
+
+    def _make_incoming_handler(self, phone_id: str) -> Callable[[int], None]:
+        """Factory — closes over phone_id so incoming calls route to the right queue."""
+
+        def _handler(call_id: int) -> None:
+            self._on_incoming_call(phone_id, call_id)
+
+        return _handler
+
+    def _on_incoming_call(self, phone_id: str, call_id: int) -> None:
+        acc = self._registry.get_account(phone_id)
+        if acc is None:
+            log.warning("[%s] Incoming call %d for unknown phone", phone_id, call_id)
+            return
+        call = SipCall(acc, call_id, phone_id=phone_id)
         call.on_disconnected_cb = self._on_call_disconnected
         with self._lock:
             self._calls[call_id] = call
-            self._incoming_queue.append(call_id)
-        log.info("Incoming call %d queued", call_id)
-
-        if self._account_mgr.auto_answer:
-            self._auto_answer_pending.append(call_id)
+            self._call_phone[call_id] = phone_id
+            self._incoming_queue.setdefault(phone_id, []).append(call_id)
+            if self._registry.get_config(phone_id) and self._registry.get_config(phone_id).auto_answer:
+                self._auto_answer_pending.setdefault(phone_id, []).append(call_id)
+        log.info("[%s] Incoming call %d queued", phone_id, call_id)
 
     def process_auto_answers(self) -> None:
-        """Process pending auto-answer calls.
+        """Process pending auto-answer calls for every phone.
 
         Called from the event poll loop — NOT from inside a pjsua callback.
         Answering inside onIncomingCall causes disconnects because the call
         state machine isn't ready yet.
         """
-        while self._auto_answer_pending:
-            call_id = self._auto_answer_pending.pop(0)
+        with self._lock:
+            pending: list[tuple[str, int]] = []
+            for pid, queue in self._auto_answer_pending.items():
+                while queue:
+                    pending.append((pid, queue.pop(0)))
+        for pid, call_id in pending:
             with self._lock:
                 call = self._calls.get(call_id)
             if call is None:
@@ -283,32 +328,51 @@ class CallManager:
                 prm = pj.CallOpParam()
                 prm.statusCode = 200
                 call.answer(prm)
-                log.info("Auto-answered call %d", call_id)
+                log.info("[%s] Auto-answered call %d", pid, call_id)
             except Exception:
-                log.exception("Failed to auto-answer call %d", call_id)
+                log.exception("[%s] Failed to auto-answer call %d", pid, call_id)
 
-    def _ensure_incoming_handler(self) -> None:
-        """Ensure incoming call handler is connected to current account."""
-        acc = self._account_mgr.account
-        if acc and acc.on_incoming_call_cb is None:
-            acc.on_incoming_call_cb = self._on_incoming_call
+    # ------------------------------------------------------------------
+    # Phone resolution
+    # ------------------------------------------------------------------
+    def _resolve_phone(self, phone_id: str | None) -> str:
+        """Resolve phone_id — explicit or fall back to 'default' if present."""
+        if phone_id is not None:
+            return phone_id
+        if self._registry.has_phone(DEFAULT_PHONE_ID):
+            return DEFAULT_PHONE_ID
+        # Fallback: if there's exactly one phone, use it.
+        ids = self._registry.list_phone_ids()
+        if len(ids) == 1:
+            return ids[0]
+        raise RuntimeError("phone_id is required — multiple phones registered")
 
+    def _ensure_incoming_handler(self, phone_id: str | None = None) -> None:
+        """Ensure incoming-call callback is wired for the given phone (or all)."""
+        ids = [self._resolve_phone(phone_id)] if phone_id else self._registry.list_phone_ids()
+        for pid in ids:
+            acc = self._registry.get_account(pid)
+            if acc is not None and acc.on_incoming_call_cb is None:
+                acc.on_incoming_call_cb = self._make_incoming_handler(pid)
+
+    # ------------------------------------------------------------------
+    # Outbound / inbound call lifecycle
+    # ------------------------------------------------------------------
     def make_call(
         self,
         dest_uri: str,
+        phone_id: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Place an outbound call."""
-        self._ensure_incoming_handler()
-        acc = self._account_mgr.account
-        if not acc or not acc.isValid():
-            raise RuntimeError("No valid account — register first")
+        """Place an outbound call from `phone_id`."""
+        pid = self._resolve_phone(phone_id)
+        self._ensure_incoming_handler(pid)
+        acc = self._registry.require_account(pid)
 
-        call = SipCall(acc)
+        call = SipCall(acc, phone_id=pid)
         call.on_disconnected_cb = self._on_call_disconnected
         prm = pj.CallOpParam(True)  # True = use default call settings
 
-        # Add custom headers
         if headers:
             sip_headers = pj.SipHeaderVector()
             for name, value in headers.items():
@@ -324,53 +388,71 @@ class CallManager:
 
         with self._lock:
             self._calls[call_id] = call
+            self._call_phone[call_id] = pid
 
-        log.info("Outbound call %d to %s", call_id, dest_uri)
-        return {"call_id": call_id, "state": _call_state_name(ci.state)}
+        log.info("[%s] Outbound call %d to %s", pid, call_id, dest_uri)
+        return {"phone_id": pid, "call_id": call_id, "state": _call_state_name(ci.state)}
 
     def answer_call(
         self,
+        phone_id: str | None = None,
         call_id: int | None = None,
         status_code: int = 200,
     ) -> dict[str, Any]:
-        """Answer an incoming call."""
-        self._ensure_incoming_handler()
-        call = self._get_call(call_id, from_incoming=True)
+        """Answer an incoming call on the specified phone."""
+        pid = self._resolve_phone(phone_id)
+        self._ensure_incoming_handler(pid)
+        call = self._get_call(phone_id=pid, call_id=call_id, from_incoming=True)
         prm = pj.CallOpParam()
         prm.statusCode = status_code
         call.answer(prm)
         ci = call.getInfo()
-        return {"call_id": ci.id, "state": _call_state_name(ci.state)}
+        return {"phone_id": pid, "call_id": ci.id, "state": _call_state_name(ci.state)}
 
-    def reject_call(self, call_id: int | None = None, status_code: int = 486) -> dict[str, Any]:
-        """Reject an incoming call with a SIP error code."""
-        call = self._get_call(call_id, from_incoming=True)
+    def reject_call(
+        self,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+        status_code: int = 486,
+    ) -> dict[str, Any]:
+        pid = self._resolve_phone(phone_id)
+        call = self._get_call(phone_id=pid, call_id=call_id, from_incoming=True)
         prm = pj.CallOpParam()
         prm.statusCode = status_code
         call.hangup(prm)
-        return {"call_id": call_id, "status_code": status_code}
+        return {"phone_id": pid, "call_id": call_id, "status_code": status_code}
 
-    def blind_transfer(self, dest_uri: str, call_id: int | None = None) -> dict[str, Any]:
-        """Blind transfer: send REFER to redirect the call."""
-        call = self._get_call(call_id)
+    def blind_transfer(
+        self,
+        dest_uri: str,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+    ) -> dict[str, Any]:
+        pid = self._resolve_phone(phone_id)
+        call = self._get_call(phone_id=pid, call_id=call_id)
         prm = pj.CallOpParam()
         call.xfer(dest_uri, prm)
-        return {"call_id": call_id, "transfer_to": dest_uri}
+        return {"phone_id": pid, "call_id": call_id, "transfer_to": dest_uri}
 
-    def attended_transfer(self, call_id: int | None = None, dest_call_id: int | None = None) -> dict[str, Any]:
-        """Attended transfer: connect two calls, removing ourselves.
-
-        Uses REFER with Replaces header. call_id is transferred to dest_call_id.
-        """
+    def attended_transfer(
+        self,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+        dest_call_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Attended transfer — both call legs must belong to the same phone."""
+        pid = self._resolve_phone(phone_id)
         with self._lock:
             active_calls = [
                 (cid, call) for cid, call in self._calls.items()
-                if call.isActive()
+                if self._call_phone.get(cid) == pid and call.isActive()
             ]
         if len(active_calls) < 2:
-            raise RuntimeError("Need at least 2 active calls for attended transfer")
+            raise RuntimeError(f"[{pid}] Need at least 2 active calls for attended transfer")
 
         if call_id is not None and dest_call_id is not None:
+            self._ensure_call_belongs_to(pid, call_id)
+            self._ensure_call_belongs_to(pid, dest_call_id)
             src_call = self._get_call_by_id(call_id)
             dst_call = self._get_call_by_id(dest_call_id)
         else:
@@ -379,11 +461,15 @@ class CallManager:
 
         prm = pj.CallOpParam()
         src_call.xferReplaces(dst_call, prm)
-        return {"transferred": True}
+        return {"phone_id": pid, "transferred": True}
 
-    def hangup(self, call_id: int | None = None) -> None:
-        """Hang up a call."""
-        call = self._get_call(call_id)
+    def hangup(
+        self,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+    ) -> None:
+        pid = self._resolve_phone(phone_id)
+        call = self._get_call(phone_id=pid, call_id=call_id)
         prm = pj.CallOpParam()
         prm.statusCode = 603  # Decline
         try:
@@ -391,10 +477,13 @@ class CallManager:
         except pj.Error:
             log.debug("Call already disconnected")
 
-    def hangup_all(self) -> None:
-        """Hang up all active calls (cleanup)."""
+    def hangup_all(self, phone_id: str | None = None) -> None:
+        """Hang up all calls (optionally scoped to one phone)."""
         with self._lock:
-            calls = list(self._calls.values())
+            if phone_id is None:
+                calls = list(self._calls.values())
+            else:
+                calls = [c for cid, c in self._calls.items() if self._call_phone.get(cid) == phone_id]
         for call in calls:
             try:
                 if call.isActive():
@@ -404,11 +493,16 @@ class CallManager:
             except Exception:
                 log.debug("Error hanging up call during cleanup")
 
-    def get_call_info(self, call_id: int | None = None) -> dict[str, Any]:
+    def get_call_info(
+        self,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+    ) -> dict[str, Any]:
         """Get info about a call including RTP statistics."""
-        call = self._get_call(call_id)
+        pid = self._resolve_phone(phone_id)
+        call = self._get_call(phone_id=pid, call_id=call_id)
         info = call.get_cached_info()
-        # Also try to get fresh info
+        info["phone_id"] = pid
         try:
             ci = call.getInfo()
             info["call_id"] = ci.id
@@ -418,7 +512,6 @@ class CallManager:
             info["local_contact"] = ci.localContact
         except Exception:
             pass
-        # RTP/RTCP statistics from the media stream
         try:
             stat = call.getStreamStat(0)
             rtcp = stat.rtcp
@@ -438,59 +531,73 @@ class CallManager:
             pass
         return info
 
-    def send_dtmf(self, call_id: int, digits: str) -> None:
-        """Send DTMF digits on a call."""
+    def send_dtmf(self, call_id: int, digits: str, phone_id: str | None = None) -> None:
+        pid = self._resolve_phone(phone_id)
+        self._ensure_call_belongs_to(pid, call_id)
         call = self._get_call_by_id(call_id)
-        prm = pj.CallOpParam()
         for digit in digits:
             try:
                 call.dialDtmf(digit)
             except (pj.Error, AttributeError):
-                # Fallback to INFO method
                 dparam = pj.CallSendDtmfParam()
                 dparam.digits = digit
                 dparam.method = pj.PJSUA_DTMF_METHOD_SIP_INFO
                 call.sendDtmf(dparam)
 
-    def reinvite_with_codecs(self, codecs: list[str], call_id: int | None = None) -> dict[str, Any]:
+    def reinvite_with_codecs(
+        self,
+        codecs: list[str],
+        phone_id: str | None = None,
+        call_id: int | None = None,
+    ) -> dict[str, Any]:
         """Change codecs on an active call via re-INVITE.
 
-        Sets codec priorities on the endpoint, then sends re-INVITE
-        to renegotiate media with the new SDP.
+        Codec priorities are endpoint-wide; this sets them then re-INVITEs
+        the target call.
         """
+        pid = self._resolve_phone(phone_id)
         enabled = self._engine.set_codecs(codecs)
-        call = self._get_call(call_id)
+        call = self._get_call(phone_id=pid, call_id=call_id)
         prm = pj.CallOpParam()
         call.reinvite(prm)
-        return {"codecs": enabled, "reinvite": True}
+        return {"phone_id": pid, "codecs": enabled, "reinvite": True}
 
-    def play_audio(self, file_path: str, call_id: int | None = None, loop: bool = False) -> dict[str, Any]:
-        """Play a WAV file into a call's audio stream."""
-        call = self._get_call(call_id)
+    def play_audio(
+        self,
+        file_path: str,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+        loop: bool = False,
+    ) -> dict[str, Any]:
+        pid = self._resolve_phone(phone_id)
+        call = self._get_call(phone_id=pid, call_id=call_id)
         call.play_file(file_path, loop=loop)
-        return {"call_id": call_id, "playing_file": file_path, "loop": loop}
+        return {"phone_id": pid, "call_id": call_id, "playing_file": file_path, "loop": loop}
 
-    def stop_audio(self, call_id: int | None = None) -> None:
-        """Stop audio playback on a call (resumes default MOH)."""
-        call = self._get_call(call_id)
+    def stop_audio(
+        self,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+    ) -> None:
+        pid = self._resolve_phone(phone_id)
+        call = self._get_call(phone_id=pid, call_id=call_id)
         call.stop_playback()
 
-    def conference(self, call_ids: list[int]) -> dict[str, Any]:
-        """Bridge multiple calls together via the conference bridge.
-
-        Cross-connects audio media of all specified calls so all parties
-        can hear each other.
-        """
+    def conference(
+        self,
+        call_ids: list[int],
+        phone_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Bridge multiple calls — all must belong to the same phone."""
+        pid = self._resolve_phone(phone_id)
+        for cid in call_ids:
+            self._ensure_call_belongs_to(pid, cid)
         calls = [self._get_call_by_id(cid) for cid in call_ids]
-        media_ports = []
-        for call in calls:
-            if call.audio_media is not None:
-                media_ports.append(call.audio_media)
+        media_ports = [c.audio_media for c in calls if c.audio_media is not None]
 
         if len(media_ports) < 2:
-            raise RuntimeError("Need at least 2 calls with active audio for conference")
+            raise RuntimeError(f"[{pid}] Need at least 2 calls with active audio for conference")
 
-        # Cross-connect all audio ports
         for i, port_a in enumerate(media_ports):
             for j, port_b in enumerate(media_ports):
                 if i != j:
@@ -499,16 +606,18 @@ class CallManager:
                     except Exception:
                         log.debug("Conference connect error: %d->%d", i, j)
 
-        return {"call_ids": call_ids, "participants": len(media_ports)}
+        return {"phone_id": pid, "call_ids": call_ids, "participants": len(media_ports)}
 
-    def hold(self, call_id: int) -> None:
-        """Put a call on hold."""
+    def hold(self, call_id: int, phone_id: str | None = None) -> None:
+        pid = self._resolve_phone(phone_id)
+        self._ensure_call_belongs_to(pid, call_id)
         call = self._get_call_by_id(call_id)
         prm = pj.CallOpParam()
         call.setHold(prm)
 
-    def unhold(self, call_id: int) -> None:
-        """Resume a held call."""
+    def unhold(self, call_id: int, phone_id: str | None = None) -> None:
+        pid = self._resolve_phone(phone_id)
+        self._ensure_call_belongs_to(pid, call_id)
         call = self._get_call_by_id(call_id)
         prm = pj.CallOpParam()
         prm.flag = pj.PJSUA_CALL_UNHOLD
@@ -517,6 +626,7 @@ class CallManager:
     def _on_call_disconnected(self, info: dict) -> None:
         """Record call to history and remove from active calls."""
         self._call_history.append({
+            "phone_id": info.get("phone_id"),
             "remote_uri": info.get("remote_uri", ""),
             "duration": info.get("duration", 0),
             "last_status": info.get("last_status", 0),
@@ -525,90 +635,127 @@ class CallManager:
             "recording_file": info.get("recording_file"),
             "timestamp": datetime.now().isoformat(),
         })
-        # Remove disconnected calls from _calls dict to prevent stale entries
         with self._lock:
             stale = [cid for cid, c in self._calls.items()
                      if c.get_cached_info().get("state") == "DISCONNECTED"]
             for cid in stale:
-                del self._calls[cid]
-            # Clean incoming queue of stale IDs
-            self._incoming_queue = [
-                cid for cid in self._incoming_queue if cid in self._calls
-            ]
+                self._calls.pop(cid, None)
+                self._call_phone.pop(cid, None)
+            for pid, queue in self._incoming_queue.items():
+                self._incoming_queue[pid] = [cid for cid in queue if cid in self._calls]
 
     def cleanup(self) -> None:
         """Clear all call state — called before re-registration."""
         with self._lock:
             self._calls.clear()
-            self._incoming_queue.clear()
-            self._auto_answer_pending.clear()
+            self._call_phone.clear()
+            for pid in list(self._incoming_queue):
+                self._incoming_queue[pid].clear()
+            for pid in list(self._auto_answer_pending):
+                self._auto_answer_pending[pid].clear()
 
-    def list_calls(self) -> list[dict]:
-        """List all tracked calls with basic status."""
+    def list_calls(self, phone_id: str | None = None) -> list[dict]:
+        """List all tracked calls with basic status (optionally scoped to one phone)."""
         result = []
         with self._lock:
-            for cid, call in self._calls.items():
-                info = call.get_cached_info()
-                entry = {
-                    "call_id": cid,
-                    "state": info.get("state", "UNKNOWN"),
-                    "remote_uri": info.get("remote_uri", ""),
-                    "duration": info.get("duration", 0),
-                    "codec": info.get("codec", ""),
-                }
-                # Try fresh state
-                try:
-                    ci = call.getInfo()
-                    entry["state"] = _call_state_name(ci.state)
-                    entry["call_id"] = ci.id
-                    entry["duration"] = ci.connectDuration.sec
-                except Exception:
-                    pass
-                result.append(entry)
+            items = list(self._calls.items())
+        for cid, call in items:
+            pid = self._call_phone.get(cid, call.phone_id)
+            if phone_id is not None and pid != phone_id:
+                continue
+            info = call.get_cached_info()
+            entry = {
+                "phone_id": pid,
+                "call_id": cid,
+                "state": info.get("state", "UNKNOWN"),
+                "remote_uri": info.get("remote_uri", ""),
+                "duration": info.get("duration", 0),
+                "codec": info.get("codec", ""),
+            }
+            try:
+                ci = call.getInfo()
+                entry["state"] = _call_state_name(ci.state)
+                entry["call_id"] = ci.id
+                entry["duration"] = ci.connectDuration.sec
+            except Exception:
+                pass
+            result.append(entry)
         return result
 
-    def get_active_calls(self) -> list[dict]:
+    def get_active_calls(self, phone_id: str | None = None) -> list[dict]:
         """List only active (non-DISCONNECTED) calls with full info + RTP."""
         result = []
-        for entry in self.list_calls():
+        for entry in self.list_calls(phone_id=phone_id):
             if entry["state"] not in ("DISCONNECTED", "NONE", "NULL"):
-                # Get full info including RTP
                 try:
-                    full = self.get_call_info(call_id=entry["call_id"])
+                    full = self.get_call_info(phone_id=entry["phone_id"], call_id=entry["call_id"])
                     result.append(full)
                 except Exception:
                     result.append(entry)
         return result
 
-    def get_call_history(self, last_n: int | None = None) -> list[dict]:
+    def get_call_history(
+        self,
+        phone_id: str | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
         history = list(self._call_history)
+        if phone_id is not None:
+            history = [h for h in history if h.get("phone_id") == phone_id]
         if last_n:
             history = history[-last_n:]
         return history
 
-    def _get_call(self, call_id: int | None = None, from_incoming: bool = False) -> SipCall:
-        """Get a call by ID, or the current active/incoming call."""
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _get_call(
+        self,
+        phone_id: str | None = None,
+        call_id: int | None = None,
+        from_incoming: bool = False,
+    ) -> SipCall:
+        """Get a call by ID, or the first active/incoming call (scoped to phone_id)."""
         if call_id is not None:
+            if phone_id is not None:
+                self._ensure_call_belongs_to(phone_id, call_id)
             return self._get_call_by_id(call_id)
 
+        pid = phone_id
         with self._lock:
-            if from_incoming and self._incoming_queue:
-                cid = self._incoming_queue.pop(0)
-                if cid in self._calls:
-                    return self._calls[cid]
+            if from_incoming and pid is not None:
+                queue = self._incoming_queue.get(pid, [])
+                while queue:
+                    cid = queue.pop(0)
+                    if cid in self._calls:
+                        return self._calls[cid]
 
-            # Return any active call
-            for call in self._calls.values():
+            # Return the first active call that matches phone scope (if any)
+            for cid, call in self._calls.items():
+                if pid is not None and self._call_phone.get(cid) != pid:
+                    continue
                 try:
                     if call.isActive():
                         return call
                 except Exception:
                     continue
 
-        raise RuntimeError("No active call found")
+        scope = f"phone {pid!r}" if pid else "any phone"
+        raise RuntimeError(f"No active call found for {scope}")
 
     def _get_call_by_id(self, call_id: int) -> SipCall:
         with self._lock:
             if call_id in self._calls:
                 return self._calls[call_id]
         raise RuntimeError(f"Call {call_id} not found")
+
+    def _ensure_call_belongs_to(self, phone_id: str, call_id: int) -> None:
+        """Raise if call_id does not belong to phone_id."""
+        with self._lock:
+            owner = self._call_phone.get(call_id)
+        if owner is None:
+            raise RuntimeError(f"Call {call_id} not found")
+        if owner != phone_id:
+            raise RuntimeError(
+                f"call_id {call_id} belongs to phone_id {owner!r}, not {phone_id!r}"
+            )

@@ -9,3 +9,4 @@ services:
     volumes:
       - ./captures:/captures
       - ./recordings:/recordings
+      - ./config:/config:ro

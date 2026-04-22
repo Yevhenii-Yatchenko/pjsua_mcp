@@ -9,9 +9,11 @@ from src.sip_engine import SipEngine
 
 class TestInitializeValidation:
     def test_invalid_transport(self, pjsua_endpoint):
+        """Transport validation happens in create_transport() now that
+        initialize() is parameter-less."""
         engine = SipEngine()
         with pytest.raises(ValueError, match="Unsupported transport"):
-            engine.initialize(transport="websocket")
+            engine.create_transport(transport="websocket")
 
     def test_double_init(self, pjsua_endpoint):
         """Cannot initialize twice on the same engine instance.

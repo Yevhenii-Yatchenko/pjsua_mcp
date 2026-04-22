@@ -1,0 +1,35 @@
+# Phone profile for load_phone_profile.
+#
+# Copy this file to phones.yaml (gitignored) and fill in the credentials
+# for your test stand, then invoke the tool:
+#
+#   mcp__pjsua__load_phone_profile(path="/config/phones.yaml")
+#
+# Keep multiple profiles side-by-side (e.g. test-stand.yaml, prod.yaml,
+# asterisk.yaml) and pass the right path when loading.
+
+# Keys under `defaults` are merged into each phone entry — override per-phone
+# by setting the same key on the phone.
+defaults:
+  domain: sip.example.com
+  password: change_me
+  codecs: [PCMA]
+  transport: udp
+  auto_answer: false
+  register: true
+  srtp: false
+
+phones:
+  - phone_id: a
+    username: "1001"
+
+  - phone_id: b
+    username: "1002"
+    auto_answer: true
+
+  - phone_id: c
+    username: "1003"
+    auto_answer: true
+    # Per-phone override of defaults:
+    # password: "c_specific_pw"
+    # realm: "example.realm"

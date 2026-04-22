@@ -1,0 +1,6 @@
+# Keep real test-stand credentials out of git.
+# Only *.example.yaml is tracked.
+*.yaml
+*.yml
+!*.example.yaml
+!*.example.yml

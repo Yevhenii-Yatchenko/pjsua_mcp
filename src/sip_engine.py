@@ -24,7 +24,6 @@ class SipEngine:
     def __init__(self) -> None:
         self._ep: pj.Endpoint | None = None
         self._log_writer: SipLogWriter | None = None
-        self._transport_id: int | None = None
         self._initialized = False
         self._lock = threading.Lock()
 
@@ -37,22 +36,17 @@ class SipEngine:
     def initialized(self) -> bool:
         return self._initialized
 
-    def initialize(self, transport: str = "udp", local_port: int = 0) -> int:
-        """Create Endpoint, configure logging, create transport.
+    def initialize(self) -> None:
+        """Create Endpoint and start the pjlib library.
 
-        Returns the transport ID.
+        Transports are created separately via `create_transport()` — one per phone.
         """
         if self._initialized:
             raise RuntimeError("SIP engine already initialized")
 
-        transport = transport.lower()
-        if transport not in TRANSPORT_MAP:
-            raise ValueError(f"Unsupported transport: {transport!r} (use udp/tcp/tls)")
-
         ep = pj.Endpoint()
         ep.libCreate()
 
-        # Endpoint config
         ep_cfg = pj.EpConfig()
 
         # Logging: capture everything via LogWriter.
@@ -73,20 +67,51 @@ class SipEngine:
         # Null audio device — headless Docker, no sound card
         ep.audDevManager().setNullDev()
 
-        # Create transport
-        tp_cfg = pj.TransportConfig()
-        tp_cfg.port = local_port
-
-        tp_type = TRANSPORT_MAP[transport]
-        self._transport_id = ep.transportCreate(tp_type, tp_cfg)
-
-        # Start library
         ep.libStart()
 
         self._ep = ep
         self._initialized = True
-        log.info("SIP engine initialized (transport=%s, port=%d)", transport, local_port)
-        return self._transport_id
+        log.info("SIP engine initialized (no transports — created per-phone)")
+
+    def create_transport(self, transport: str = "udp", local_port: int = 0) -> int:
+        """Create a new transport bound to `local_port` and return its ID.
+
+        Each phone (pj.Account) gets its own transport so per-phone packet
+        capture and SIP-Contact port separation work. `local_port=0` lets the
+        kernel pick an ephemeral port.
+        """
+        transport = transport.lower()
+        if transport not in TRANSPORT_MAP:
+            raise ValueError(f"Unsupported transport: {transport!r} (use udp/tcp/tls)")
+
+        if not self._initialized:
+            raise RuntimeError("SIP engine not initialized — call initialize() first")
+
+        tp_cfg = pj.TransportConfig()
+        tp_cfg.port = local_port
+        tp_id = self._ep.transportCreate(TRANSPORT_MAP[transport], tp_cfg)
+        log.info("Created %s transport id=%d (port=%d)", transport, tp_id, local_port)
+        return tp_id
+
+    def close_transport(self, transport_id: int) -> None:
+        """Close a transport. Safe to call if the ID is unknown — logs and skips."""
+        if not self._initialized or self._ep is None:
+            return
+        try:
+            self._ep.transportClose(transport_id)
+            log.info("Closed transport id=%d", transport_id)
+        except Exception:
+            log.exception("Failed to close transport id=%d", transport_id)
+
+    def get_transport_port(self, transport_id: int) -> int | None:
+        """Return the local port of a transport, or None if unknown."""
+        if not self._initialized or self._ep is None:
+            return None
+        try:
+            info = self._ep.transportGetInfo(transport_id)
+            return info.localName.split(":")[-1] and int(info.localName.split(":")[-1])
+        except Exception:
+            return None
 
     def handle_events(self, msec_timeout: int = 50) -> None:
         """Poll PJSUA2 event loop. Called from executor thread."""

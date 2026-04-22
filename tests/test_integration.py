@@ -1,16 +1,17 @@
-"""MCP JSON-RPC integration tests.
+"""MCP JSON-RPC integration tests — multi-phone dynamic-tool architecture.
 
-Self-contained when run via docker-compose.test.yml (Asterisk PBX + two
-PJSUA MCP server subprocesses as caller/callee).
+One MCP server process manages multiple phones via `add_phone` / `drop_phone`.
+Each phone gets per-phone tools named `<phone_id>_<action>` that appear/disappear
+via `notifications/tools/list_changed`.
 
-Can also target any SIP registrar by setting env vars manually.
+Self-contained when run via docker-compose.test.yml (Asterisk PBX + test runner).
 
 Usage:
     # Docker Compose (self-contained, recommended)
     docker compose -f docker-compose.test.yml run --build --rm test-runner
 
     # Against external SIP server
-    SIP_DOMAIN=192.168.1.202 SIP_USER_A=123007 SIP_PASS_A=xxx \
+    SIP_DOMAIN=sip.example.com SIP_USER_A=user_a SIP_PASS_A=xxx \
         pytest tests/test_integration.py -v
 """
 
@@ -75,7 +76,6 @@ class McpClient:
         return self._msg_id
 
     def send_initialize(self) -> dict:
-        """Send MCP initialize handshake."""
         resp = self._send_request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
@@ -85,11 +85,14 @@ class McpClient:
         return resp
 
     def call_tool(self, name: str, arguments: dict | None = None) -> dict:
-        """Call an MCP tool and return the raw JSON-RPC response."""
         return self._send_request("tools/call", {
             "name": name,
             "arguments": arguments or {},
         })
+
+    def list_tools(self) -> list[str]:
+        resp = self._send_request("tools/list", {})
+        return sorted(t["name"] for t in resp["result"]["tools"])
 
     def _send_request(self, method: str, params: dict) -> dict:
         assert self._proc and self._proc.stdin and self._proc.stdout
@@ -133,7 +136,6 @@ class McpClient:
 
 
 def _parse_tool_result(resp: dict) -> dict[str, Any]:
-    """Extract parsed JSON from MCP tool response."""
     if "error" in resp:
         raise RuntimeError(f"MCP error: {resp['error']}")
     content = resp["result"]["content"]
@@ -141,37 +143,56 @@ def _parse_tool_result(resp: dict) -> dict[str, Any]:
     return json.loads(text)
 
 
-def _wait_registered(client: McpClient, timeout: float = 5.0) -> None:
-    """Poll get_registration_status until is_registered=True."""
+def _wait_phone_registered(client: McpClient, phone_id: str, timeout: float = 5.0) -> None:
+    """Poll `<phone_id>_get_registration_status` until is_registered=True."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        info = _parse_tool_result(client.call_tool("get_registration_status"))
+        info = _parse_tool_result(client.call_tool(f"{phone_id}_get_registration_status"))
         if info.get("is_registered"):
             return
-        time.sleep(0.5)
-    raise AssertionError(f"Registration not completed within {timeout}s")
+        time.sleep(0.3)
+    raise AssertionError(f"Phone {phone_id!r} not registered within {timeout}s")
 
 
-def _configure_and_register(client: McpClient, user: str, password: str) -> None:
-    """Helper: configure + register an MCP client, wait until registered."""
-    result = _parse_tool_result(client.call_tool("configure", {
+def _add_phone(
+    client: McpClient,
+    phone_id: str,
+    username: str,
+    password: str,
+    *,
+    auto_answer: bool = False,
+    codecs: list[str] | None = None,
+) -> dict:
+    result = _parse_tool_result(client.call_tool("add_phone", {
+        "phone_id": phone_id,
         "domain": SIP_DOMAIN,
-        "transport": "udp",
-        "username": user,
+        "username": username,
         "password": password,
+        "auto_answer": auto_answer,
+        "codecs": codecs,
     }))
-    assert result["status"] == "configured"
-    result = _parse_tool_result(client.call_tool("register"))
-    assert result["status"] == "ok"
-    _wait_registered(client)
+    assert result["status"] == "ok", f"add_phone failed: {result}"
+    return result
+
+
+def _wait_and_answer(client: McpClient, phone_id: str, timeout: float = 5.0) -> dict:
+    """Retry <phone_id>_answer_call until the incoming INVITE arrives."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = _parse_tool_result(client.call_tool(f"{phone_id}_answer_call"))
+        if result.get("status") == "ok":
+            return result
+        time.sleep(0.3)
+    raise AssertionError(f"No incoming call on {phone_id!r} within {timeout}s")
 
 
 # ---------------------------------------------------------------------------
-# Registration tests (single account)
+# Dynamic tool lifecycle — exercises the factory/remove_tool machinery
 # ---------------------------------------------------------------------------
 
-@skip_no_domain
-class TestRegistration:
+class TestDynamicTools:
+    """No SIP_DOMAIN needed — these tests target the factory, not the network."""
+
     @pytest.fixture(autouse=True)
     def mcp(self):
         with McpClient() as client:
@@ -179,558 +200,701 @@ class TestRegistration:
             self.client = client
             yield
 
-    def test_configure_and_register(self):
-        result = _parse_tool_result(self.client.call_tool("configure", {
-            "domain": SIP_DOMAIN,
-            "transport": "udp",
-            "username": SIP_USER_A,
-            "password": SIP_PASS_A,
+    def test_static_tools_only_at_startup(self):
+        tools = self.client.list_tools()
+        assert "add_phone" in tools
+        assert "drop_phone" in tools
+        assert "list_phones" in tools
+        assert "load_phone_profile" in tools
+        # No per-phone tools until add_phone is called
+        assert not any(t.startswith("a_") for t in tools)
+
+    def test_add_phone_exposes_phone_tools(self):
+        # register=False avoids waiting for a SIP REGISTER response
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1",
+            "username": "user_z",
+            "password": "pw",
+            "register": False,
         }))
-        assert result["status"] == "configured"
-
-        result = _parse_tool_result(self.client.call_tool("register"))
         assert result["status"] == "ok"
-        # Registration may still be in-flight; poll until complete.
-        _wait_registered(self.client)
+        assert result["tools_registered"] == 21
 
-    def test_get_registration_status(self):
-        _configure_and_register(self.client, SIP_USER_A, SIP_PASS_A)
+        tools = self.client.list_tools()
+        assert "z_make_call" in tools
+        assert "z_hangup" in tools
+        assert "z_get_call_info" in tools
+        assert "z_attended_transfer" in tools
+        assert "z_get_registration_status" in tools
 
-        result = _parse_tool_result(
-            self.client.call_tool("get_registration_status")
-        )
-        assert result["is_registered"] is True
+    def test_drop_phone_removes_phone_tools(self):
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1",
+            "username": "user_z",
+            "password": "pw",
+            "register": False,
+        }))
+        assert "z_make_call" in self.client.list_tools()
 
-    def test_register_without_configure(self):
-        result = _parse_tool_result(self.client.call_tool("register"))
+        result = _parse_tool_result(self.client.call_tool("drop_phone", {"phone_id": "z"}))
+        assert result["status"] == "ok"
+        assert result["tools_removed"] == 21
+
+        tools = self.client.list_tools()
+        assert "z_make_call" not in tools
+        # Static tools still present
+        assert "add_phone" in tools
+
+    def test_list_phones_reflects_registry(self):
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z", "domain": "127.0.0.1",
+            "username": "user_z", "password": "pw",
+            "register": False,
+        }))
+        result = _parse_tool_result(self.client.call_tool("list_phones"))
+        assert result["total_count"] == 1
+        assert result["phones"][0]["phone_id"] == "z"
+        assert result["phones"][0]["username"] == "user_z"
+        assert result["phones"][0]["tools"]
+
+    def test_phone_id_validation_rejects_bad_chars(self):
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "Phone-1",  # uppercase + hyphen not allowed
+            "domain": "127.0.0.1", "username": "x", "password": "x",
+            "register": False,
+        }))
+        assert result["status"] == "error"
+        assert "invalid" in result["error"].lower()
+
+
+class TestLoadPhoneProfile:
+    """Profile loader — no SIP_DOMAIN needed (all phones use register=False)."""
+
+    @pytest.fixture(autouse=True)
+    def mcp(self, tmp_path):
+        self.tmp_path = tmp_path
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            yield
+
+    def _write_profile(self, name: str, body: str) -> str:
+        path = self.tmp_path / name
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    def test_load_adds_three_phones(self):
+        path = self._write_profile("profile.yaml", """
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+phones:
+  - phone_id: p1
+    username: u1
+  - phone_id: p2
+    username: u2
+    auto_answer: true
+  - phone_id: p3
+    username: u3
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        assert result["status"] == "ok"
+        assert len(result["added"]) == 3
+        assert not result["errors"]
+
+        tools = self.client.list_tools()
+        for pid in ("p1", "p2", "p3"):
+            assert f"{pid}_make_call" in tools
+            assert f"{pid}_hangup" in tools
+
+    def test_missing_file(self):
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {
+            "path": "/tmp/does_not_exist.yaml",
+        }))
+        assert result["status"] == "error"
+        assert "not found" in result["error"].lower()
+
+    def test_missing_required_field(self):
+        path = self._write_profile("bad.yaml", """
+defaults:
+  domain: 127.0.0.1
+  register: false
+phones:
+  - phone_id: p1
+    username: u1
+    # password missing from both defaults and phone
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        assert result["status"] == "error"
+        assert "password" in result["error"].lower()
+
+    def test_unknown_field_rejected(self):
+        path = self._write_profile("bad.yaml", """
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+phones:
+  - phone_id: p1
+    username: u1
+    unknown_key: "oops"
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        assert result["status"] == "error"
+        assert "unknown" in result["error"].lower()
+
+    def test_duplicate_phone_id(self):
+        path = self._write_profile("dup.yaml", """
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+phones:
+  - phone_id: p1
+    username: u1
+  - phone_id: p1
+    username: u2
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        assert result["status"] == "error"
+        assert "duplicate" in result["error"].lower()
+
+    def test_empty_phones_list(self):
+        path = self._write_profile("empty.yaml", """
+defaults:
+  domain: 127.0.0.1
+  password: x
+phones: []
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        assert result["status"] == "error"
+        assert "empty" in result["error"].lower()
+
+    def test_per_phone_override_beats_defaults(self):
+        path = self._write_profile("override.yaml", """
+defaults:
+  domain: default.example.com
+  password: x
+  register: false
+  auto_answer: false
+phones:
+  - phone_id: p1
+    username: u1
+    domain: override.example.com
+    auto_answer: true
+""")
+        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "p1"}))
+        assert info["domain"] == "override.example.com"
+        assert info["auto_answer"] is True
+
+    def test_replace_drops_existing_phones(self):
+        """Default mode drops phones that are NOT in the new profile."""
+        first = self._write_profile("first.yaml", """
+defaults: {domain: 127.0.0.1, password: x, register: false}
+phones:
+  - {phone_id: p1, username: u1}
+  - {phone_id: p2, username: u2}
+  - {phone_id: p3, username: u3}
+""")
+        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": first}))
+        phones = _parse_tool_result(self.client.call_tool("list_phones"))
+        assert {p["phone_id"] for p in phones["phones"]} == {"p1", "p2", "p3"}
+
+        # Load a profile that contains only p4 — p1/p2/p3 should be dropped.
+        second = self._write_profile("second.yaml", """
+defaults: {domain: 127.0.0.1, password: x, register: false}
+phones:
+  - {phone_id: p4, username: u4}
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": second}))
+        assert result["mode"] == "replace"
+        assert set(result["dropped"]) == {"p1", "p2", "p3"}
+        assert len(result["added"]) == 1
+
+        phones = _parse_tool_result(self.client.call_tool("list_phones"))
+        assert {p["phone_id"] for p in phones["phones"]} == {"p4"}
+
+        tools = self.client.list_tools()
+        for gone in ("p1_make_call", "p2_make_call", "p3_make_call"):
+            assert gone not in tools
+        assert "p4_make_call" in tools
+
+    def test_merge_mode_preserves_outside_phones(self):
+        """merge=True keeps phones that are not in the profile."""
+        first = self._write_profile("first.yaml", """
+defaults: {domain: 127.0.0.1, password: x, register: false}
+phones:
+  - {phone_id: p1, username: u1}
+  - {phone_id: p2, username: u2}
+""")
+        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": first}))
+
+        second = self._write_profile("second.yaml", """
+defaults: {domain: 127.0.0.1, password: x, register: false}
+phones:
+  - {phone_id: p3, username: u3}
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {
+            "path": second, "merge": True,
+        }))
+        assert result["mode"] == "merge"
+        assert result["dropped"] == []
+
+        phones = _parse_tool_result(self.client.call_tool("list_phones"))
+        assert {p["phone_id"] for p in phones["phones"]} == {"p1", "p2", "p3"}
+
+    def test_invalid_profile_leaves_existing_untouched(self):
+        """Parse/validation errors happen before any state mutation."""
+        first = self._write_profile("first.yaml", """
+defaults: {domain: 127.0.0.1, password: x, register: false}
+phones:
+  - {phone_id: p1, username: u1}
+  - {phone_id: p2, username: u2}
+""")
+        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": first}))
+
+        bad = self._write_profile("bad.yaml", """
+defaults: {domain: 127.0.0.1, register: false}
+phones:
+  - {phone_id: p3, username: u3}
+  # password missing both from defaults and phone → validation fails
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": bad}))
         assert result["status"] == "error"
 
-    def test_get_sip_log_has_entries(self):
-        _configure_and_register(self.client, SIP_USER_A, SIP_PASS_A)
+        phones = _parse_tool_result(self.client.call_tool("list_phones"))
+        assert {p["phone_id"] for p in phones["phones"]} == {"p1", "p2"}
 
-        result = _parse_tool_result(self.client.call_tool("get_sip_log"))
-        assert result["total_count"] > 0
+    def test_replace_of_empty_registry(self):
+        """Replace semantics must not fail when there are no existing phones."""
+        path = self._write_profile("fresh.yaml", """
+defaults: {domain: 127.0.0.1, password: x, register: false}
+phones:
+  - {phone_id: p1, username: u1}
+""")
+        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        assert result["status"] == "ok"
+        assert result["dropped"] == []
+        assert len(result["added"]) == 1
 
-    def test_get_sip_log_filter(self):
-        _configure_and_register(self.client, SIP_USER_A, SIP_PASS_A)
 
-        all_result = _parse_tool_result(self.client.call_tool("get_sip_log"))
-        filtered = _parse_tool_result(self.client.call_tool("get_sip_log", {
+# ---------------------------------------------------------------------------
+# Registration against live Asterisk (single phone)
+# ---------------------------------------------------------------------------
+
+@skip_no_domain
+class TestPhoneRegistration:
+    @pytest.fixture(autouse=True)
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            yield
+
+    def test_add_phone_registers(self):
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+        _wait_phone_registered(self.client, "a")
+
+        status = _parse_tool_result(self.client.call_tool("a_get_registration_status"))
+        assert status["is_registered"] is True
+
+    def test_add_phone_fails_without_engine_reach(self):
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "bad",
+            "domain": "nonexistent.invalid",
+            "username": "x",
+            "password": "x",
+        }))
+        # add_phone itself succeeds (account is created, REGISTER sent) but
+        # registration state will be off. Status "ok" — checked via get_phone.
+        assert result["status"] == "ok"
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "bad"}))
+        assert info["is_registered"] is False
+
+    def test_sip_log_has_register_entries(self):
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+        _wait_phone_registered(self.client, "a")
+        result = _parse_tool_result(self.client.call_tool("get_sip_log", {
             "filter_text": "REGISTER",
         }))
-        assert filtered["total_count"] <= all_result["total_count"]
-        assert filtered["total_count"] > 0
+        assert result["total_count"] > 0
 
-    def test_unregister(self):
-        _configure_and_register(self.client, SIP_USER_A, SIP_PASS_A)
+    def test_get_sip_log_phone_filter(self):
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+        _wait_phone_registered(self.client, "a")
+        result = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a",
+        }))
+        # Every kept entry should contain phone a's user URI
+        assert result["total_count"] > 0
+        for e in result["entries"]:
+            assert f"sip:{SIP_USER_A}@" in e["msg"]
 
-        result = _parse_tool_result(self.client.call_tool("unregister"))
+    def test_unregister_phone_tool(self):
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+        _wait_phone_registered(self.client, "a")
+        result = _parse_tool_result(self.client.call_tool("a_unregister"))
         assert result["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------
-# Call-flow tests (two accounts)
+# Call flow (two phones in one MCP process)
 # ---------------------------------------------------------------------------
 
 @skip_no_domain
 class TestCallFlow:
     @pytest.fixture(autouse=True)
-    def mcp_pair(self):
-        with McpClient() as caller, McpClient() as callee:
-            caller.send_initialize()
-            callee.send_initialize()
-            self.caller = caller
-            self.callee = callee
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
             yield
 
-    def _register_both(self) -> None:
-        _configure_and_register(self.caller, SIP_USER_A, SIP_PASS_A)
-        _configure_and_register(self.callee, SIP_USER_B, SIP_PASS_B)
-
-    @staticmethod
-    def _wait_and_answer(client: McpClient, timeout: float = 5.0) -> dict:
-        """Retry answer_call until the incoming INVITE arrives."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            result = _parse_tool_result(client.call_tool("answer_call"))
-            if result.get("status") == "ok":
-                return result
-            time.sleep(0.5)
-        raise AssertionError(f"No incoming call within {timeout}s")
-
     def test_call_and_hangup(self):
-        self._register_both()
-
-        # Caller dials callee
-        result = _parse_tool_result(self.caller.call_tool("make_call", {
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
         assert result["status"] == "ok"
         call_id = result["call_id"]
 
-        # Callee answers
-        self._wait_and_answer(self.callee)
+        _wait_and_answer(self.client, "b")
         time.sleep(0.5)
 
-        # Verify caller side shows CONFIRMED
-        caller_info = _parse_tool_result(
-            self.caller.call_tool("get_call_info", {"call_id": call_id})
-        )
-        assert caller_info["state"] == "CONFIRMED"
+        info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
+        assert info["state"] == "CONFIRMED"
+        assert info["phone_id"] == "a"
 
-        # Hangup from caller
-        result = _parse_tool_result(
-            self.caller.call_tool("hangup", {"call_id": call_id})
-        )
+        result = _parse_tool_result(self.client.call_tool("a_hangup", {"call_id": call_id}))
         assert result["status"] == "ok"
 
     def test_callee_hangup(self):
-        self._register_both()
-
-        self.caller.call_tool("make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        })
-        self._wait_and_answer(self.callee)
+        self.client.call_tool("a_make_call", {"dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}"})
+        _wait_and_answer(self.client, "b")
         time.sleep(0.5)
 
-        # Hangup from callee side
-        result = _parse_tool_result(self.callee.call_tool("hangup"))
+        result = _parse_tool_result(self.client.call_tool("b_hangup"))
         assert result["status"] == "ok"
 
     def test_sip_log_shows_invite(self):
-        self._register_both()
-
-        self.caller.call_tool("make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        })
-        self._wait_and_answer(self.callee)
+        self.client.call_tool("a_make_call", {"dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}"})
+        _wait_and_answer(self.client, "b")
         time.sleep(0.5)
-        self.caller.call_tool("hangup")
+        self.client.call_tool("a_hangup")
         time.sleep(0.5)
 
-        log = _parse_tool_result(self.caller.call_tool("get_sip_log", {
-            "filter_text": "INVITE",
-        }))
+        log = _parse_tool_result(self.client.call_tool("get_sip_log", {"filter_text": "INVITE"}))
         assert log["total_count"] > 0
 
-    def test_auto_answer(self):
-        """Callee with auto_answer=True answers automatically."""
-        _configure_and_register(self.caller, SIP_USER_A, SIP_PASS_A)
-        _parse_tool_result(self.callee.call_tool("configure", {
-            "domain": SIP_DOMAIN, "transport": "udp",
-            "username": SIP_USER_B, "password": SIP_PASS_B,
-            "auto_answer": True,
-        }))
-        _parse_tool_result(self.callee.call_tool("register"))
-        _wait_registered(self.callee)
-
-        result = _parse_tool_result(self.caller.call_tool("make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        }))
-        call_id = result["call_id"]
-
-        time.sleep(3)
-        caller_info = _parse_tool_result(
-            self.caller.call_tool("get_call_info", {"call_id": call_id})
-        )
-        assert caller_info["state"] == "CONFIRMED"
-        self.caller.call_tool("hangup", {"call_id": call_id})
-
     def test_call_info_contacts(self):
-        """get_call_info returns remote_contact and local_contact."""
-        self._register_both()
-
-        result = _parse_tool_result(self.caller.call_tool("make_call", {
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
         call_id = result["call_id"]
-        self._wait_and_answer(self.callee)
+        _wait_and_answer(self.client, "b")
         time.sleep(0.5)
 
-        info = _parse_tool_result(
-            self.caller.call_tool("get_call_info", {"call_id": call_id})
-        )
-        # remote_contact should contain callee's address
-        assert "remote_contact" in info
-        assert info["remote_contact"]  # non-empty
+        info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
+        assert "remote_contact" in info and info["remote_contact"]
+        assert "local_contact" in info and info["local_contact"]
         assert "sip:" in info["remote_contact"]
 
-        # local_contact should contain our own address
-        assert "local_contact" in info
-        assert info["local_contact"]
-        assert "sip:" in info["local_contact"]
-
-        self.caller.call_tool("hangup", {"call_id": call_id})
+        self.client.call_tool("a_hangup", {"call_id": call_id})
 
     def test_reject_call(self):
-        """Callee rejects incoming call with 486 Busy."""
-        self._register_both()
+        self.client.call_tool("a_make_call", {"dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}"})
 
-        self.caller.call_tool("make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        })
-
-        # Callee rejects
         deadline = time.time() + 5
         while time.time() < deadline:
-            result = _parse_tool_result(self.callee.call_tool("reject_call", {
+            result = _parse_tool_result(self.client.call_tool("b_reject_call", {
                 "status_code": 486,
             }))
             if result.get("status") == "ok":
                 break
-            time.sleep(0.5)
+            time.sleep(0.3)
         else:
             raise AssertionError("reject_call never succeeded")
 
         time.sleep(1)
-
-        # Caller should see 486 in SIP log
-        log_result = _parse_tool_result(self.caller.call_tool("get_sip_log", {
-            "filter_text": "486",
-        }))
+        log_result = _parse_tool_result(self.client.call_tool("get_sip_log", {"filter_text": "486"}))
         assert log_result["total_count"] > 0
 
-    def test_call_history(self):
-        """After a call, history contains the call record."""
-        self._register_both()
-
-        self.caller.call_tool("make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        })
-        self._wait_and_answer(self.callee)
+    def test_call_history_per_phone(self):
+        self.client.call_tool("a_make_call", {"dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}"})
+        _wait_and_answer(self.client, "b")
         time.sleep(1)
-        self.caller.call_tool("hangup")
+        self.client.call_tool("a_hangup")
         time.sleep(1)
 
-        result = _parse_tool_result(self.caller.call_tool("get_call_history"))
+        # A's history has the outbound call
+        result = _parse_tool_result(self.client.call_tool("a_get_call_history"))
         assert result["total_count"] >= 1
         entry = result["history"][0]
-        assert "remote_uri" in entry
-        assert "duration" in entry
-        assert "recording_file" in entry
+        assert entry["phone_id"] == "a"
+
+
+@skip_no_domain
+class TestAutoAnswer:
+    @pytest.fixture(autouse=True)
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B, auto_answer=True)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
+            yield
+
+    def test_auto_answer(self):
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        time.sleep(3)
+        info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
+        assert info["state"] == "CONFIRMED"
+        self.client.call_tool("a_hangup", {"call_id": call_id})
 
 
 # ---------------------------------------------------------------------------
-# SIP MESSAGE tests (two accounts)
+# Messaging
 # ---------------------------------------------------------------------------
 
 @skip_no_domain
 class TestSipMessage:
     @pytest.fixture(autouse=True)
-    def mcp_pair(self):
-        with McpClient() as a, McpClient() as b:
-            a.send_initialize()
-            b.send_initialize()
-            self.ua_a = a
-            self.ua_b = b
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
             yield
 
-    def test_send_and_receive_message(self):
-        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
-        _configure_and_register(self.ua_b, SIP_USER_B, SIP_PASS_B)
-
-        # A sends message to B
-        result = _parse_tool_result(self.ua_a.call_tool("send_message", {
+    def test_send_and_receive(self):
+        result = _parse_tool_result(self.client.call_tool("a_send_message", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
             "body": "Hello from A",
         }))
         assert result["status"] == "ok"
-
         time.sleep(2)
 
-        # B checks received messages
-        result = _parse_tool_result(self.ua_b.call_tool("get_messages"))
+        result = _parse_tool_result(self.client.call_tool("b_get_messages"))
         assert result["total_count"] > 0
         assert any("Hello from A" in m["body"] for m in result["messages"])
 
-    def test_get_messages_empty(self):
-        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
-
-        result = _parse_tool_result(self.ua_a.call_tool("get_messages"))
-        assert result["total_count"] == 0
-        assert result["messages"] == []
-
-    def test_send_message_without_registration(self):
-        # No configure/register called — should error
-        result = _parse_tool_result(self.ua_a.call_tool("send_message", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-            "body": "Should fail",
-        }))
-        assert result["status"] == "error"
-
 
 # ---------------------------------------------------------------------------
-# Blind transfer tests (three accounts)
+# Transfer scenarios (three phones in ONE MCP server)
 # ---------------------------------------------------------------------------
 
 @skip_no_domain
 class TestBlindTransfer:
     @pytest.fixture(autouse=True)
-    def mcp_trio(self):
-        with McpClient() as a, McpClient() as b, McpClient() as c:
-            a.send_initialize()
-            b.send_initialize()
-            c.send_initialize()
-            self.ua_a = a
-            self.ua_b = b
-            self.ua_c = c
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
+            _add_phone(self.client, "c", SIP_USER_C, SIP_PASS_C, auto_answer=True)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
+            _wait_phone_registered(self.client, "c")
             yield
 
-    def _register_all(self):
-        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
-        _configure_and_register(self.ua_b, SIP_USER_B, SIP_PASS_B)
-        # C with auto_answer so transfer completes automatically
-        _parse_tool_result(self.ua_c.call_tool("configure", {
-            "domain": SIP_DOMAIN, "transport": "udp",
-            "username": SIP_USER_C, "password": SIP_PASS_C,
-            "auto_answer": True,
-        }))
-        _parse_tool_result(self.ua_c.call_tool("register"))
-        _wait_registered(self.ua_c)
-
-    @staticmethod
-    def _wait_and_answer(client, timeout=5.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            result = _parse_tool_result(client.call_tool("answer_call"))
-            if result.get("status") == "ok":
-                return result
-            time.sleep(0.5)
-        raise AssertionError(f"No incoming call within {timeout}s")
-
     def test_blind_transfer(self):
-        """A calls B, then B blind-transfers A to C."""
-        self._register_all()
-
-        # A calls B
-        result = _parse_tool_result(self.ua_a.call_tool("make_call", {
+        """A calls B, B blind-transfers A to C."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
         assert result["status"] == "ok"
-        self._wait_and_answer(self.ua_b)
+        _wait_and_answer(self.client, "b")
         time.sleep(1)
 
-        # B transfers A to C (blind)
-        result = _parse_tool_result(self.ua_b.call_tool("blind_transfer", {
+        result = _parse_tool_result(self.client.call_tool("b_blind_transfer", {
             "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
         }))
         assert result["status"] == "ok"
-
-        # Wait for transfer to complete — C auto-answers
         time.sleep(3)
 
-        # B should be disconnected after transfer
-        b_log = _parse_tool_result(self.ua_b.call_tool("get_sip_log", {
-            "filter_text": "BYE",
-        }))
-        assert b_log["total_count"] > 0
+        log = _parse_tool_result(self.client.call_tool("get_sip_log", {"filter_text": "BYE"}))
+        assert log["total_count"] > 0
 
     def test_attended_transfer(self):
-        """A calls B, B consults C, then B transfers A to C."""
-        self._register_all()
-
-        # A calls B
-        r_ab = _parse_tool_result(self.ua_a.call_tool("make_call", {
+        """A calls B, B consults C, B bridges A↔C."""
+        _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
-        b_answer = self._wait_and_answer(self.ua_b)
-        ab_call_id_on_b = b_answer["call_id"]
+        b_answer = _wait_and_answer(self.client, "b")
+        ab_on_b = b_answer["call_id"]
         time.sleep(1)
 
-        # B puts A on hold
-        _parse_tool_result(self.ua_b.call_tool("hold", {
-            "call_id": ab_call_id_on_b,
-        }))
+        _parse_tool_result(self.client.call_tool("b_hold", {"call_id": ab_on_b}))
         time.sleep(0.5)
 
-        # B calls C for consultation
-        r_bc = _parse_tool_result(self.ua_b.call_tool("make_call", {
+        bc = _parse_tool_result(self.client.call_tool("b_make_call", {
             "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
         }))
-        bc_call_id_on_b = r_bc["call_id"]
-        # C auto-answers
-        time.sleep(2)
+        bc_on_b = bc["call_id"]
+        time.sleep(2)  # C auto-answers
 
-        # B transfers A to C (attended)
-        result = _parse_tool_result(self.ua_b.call_tool("attended_transfer", {
-            "call_id": ab_call_id_on_b,
-            "dest_call_id": bc_call_id_on_b,
+        result = _parse_tool_result(self.client.call_tool("b_attended_transfer", {
+            "call_id": ab_on_b,
+            "dest_call_id": bc_on_b,
         }))
         assert result["status"] == "ok"
-
         time.sleep(3)
 
-        # B should see BYE in logs (disconnected from both calls)
-        b_log = _parse_tool_result(self.ua_b.call_tool("get_sip_log", {
-            "filter_text": "BYE",
+        log = _parse_tool_result(self.client.call_tool("get_sip_log", {"filter_text": "BYE"}))
+        assert log["total_count"] > 0
+
+    def test_attended_transfer_rejects_cross_phone(self):
+        """a_attended_transfer must reject a dest_call_id that belongs to another phone."""
+        # Phone 'a' has two active calls (to B and to C), so the "need 2 active"
+        # check passes. Then dest_call_id from phone 'b' triggers the
+        # cross-phone validator.
+        a_to_b = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
-        assert b_log["total_count"] > 0
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        a_to_c = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
+        }))
+        time.sleep(2)  # C auto-answers
+
+        b_calls = _parse_tool_result(self.client.call_tool("b_list_calls"))
+        b_first_cid = b_calls["calls"][0]["call_id"]
+        assert b_first_cid != a_to_b["call_id"]
+        assert b_first_cid != a_to_c["call_id"]
+
+        result = _parse_tool_result(self.client.call_tool("a_attended_transfer", {
+            "call_id": a_to_b["call_id"],
+            "dest_call_id": b_first_cid,  # belongs to phone b, not a
+        }))
+        assert result["status"] == "error"
+        assert "belongs to phone_id" in result["error"]
+
+        self.client.call_tool("a_hangup", {"call_id": a_to_b["call_id"]})
+        self.client.call_tool("a_hangup", {"call_id": a_to_c["call_id"]})
 
 
 # ---------------------------------------------------------------------------
-# Conference / 3-way calling tests (three accounts)
+# Conference (three phones in ONE MCP server)
 # ---------------------------------------------------------------------------
 
 @skip_no_domain
 class TestConference:
     @pytest.fixture(autouse=True)
-    def mcp_trio(self):
-        with McpClient() as a, McpClient() as b, McpClient() as c:
-            a.send_initialize()
-            b.send_initialize()
-            c.send_initialize()
-            self.ua_a = a
-            self.ua_b = b
-            self.ua_c = c
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B, auto_answer=True)
+            _add_phone(self.client, "c", SIP_USER_C, SIP_PASS_C, auto_answer=True)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
+            _wait_phone_registered(self.client, "c")
             yield
 
     def test_three_way_conference(self):
-        """A calls B, A calls C, then A bridges all into a conference."""
-        _configure_and_register(self.ua_a, SIP_USER_A, SIP_PASS_A)
-        # B and C with auto_answer
-        for ua, user, pwd in [(self.ua_b, SIP_USER_B, SIP_PASS_B),
-                               (self.ua_c, SIP_USER_C, SIP_PASS_C)]:
-            _parse_tool_result(ua.call_tool("configure", {
-                "domain": SIP_DOMAIN, "transport": "udp",
-                "username": user, "password": pwd, "auto_answer": True,
-            }))
-            _parse_tool_result(ua.call_tool("register"))
-            _wait_registered(ua)
-
-        # A calls B
-        r1 = _parse_tool_result(self.ua_a.call_tool("make_call", {
+        r1 = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
         time.sleep(2)
-
-        # A calls C
-        r2 = _parse_tool_result(self.ua_a.call_tool("make_call", {
+        r2 = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
         }))
         time.sleep(2)
 
-        # A bridges both calls
-        result = _parse_tool_result(self.ua_a.call_tool("conference", {
+        result = _parse_tool_result(self.client.call_tool("a_conference", {
             "call_ids": [r1["call_id"], r2["call_id"]],
         }))
         assert result["status"] == "ok"
         assert result["participants"] == 2
 
         time.sleep(1)
-        # All calls should still be CONFIRMED
-        for cid in [r1["call_id"], r2["call_id"]]:
-            info = _parse_tool_result(
-                self.ua_a.call_tool("get_call_info", {"call_id": cid})
-            )
+        for cid in (r1["call_id"], r2["call_id"]):
+            info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": cid}))
             assert info["state"] == "CONFIRMED"
 
-        # Cleanup
-        self.ua_a.call_tool("hangup", {"call_id": r1["call_id"]})
-        self.ua_a.call_tool("hangup", {"call_id": r2["call_id"]})
+        self.client.call_tool("a_hangup", {"call_id": r1["call_id"]})
+        self.client.call_tool("a_hangup", {"call_id": r2["call_id"]})
 
 
 # ---------------------------------------------------------------------------
-# Codec management tests
+# Codec management
 # ---------------------------------------------------------------------------
 
 @skip_no_domain
 class TestCodecs:
     @pytest.fixture(autouse=True)
-    def mcp_pair(self):
-        with McpClient() as caller, McpClient() as callee:
-            caller.send_initialize()
-            callee.send_initialize()
-            self.caller = caller
-            self.callee = callee
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
             yield
 
-    def _register_both(self):
-        _configure_and_register(self.caller, SIP_USER_A, SIP_PASS_A)
-        _configure_and_register(self.callee, SIP_USER_B, SIP_PASS_B)
-
-    @staticmethod
-    def _wait_and_answer(client, timeout=5.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            result = _parse_tool_result(client.call_tool("answer_call"))
-            if result.get("status") == "ok":
-                return result
-            time.sleep(0.5)
-        raise AssertionError(f"No incoming call within {timeout}s")
-
     def test_configure_with_codecs(self):
-        """Configure with specific codec, verify it's used in call."""
-        # Caller uses only PCMU
-        _parse_tool_result(self.caller.call_tool("configure", {
-            "domain": SIP_DOMAIN, "transport": "udp",
-            "username": SIP_USER_A, "password": SIP_PASS_A,
-            "codecs": ["PCMU"],
-        }))
-        _parse_tool_result(self.caller.call_tool("register"))
-        _wait_registered(self.caller)
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A, codecs=["PCMU"])
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
 
-        _configure_and_register(self.callee, SIP_USER_B, SIP_PASS_B)
-
-        # Make call
-        result = _parse_tool_result(self.caller.call_tool("make_call", {
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
         call_id = result["call_id"]
-        self._wait_and_answer(self.callee)
+        _wait_and_answer(self.client, "b")
         time.sleep(1)
 
-        # Verify codec is PCMU
-        info = _parse_tool_result(
-            self.caller.call_tool("get_call_info", {"call_id": call_id})
-        )
+        info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
         assert "PCMU" in info.get("codec", "")
-
-        self.caller.call_tool("hangup", {"call_id": call_id})
+        self.client.call_tool("a_hangup", {"call_id": call_id})
 
     def test_get_codecs(self):
-        """get_codecs returns available codecs with priorities."""
-        _configure_and_register(self.caller, SIP_USER_A, SIP_PASS_A)
-
-        result = _parse_tool_result(self.caller.call_tool("get_codecs"))
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+        _wait_phone_registered(self.client, "a")
+        result = _parse_tool_result(self.client.call_tool("get_codecs"))
         assert "codecs" in result
         assert len(result["codecs"]) > 0
-        # Should have at least PCMU and PCMA
         codec_names = [c["codec"] for c in result["codecs"]]
         assert any("PCMU" in c for c in codec_names)
 
     def test_set_codecs_midcall(self):
-        """Change codec mid-call via set_codecs with re-INVITE."""
-        # Start with PCMU only
-        _parse_tool_result(self.caller.call_tool("configure", {
-            "domain": SIP_DOMAIN, "transport": "udp",
-            "username": SIP_USER_A, "password": SIP_PASS_A,
-            "codecs": ["PCMU", "PCMA"],
-        }))
-        _parse_tool_result(self.caller.call_tool("register"))
-        _wait_registered(self.caller)
-        _configure_and_register(self.callee, SIP_USER_B, SIP_PASS_B)
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A, codecs=["PCMU", "PCMA"])
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
 
-        result = _parse_tool_result(self.caller.call_tool("make_call", {
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
         }))
         call_id = result["call_id"]
-        self._wait_and_answer(self.callee)
+        _wait_and_answer(self.client, "b")
         time.sleep(1)
 
-        # Change to PCMA only via re-INVITE
-        result = _parse_tool_result(self.caller.call_tool("set_codecs", {
+        result = _parse_tool_result(self.client.call_tool("set_codecs", {
             "codecs": ["PCMA"],
+            "phone_id": "a",
             "call_id": call_id,
         }))
         assert result["status"] == "ok"
         assert result["reinvite"] is True
-
         time.sleep(2)
 
-        # Verify codec changed
-        info = _parse_tool_result(
-            self.caller.call_tool("get_call_info", {"call_id": call_id})
-        )
+        info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
         assert "PCMA" in info.get("codec", "")
-
-        self.caller.call_tool("hangup", {"call_id": call_id})
+        self.client.call_tool("a_hangup", {"call_id": call_id})

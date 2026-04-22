@@ -3,9 +3,9 @@
 # Usage:
 #   docker compose -f docker-compose.test.yml run --build --rm test-runner
 #
-# Asterisk provides two SIP extensions (6001, 6002).
-# The test runner spawns two MCP server subprocesses that register as
-# 6001 and 6002, then exercises call flows between them.
+# Asterisk provides three SIP extensions (6001, 6002, 6003).
+# The test runner spawns ONE MCP server subprocess that manages all three
+# phones via add_phone / drop_phone, then exercises call flows between them.
 
 services:
   asterisk:
