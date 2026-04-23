@@ -1,6 +1,11 @@
 services:
   pjsua-mcp:
     build: .
+    # Run as the host user so files on bind mounts (./captures, ./recordings)
+    # are owned by the invoking user, not root. Populate UID/GID via .env
+    # (see .env.example) — docker-compose reads it automatically. Fallback
+    # is 1000:1000 if the env is absent.
+    user: "${UID:-1000}:${GID:-1000}"
     network_mode: host
     stdin_open: true
     cap_add:

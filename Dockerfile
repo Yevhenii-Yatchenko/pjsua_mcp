@@ -44,7 +44,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     libasound2 \
     tcpdump \
+    libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
+
+# Allow tcpdump to open raw sockets without root. The image has no baked-in
+# UID — runtime user comes from `user:` in docker-compose.yml so the image
+# stays portable across hosts with different host UIDs. Container still needs
+# NET_RAW/NET_ADMIN in its bounding set (granted by cap_add in compose).
+RUN setcap cap_net_raw,cap_net_admin+eip /usr/bin/tcpdump
 
 # Copy pjproject shared libraries
 COPY --from=builder /usr/local/lib/libpj*.so* /usr/local/lib/
@@ -73,10 +80,17 @@ COPY pyproject.toml /app/pyproject.toml
 
 WORKDIR /app
 
-# Ensure output dirs exist
-RUN mkdir -p /captures /recordings /config
+# Ensure output dirs exist. Mode 1777 (sticky + world-writable, like /tmp)
+# means any runtime UID set via `user:` in compose can write here while only
+# the owner can delete their own files. /config is mounted read-only.
+RUN mkdir -p /captures /recordings /config \
+    && chmod 1777 /captures /recordings
 
 # Unbuffered output to protect MCP stdio channel
 ENV PYTHONUNBUFFERED=1
+
+# HOME defaults to / for arbitrary UIDs with no /etc/passwd entry; /tmp is
+# always writable, so point HOME there to avoid noisy warnings from libs.
+ENV HOME=/tmp
 
 ENTRYPOINT ["python", "-u", "-m", "src.server"]
