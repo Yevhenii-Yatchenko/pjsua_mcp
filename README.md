@@ -22,7 +22,7 @@ One MCP server process manages N phones side by side. Each phone gets its own `p
 │  │ (Endpoint, │  │  dict[pid]    │  │  dict[call_id],     │  │
 │  │  codecs,   │  │  → SipAccount │  │  per-phone queues,  │  │
 │  │  per-phone │  │   + Config    │  │  incoming routing,  │  │
-│  │  transports)│  │               │  │  optional recording│  │
+│  │  transports)│  │               │  │  always-on recording│  │
 │  └──────┬─────┘  └──────┬────────┘  └──────┬──────────────┘  │
 │         │               │                   │                │
 │         │          ┌────┴─── phone_tool_factory ─────┐       │
@@ -60,7 +60,7 @@ One MCP server process manages N phones side by side. Each phone gets its own `p
 | `list_phones` | All registered phones with registration state, transport port, active-call count, per-phone tool names |
 | `add_phone` | Create a transport + SipAccount, send REGISTER, register 22 per-phone action tools |
 | `drop_phone` | Hang up the phone's calls, unregister, close transport, unload its per-phone tools |
-| `get_phone` | Full info for one phone — credentials (sans password), reg state, active calls, recordings_dir |
+| `get_phone` | Full info for one phone — credentials (sans password), reg state, active calls |
 | `update_phone` | Mutate runtime settings — `auto_answer` (instant), `codecs`, or credentials (forces reregister) |
 | `load_phone_profile` | Bulk-add every phone listed in a YAML profile. Atomic replace by default (`merge=True` for upsert) |
 | `get_phone_profile_example` | Return a ready-to-edit YAML template, host/container paths, and next-step hints |
@@ -74,7 +74,7 @@ One MCP server process manages N phones side by side. Each phone gets its own `p
 | `start_capture` | Start tcpdump. Without `phone_id` — host-wide; with `phone_id` — BPF filter on that phone's UDP port |
 | `stop_capture` | Stop the running capture |
 | `get_pcap` | Info about the most recent (or named) pcap file |
-| `list_recordings` | Aggregate WAVs from every phone's `recordings_dir` (opt-in); filter by `phone_id` / `call_id` |
+| `list_recordings` | Walk `/recordings/` (and legacy flat files) for every WAV; filter by `phone_id` / `call_id` |
 
 ### Per-phone dynamic (22 per active phone)
 
@@ -96,7 +96,7 @@ Registered when `add_phone` (or `load_phone_profile`) brings a phone online; unr
 | `a_attended_transfer` | REFER+Replaces. Both legs must belong to phone a — cross-phone bridging is rejected |
 | `a_conference` | Bridge multiple a-owned calls into a conference |
 | `a_play_audio` / `a_stop_audio` | Play WAV into a call / resume MOH |
-| `a_get_recording` | Path/size of the WAV recording for a call (errors if recording disabled) |
+| `a_get_recording` | Path/size of the WAV + sidecar meta for a call on phone a |
 | `a_send_message` / `a_get_messages` | SIP MESSAGE outbox / inbox |
 | `a_register` / `a_unregister` | Fresh REGISTER cycle / de-REGISTER (symmetric pair) |
 | `a_get_registration_status` | Quick reg state for phone a |
@@ -156,12 +156,10 @@ defaults:                 # optional — merged into every phone, phone-level ke
   password: change_me
   codecs: [PCMA]
   auto_answer: false
-  # recordings_dir: /recordings    # optional: enable recording for every phone
 
 phones:
   - phone_id: a
     username: "1001"
-    # recordings_dir: /recordings/a   # optional: enable recording just for a
   - phone_id: b
     username: "1002"
     auto_answer: true
@@ -186,8 +184,8 @@ For ad-hoc additions without touching the profile file:
 mcp__pjsua__add_phone(phone_id="alice",
                       domain="sip.example.com",
                       username="1099", password="x",
-                      codecs=["PCMA"],
-                      recordings_dir="/recordings/alice")   # optional
+                      codecs=["PCMA"])
+# → /recordings/alice/ starts receiving WAVs on every call.
 mcp__pjsua__drop_phone(phone_id="alice")
 ```
 
@@ -280,7 +278,7 @@ a_list_calls()                                       # compact summary incl. DIS
   "local_contact": "<sip:1001@192.0.2.20:5062>",
   "codec": "PCMA",
   "duration": 45,
-  "recording_file": "/recordings/a/call_a_0_20260101_141603.wav",
+  "recording_file": "/recordings/a/call_0_20260101_141603.wav",
   "playing_file": "/app/audio/moh.wav",
   "rtp": {
     "tx_packets": 2250, "tx_bytes": 360000,
@@ -293,16 +291,42 @@ a_list_calls()                                       # compact summary incl. DIS
 
 `<phone>_get_active_calls` returns this for every active call on the phone at once — no need to iterate `call_id`s.
 
-## Call Recording (opt-in, per phone)
+## Call Recording (always-on, per-phone layout)
 
-Recording is **off by default**. Enable it per phone by setting `recordings_dir`:
+Recording is always on. Every call on every phone is written to the
+container path `/recordings/<phone_id>/` as two paired files:
 
-- **In the profile:** top-level `defaults.recordings_dir` (every phone) or inside a single `phones[]` entry (just that phone).
-- **At runtime:** `add_phone(phone_id=..., recordings_dir="/recordings/a", ...)`.
+```
+/recordings/
+├── a/
+│   ├── call_0_20260422_145828.wav        # local + remote audio mixed
+│   └── call_0_20260422_145828.meta.json  # context sidecar
+├── b/
+│   └── ...
+```
 
-Calls on an opted-in phone are written as `<recordings_dir>/call_<phone_id>_<call_id>_<timestamp>.wav` (local + remote audio mixed into one mono WAV). The directory is created on add; a non-directory path is rejected.
+The sidecar carries the context the WAV itself lacks:
 
-On a phone without `recordings_dir`, `<phone>_get_recording` returns a clear "recording disabled" error instead of silently producing nothing, and `list_recordings` simply skips that phone.
+```json
+{
+  "phone_id": "a", "call_id": 0, "direction": "outbound",
+  "started_at": "2026-04-22T14:58:28+00:00",
+  "ended_at":   "2026-04-22T14:58:54+00:00",
+  "duration": 26, "codec": "PCMA",
+  "remote_uri": "sip:123002@...", "last_status": 200, "last_status_text": "OK",
+  "recording": "/recordings/a/call_0_20260422_145828.wav",
+  "pcap":      "/captures/a/call_0_20260422_145828.pcap"
+}
+```
+
+`pcap` is populated only if `start_capture(phone_id="a")` was running
+during the call — in that case the pcap lands in `/captures/<phone_id>/`
+with the same basename as the recording, so audio and signalling pair
+up without any timestamp matching.
+
+**To disable recording**, simply drop the `./recordings` bind mount from
+your `docker run` / `docker-compose.yml` — `/recordings` will live inside
+the ephemeral container FS and disappear with `--rm`. No code toggle.
 
 **Music-on-Hold** plays automatically when a call connects — Suite Espanola Op. 47 — Leyenda (Albeniz), CC0 public domain from FreeSWITCH/MUSOPEN, 8kHz WAV. Use `<phone>_play_audio` to override, `<phone>_stop_audio` to resume MOH.
 
@@ -365,7 +389,7 @@ Covers SipEngine lifecycle, PhoneRegistry CRUD + two-account isolation, CallMana
 docker compose -f docker-compose.test.yml run --build --rm test-runner
 ```
 
-Runs one MCP server subprocess per test class + an Asterisk PBX container on an isolated Docker network (ext 6001/6002/6003). Exercises registration, outbound/inbound calls, blind + attended transfer, conference, codec negotiation, SIP MESSAGE, reject, history, YAML profile loading (replace vs merge), dynamic tool add/remove, cross-phone attended-transfer rejection, per-phone recording opt-in.
+Runs one MCP server subprocess per test class + an Asterisk PBX container on an isolated Docker network (ext 6001/6002/6003). Exercises registration, outbound/inbound calls, blind + attended transfer, conference, codec negotiation, SIP MESSAGE, reject, history, YAML profile loading (replace vs merge), dynamic tool add/remove, cross-phone attended-transfer rejection, per-phone recording layout with paired pcap and `.meta.json` sidecar.
 
 The full suite runs in ~2 minutes (~90 tests).
 
@@ -442,7 +466,7 @@ pjsua_mcp/
 - **stdout protection** — C-level fd 1 is redirected to stderr at startup. MCP JSON-RPC uses a saved copy of the original stdout fd. Prevents pjlib console output from corrupting the MCP channel.
 - **SIP log** — `consoleLevel=5` (matching `level=5`) ensures the global log level isn't suppressed. The LogWriter captures everything into a thread-safe bounded deque.
 - **Auto-answer** — deferred to the event poll loop (not inside `onIncomingCall`) to avoid PJSUA2 call state machine issues.
-- **Recording** — opt-in per phone via `recordings_dir`. When enabled, the recorder is connected AFTER player setup to avoid conference bridge disruption and reconnected on every `onCallMediaState`. Local + remote audio mixed into one mono WAV.
+- **Recording** — always on, writes to `/recordings/<phone_id>/call_<call_id>_<ts>.wav` plus a `.meta.json` sidecar with call context and the paired pcap path (when a capture is running for the phone). The recorder is connected AFTER player setup to avoid conference bridge disruption and reconnected on every `onCallMediaState`. Local + remote audio mixed into one mono WAV.
 - **Re-INVITE** — audio player is reconnected to the new `aud_med` port after re-INVITE (codec change, conference conversion) so TX keeps flowing.
 - **Dynamic tool registration** — `tools_changed=True` capability enabled via `create_initialization_options` monkey-patch; `ctx.session.send_tool_list_changed()` fires after each phone add/drop (once per batch for `load_phone_profile`).
 - **Stale call cleanup** — disconnected calls are removed from tracking; accounts are shut down before re-registration to prevent ghost sessions.

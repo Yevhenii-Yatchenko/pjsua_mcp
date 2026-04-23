@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import pjsua2 as pj
 
 from .sip_engine import SipEngine
 from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 
+if TYPE_CHECKING:
+    from .pcap_manager import PcapManager
+
 log = logging.getLogger(__name__)
 
 DEFAULT_MOH_FILE = Path("/app/audio/moh.wav")
+RECORDINGS_ROOT = Path("/recordings")
 
 
 class SipCall(pj.Call):
@@ -27,14 +32,18 @@ class SipCall(pj.Call):
         account: pj.Account,
         call_id: int = pj.PJSUA_INVALID_ID,
         phone_id: str = DEFAULT_PHONE_ID,
-        recordings_dir: str | None = None,
+        direction: str = "outbound",
+        pcap_mgr: "PcapManager | None" = None,
     ) -> None:
         super().__init__(account, call_id)
         self.phone_id = phone_id
-        self._recordings_dir = recordings_dir
+        self._direction = direction
+        self._pcap_mgr = pcap_mgr
         self._lock = threading.Lock()
         self._recorder: pj.AudioMediaRecorder | None = None
         self._recording_file: str | None = None
+        self._recording_started_at: str | None = None
+        self._meta_written = False
         self._player: pj.AudioMediaPlayer | None = None
         self._player_file: str | None = None
         self._aud_med: pj.AudioMedia | None = None  # cached for play/stop
@@ -117,27 +126,36 @@ class SipCall(pj.Call):
     def _ensure_recording(self, call_id: int, aud_med: pj.AudioMedia) -> None:
         """Create recorder once, (re)connect it to aud_med every time.
 
-        No-op if the phone's `recordings_dir` is None (recording disabled).
+        Writes to `/recordings/<phone_id>/call_<call_id>_<ts>.wav`. If the
+        recordings root is missing or not writable (e.g. container launched
+        without the volume mount), this becomes a no-op — the call still
+        works, just nothing gets written.
+
         Must be called AFTER the player is set up — player.startTransmit()
         can disrupt existing conference bridge connections.
         """
-        if self._recordings_dir is None:
-            return  # recording disabled for this phone
-
         # Create recorder file once per call
         if self._recorder is None:
             try:
-                recordings_path = Path(self._recordings_dir)
-                recordings_path.mkdir(parents=True, exist_ok=True)
+                recordings_path = RECORDINGS_ROOT / self.phone_id
+                try:
+                    recordings_path.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    # Missing / read-only root — recording silently off.
+                    log.info(
+                        "[%s] Recording skipped: %s not writable (%s)",
+                        self.phone_id, recordings_path, e,
+                    )
+                    return
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                # Embed phone_id in filename for disambiguation within a shared dir.
-                filename = f"call_{self.phone_id}_{call_id}_{timestamp}.wav"
+                filename = f"call_{call_id}_{timestamp}.wav"
                 filepath = recordings_path / filename
 
                 recorder = pj.AudioMediaRecorder()
                 recorder.createRecorder(str(filepath))
                 self._recorder = recorder
                 self._recording_file = str(filepath)
+                self._recording_started_at = datetime.now(timezone.utc).isoformat()
                 with self._lock:
                     self._info["recording_file"] = str(filepath)
                 log.info("[%s] Created recorder for call %d: %s", self.phone_id, call_id, filepath)
@@ -159,10 +177,59 @@ class SipCall(pj.Call):
                 log.exception("Failed to connect player to recorder for call %d", call_id)
 
     def _stop_recording(self) -> None:
-        """Stop recording (called on DISCONNECTED)."""
+        """Stop recording and write sidecar meta (called on DISCONNECTED)."""
         if self._recorder is not None:
             log.info("[%s] Stopping recording: %s", self.phone_id, self._recording_file)
             self._recorder = None
+        self._write_meta_sidecar()
+
+    def _write_meta_sidecar(self) -> None:
+        """Write `<recording>.meta.json` with call context. Idempotent per call."""
+        if self._meta_written or not self._recording_file:
+            return
+        try:
+            rec_path = Path(self._recording_file)
+            meta_path = rec_path.with_suffix(".meta.json")
+            with self._lock:
+                info = dict(self._info)
+            # Try to grab call_id from pjsua; fall back to filename parse.
+            try:
+                ci = self.getInfo()
+                call_id: int | None = ci.id
+            except Exception:
+                call_id = None
+                stem = rec_path.stem  # "call_<id>_<date>_<time>"
+                parts = stem.split("_")
+                if len(parts) >= 2:
+                    try:
+                        call_id = int(parts[1])
+                    except ValueError:
+                        call_id = None
+            pcap_path: str | None = None
+            if self._pcap_mgr is not None:
+                try:
+                    pcap_path = self._pcap_mgr.current_pcap_path_for(self.phone_id)
+                except Exception:
+                    pcap_path = None
+            meta = {
+                "phone_id": self.phone_id,
+                "call_id": call_id,
+                "direction": self._direction,
+                "started_at": self._recording_started_at,
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "duration": info.get("duration", 0),
+                "codec": info.get("codec", ""),
+                "remote_uri": info.get("remote_uri", ""),
+                "last_status": info.get("last_status", 0),
+                "last_status_text": info.get("last_status_text", ""),
+                "recording": str(rec_path),
+                "pcap": pcap_path,
+            }
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            self._meta_written = True
+            log.info("[%s] Wrote recording meta: %s", self.phone_id, meta_path)
+        except Exception:
+            log.exception("Failed to write recording meta for %s", self._recording_file)
 
     # --- Audio playback ---
 
@@ -246,9 +313,15 @@ def _call_state_name(state: int) -> str:
 class CallManager:
     """High-level call operations across multiple phones."""
 
-    def __init__(self, engine: SipEngine, registry: PhoneRegistry) -> None:
+    def __init__(
+        self,
+        engine: SipEngine,
+        registry: PhoneRegistry,
+        pcap_mgr: "PcapManager | None" = None,
+    ) -> None:
         self._engine = engine
         self._registry = registry
+        self._pcap_mgr = pcap_mgr
         self._calls: dict[int, SipCall] = {}
         # Per-phone queues for incoming calls and pending auto-answers
         self._incoming_queue: dict[str, list[int]] = {}
@@ -260,6 +333,23 @@ class CallManager:
         # Wire registry hooks so callbacks attach to every new phone
         registry.on_phone_added = self._on_phone_added
         registry.on_phone_dropped = self._on_phone_dropped
+
+    def get_active_call_id(self, phone_id: str) -> int | None:
+        """Return the first active call_id for `phone_id`, or None.
+
+        Used by `start_capture` to pair the pcap filename with the active
+        call so recording and capture share one basename.
+        """
+        with self._lock:
+            for cid, call in self._calls.items():
+                if self._call_phone.get(cid) != phone_id:
+                    continue
+                try:
+                    if call.isActive():
+                        return cid
+                except Exception:
+                    continue
+        return None
 
     # Legacy back-compat — AccountManager/PhoneRegistry alias.
     @property
@@ -303,9 +393,12 @@ class CallManager:
         if acc is None:
             log.warning("[%s] Incoming call %d for unknown phone", phone_id, call_id)
             return
-        cfg = self._registry.get_config(phone_id)
-        recordings_dir = cfg.recordings_dir if cfg else None
-        call = SipCall(acc, call_id, phone_id=phone_id, recordings_dir=recordings_dir)
+        call = SipCall(
+            acc, call_id,
+            phone_id=phone_id,
+            direction="inbound",
+            pcap_mgr=self._pcap_mgr,
+        )
         call.on_disconnected_cb = self._on_call_disconnected
         with self._lock:
             self._calls[call_id] = call
@@ -377,9 +470,12 @@ class CallManager:
         self._ensure_incoming_handler(pid)
         acc = self._registry.require_account(pid)
 
-        cfg = self._registry.get_config(pid)
-        recordings_dir = cfg.recordings_dir if cfg else None
-        call = SipCall(acc, phone_id=pid, recordings_dir=recordings_dir)
+        call = SipCall(
+            acc,
+            phone_id=pid,
+            direction="outbound",
+            pcap_mgr=self._pcap_mgr,
+        )
         call.on_disconnected_cb = self._on_call_disconnected
         prm = pj.CallOpParam(True)  # True = use default call settings
 

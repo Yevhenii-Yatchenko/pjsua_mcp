@@ -224,16 +224,6 @@ def register_phone_tools(
 
     async def get_recording(call_id: int | None = None) -> dict[str, Any]:
         try:
-            cfg = registry.get_config(phone_id)
-            if cfg is None or cfg.recordings_dir is None:
-                return {
-                    "status": "error",
-                    "error": f"Recording disabled for phone {phone_id!r} "
-                             f"(recordings_dir is null). Re-add the phone with "
-                             f"`recordings_dir=...` to enable.",
-                    "phone_id": phone_id,
-                    "recordings_dir": None,
-                }
             info = call_mgr.get_call_info(phone_id=phone_id, call_id=call_id)
             rec_file = info.get("recording_file")
             if not rec_file:
@@ -243,11 +233,13 @@ def register_phone_tools(
             if not path.exists():
                 return {"status": "error", "error": f"Recording file not found: {rec_file}",
                         "phone_id": phone_id}
+            meta_path = path.with_suffix(".meta.json")
             return {
                 "phone_id": phone_id,
                 "recording_file": rec_file,
                 "filename": path.name,
                 "file_size": path.stat().st_size,
+                "meta_path": str(meta_path) if meta_path.exists() else None,
             }
         except Exception as e:
             return _error_response("get_recording", phone_id, e)

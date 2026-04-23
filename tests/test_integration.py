@@ -272,8 +272,15 @@ class TestDynamicTools:
         assert "invalid" in result["error"].lower()
 
 
-class TestRecordingConfig:
-    """Per-phone call-recording opt-in. No SIP_DOMAIN needed."""
+class TestRecordingLayout:
+    """Recording layout — always-on, per-phone subdirs, sidecar meta.
+
+    These tests cover the format-level contracts that don't need real SIP
+    traffic: filename parsing, legacy-flat compatibility, and graceful
+    handling of the deprecated `recordings_dir` YAML key. End-to-end
+    behaviour (actual WAV/meta/pcap files written by a real call) is
+    exercised by TestCallFlow and the live MCP verification steps.
+    """
 
     @pytest.fixture(autouse=True)
     def mcp(self, tmp_path):
@@ -283,97 +290,94 @@ class TestRecordingConfig:
             self.client = client
             yield
 
-    def test_recording_disabled_by_default(self):
+    def test_add_phone_response_has_no_recordings_dir(self):
         result = _parse_tool_result(self.client.call_tool("add_phone", {
             "phone_id": "z",
             "domain": "127.0.0.1", "username": "u", "password": "p",
             "register": False,
-        }))
-        assert result["recordings_dir"] is None
-
-        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
-        assert info["recordings_dir"] is None
-
-    def test_recording_enabled_with_recordings_dir(self):
-        rec_dir = str(self.tmp_path / "rec_z")
-        result = _parse_tool_result(self.client.call_tool("add_phone", {
-            "phone_id": "z",
-            "domain": "127.0.0.1", "username": "u", "password": "p",
-            "register": False,
-            "recordings_dir": rec_dir,
-        }))
-        assert result["recordings_dir"] == rec_dir
-
-        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
-        assert info["recordings_dir"] == rec_dir
-
-    def test_recording_dir_is_created_if_missing(self):
-        """add_phone auto-creates a missing recordings_dir."""
-        rec_dir = self.tmp_path / "deeply" / "nested" / "rec"
-        assert not rec_dir.exists()
-        result = _parse_tool_result(self.client.call_tool("add_phone", {
-            "phone_id": "z",
-            "domain": "127.0.0.1", "username": "u", "password": "p",
-            "register": False,
-            "recordings_dir": str(rec_dir),
         }))
         assert result["status"] == "ok"
-        assert rec_dir.exists()
-        assert rec_dir.is_dir()
+        assert "recordings_dir" not in result
 
-    def test_get_recording_errors_when_disabled(self):
-        _parse_tool_result(self.client.call_tool("add_phone", {
-            "phone_id": "z",
-            "domain": "127.0.0.1", "username": "u", "password": "p",
-            "register": False,
-        }))
-        result = _parse_tool_result(self.client.call_tool("z_get_recording"))
-        assert result["status"] == "error"
-        assert result["recordings_dir"] is None
-        assert "disabled" in result["error"].lower()
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
+        assert "recordings_dir" not in info
 
-    def test_list_recordings_covers_only_enabled_phones(self):
-        # Phone z has no recordings_dir, phone w has one with a fake file
-        w_dir = self.tmp_path / "rec_w"
-        w_dir.mkdir()
-        (w_dir / "call_w_0_20260101_120000.wav").write_bytes(b"fake wav")
-
-        _parse_tool_result(self.client.call_tool("add_phone", {
-            "phone_id": "z",
-            "domain": "127.0.0.1", "username": "u", "password": "p",
-            "register": False,
-        }))
-        _parse_tool_result(self.client.call_tool("add_phone", {
-            "phone_id": "w",
-            "domain": "127.0.0.1", "username": "u", "password": "p",
-            "register": False,
-            "recordings_dir": str(w_dir),
-        }))
-
-        result = _parse_tool_result(self.client.call_tool("list_recordings"))
-        assert result["total_count"] == 1
-        assert result["recordings"][0]["phone_id"] == "w"
-        assert str(w_dir) in result["searched_dirs"]
-
-    def test_load_phone_profile_with_recordings_dir(self):
-        rec_dir = self.tmp_path / "profile_rec"
-        profile = self.tmp_path / "p.yaml"
-        profile.write_text(f"""
+    def test_load_phone_profile_warns_and_ignores_legacy_recordings_dir(self):
+        """Legacy YAML files with recordings_dir should still load (warn + strip)."""
+        profile = self.tmp_path / "legacy.yaml"
+        profile.write_text("""
 defaults:
   domain: 127.0.0.1
   password: x
   register: false
+  recordings_dir: /recordings
 phones:
-  - {{phone_id: p1, username: u1}}
-  - {{phone_id: p2, username: u2, recordings_dir: {rec_dir}}}
+  - {phone_id: p1, username: u1}
+  - {phone_id: p2, username: u2, recordings_dir: /recordings/p2}
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": str(profile)}))
+        result = _parse_tool_result(self.client.call_tool(
+            "load_phone_profile", {"path": str(profile)}
+        ))
         assert result["status"] == "ok"
+        # Both phones loaded; legacy key silently dropped.
+        loaded_ids = {p["phone_id"] for p in result["added"]}
+        assert loaded_ids == {"p1", "p2"}
 
-        p1 = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "p1"}))
-        p2 = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "p2"}))
-        assert p1["recordings_dir"] is None
-        assert p2["recordings_dir"] == str(rec_dir)
+    def test_list_recordings_reads_new_layout(self):
+        """/recordings/<phone_id>/call_<id>_<ts>.wav is parsed correctly."""
+        # list_recordings walks the container's /recordings/ root. In-process
+        # we create files under the real /recordings tree — works because the
+        # test runner container mounts it writable.
+        from pathlib import Path
+        root = Path("/recordings")
+        if not root.exists():
+            pytest.skip("/recordings not mounted in this test environment")
+        phone_dir = root / "testlayout"
+        phone_dir.mkdir(parents=True, exist_ok=True)
+        new_file = phone_dir / "call_7_20260101_120000.wav"
+        new_file.write_bytes(b"fake wav")
+        meta_file = new_file.with_suffix(".meta.json")
+        meta_file.write_text('{"phone_id": "testlayout", "call_id": 7}')
+
+        try:
+            result = _parse_tool_result(self.client.call_tool(
+                "list_recordings", {"phone_id": "testlayout"}
+            ))
+            assert result["total_count"] >= 1
+            match = next(
+                r for r in result["recordings"] if r["filename"] == new_file.name
+            )
+            assert match["phone_id"] == "testlayout"
+            assert match["call_id"] == 7
+            assert match["meta_path"] == str(meta_file)
+        finally:
+            new_file.unlink(missing_ok=True)
+            meta_file.unlink(missing_ok=True)
+            try:
+                phone_dir.rmdir()
+            except OSError:
+                pass
+
+    def test_list_recordings_reads_legacy_flat_layout(self):
+        """Pre-refactor flat files /recordings/call_<phone_id>_<id>_<ts>.wav still show up."""
+        from pathlib import Path
+        root = Path("/recordings")
+        if not root.exists():
+            pytest.skip("/recordings not mounted in this test environment")
+        flat_file = root / "call_legacy_3_20260101_120000.wav"
+        flat_file.write_bytes(b"fake wav")
+
+        try:
+            result = _parse_tool_result(self.client.call_tool(
+                "list_recordings", {"phone_id": "legacy"}
+            ))
+            match = next(
+                r for r in result["recordings"] if r["filename"] == flat_file.name
+            )
+            assert match["phone_id"] == "legacy"
+            assert match["call_id"] == 3
+        finally:
+            flat_file.unlink(missing_ok=True)
 
 
 class TestLoadPhoneProfile:

@@ -59,6 +59,10 @@ PHONE_PROFILE_TEMPLATE = """\
 #
 #   mcp__pjsua__load_phone_profile()                               # /config/phones.yaml
 #   mcp__pjsua__load_phone_profile(path="/config/other.yaml")      # another profile
+#
+# Recording is always on. Calls land in /recordings/<phone_id>/ as
+# call_<call_id>_<ts>.wav plus a .meta.json sidecar with codec, duration,
+# remote URI, direction, and (if a capture is running) the paired pcap path.
 
 # Keys under `defaults` are merged into every phone entry.
 # Phone-level keys win over defaults.
@@ -70,17 +74,10 @@ defaults:
   auto_answer: false
   register: true
   srtp: false
-  # Call recording is OFF by default. To enable it, set `recordings_dir`
-  # either here (same dir for every phone) or per-phone. The directory
-  # is created if missing. Recordings land as
-  # <recordings_dir>/call_<phone_id>_<call_id>_<ts>.wav.
-  # recordings_dir: /recordings
 
 phones:
   - phone_id: a
     username: "1001"
-    # Enable recording just for phone a:
-    # recordings_dir: /recordings/a
 
   - phone_id: b
     username: "1002"
@@ -116,8 +113,10 @@ async def lifespan(server: FastMCP):
     log.info("PJSUA MCP server starting")
     engine = SipEngine()
     registry = PhoneRegistry(engine)
-    call_mgr = CallManager(engine, registry)
     pcap_mgr = PcapManager()
+    # pcap_mgr is passed into CallManager so SipCall can reference the
+    # active capture when writing the .meta.json sidecar on disconnect.
+    call_mgr = CallManager(engine, registry, pcap_mgr=pcap_mgr)
 
     # Start engine up-front so add_phone works immediately.
     engine.initialize()
@@ -193,7 +192,6 @@ def _add_phone_impl(
     local_port: int = 0,
     codecs: list[str] | None = None,
     register: bool = True,
-    recordings_dir: str | None = None,
 ) -> dict[str, Any]:
     """Common add-phone routine — no client notification, no async."""
     assert registry is not None and engine is not None
@@ -221,7 +219,6 @@ def _add_phone_impl(
         local_port=local_port,
         codecs=codecs,
         register=register,
-        recordings_dir=recordings_dir,
     )
 
     tool_names = register_phone_tools(mcp, phone_id, call_mgr, registry)
@@ -236,7 +233,6 @@ def _add_phone_impl(
         "auto_answer": auto_answer,
         "transport": transport,
         "transport_id": cfg.transport_id if cfg else None,
-        "recordings_dir": cfg.recordings_dir if cfg else None,
         "tools_registered": len(tool_names),
         **reg,
     }
@@ -296,7 +292,6 @@ async def add_phone(
     srtp: bool = False,
     realm: str | None = None,
     register: bool = True,
-    recordings_dir: str | None = None,
 ) -> dict[str, Any]:
     """Add a new phone (SIP account) and register its per-phone action tools.
 
@@ -304,10 +299,10 @@ async def add_phone(
     `<phone_id>_hangup`, etc. become visible via
     `notifications/tools/list_changed`.
 
-    Call recording is **off by default**. Pass `recordings_dir` to enable it:
-    every call on this phone will be recorded to
-    `<recordings_dir>/call_<phone_id>_<call_id>_<ts>.wav`. The directory is
-    created if missing. Example: `recordings_dir="/recordings/a"`.
+    Recording is always on: every call on this phone is written to
+    `/recordings/<phone_id>/call_<call_id>_<ts>.wav` (with a `.meta.json`
+    sidecar alongside). Mount that directory on the host if you want the
+    files to persist across container restarts.
     """
     try:
         result = _add_phone_impl(
@@ -316,7 +311,6 @@ async def add_phone(
             realm=realm, srtp=srtp, auto_answer=auto_answer,
             transport=transport, local_port=local_port,
             codecs=codecs, register=register,
-            recordings_dir=recordings_dir,
         )
         await asyncio.sleep(1.0)  # give REGISTER a moment
         result.update(registry.get_registration_info(phone_id))
@@ -363,7 +357,6 @@ async def get_phone(phone_id: str) -> dict[str, Any]:
             "local_port": cfg.local_port,
             "transport_id": cfg.transport_id,
             "codecs": cfg.codecs,
-            "recordings_dir": cfg.recordings_dir,
             "active_calls": active_calls,
             "tools": _phone_tools.get(phone_id, []),
             **reg,
@@ -425,8 +418,12 @@ async def update_phone(
 _PHONE_FIELDS = {
     "phone_id", "domain", "username", "password", "realm", "srtp",
     "auto_answer", "transport", "local_port", "codecs", "register",
-    "recordings_dir",
 }
+
+# Keys we used to accept but no longer do. If they appear in the profile,
+# warn and strip instead of hard-failing — so YAML files written against
+# the previous commit still load.
+_LEGACY_FIELDS = {"recordings_dir"}
 
 
 def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
@@ -472,6 +469,15 @@ def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
         if not isinstance(entry, dict):
             raise ValueError(f"{path}: phones[{i}] must be a mapping")
         merged = {**defaults, **entry}
+        legacy = set(merged) & _LEGACY_FIELDS
+        if legacy:
+            log.warning(
+                "%s: phones[%d] uses deprecated keys %s — ignoring. "
+                "Recording is now always-on and lands in /recordings/<phone_id>/.",
+                path, i, sorted(legacy),
+            )
+            for key in legacy:
+                merged.pop(key, None)
         unknown = set(merged) - _PHONE_FIELDS
         if unknown:
             raise ValueError(
@@ -698,16 +704,40 @@ async def start_capture(
     interface: str = "any",
     port: int | None = None,
 ) -> dict[str, Any]:
-    """Start tcpdump. Without phone_id — host-wide. With phone_id — BPF filters by that phone's local port."""
+    """Start tcpdump.
+
+    - No `phone_id`: host-wide capture → `/captures/capture_<ts>.pcap`.
+    - With `phone_id`: BPF filters by that phone's UDP transport port and
+      the pcap lands under `/captures/<phone_id>/`.
+    - With `phone_id` + an active call on that phone: pcap filename matches
+      the active recording's basename (e.g. `call_0_<ts>.pcap` next to
+      `/recordings/<phone_id>/call_0_<ts>.wav`), so pcap and wav pair up
+      without cross-referencing timestamps.
+    """
     assert pcap_mgr is not None and engine is not None and registry is not None
     try:
-        if phone_id is not None and port is None:
-            cfg = registry.get_config(phone_id)
-            if cfg is None or cfg.transport_id is None:
-                return {"status": "error", "error": f"Phone {phone_id!r} has no transport"}
-            port = engine.get_transport_port(cfg.transport_id)
-        info = await pcap_mgr.start(interface=interface, port=port)
-        return {"status": "ok", "phone_id": phone_id, "port": port, **info}
+        active_call_id: int | None = None
+        if phone_id is not None:
+            if port is None:
+                cfg = registry.get_config(phone_id)
+                if cfg is None or cfg.transport_id is None:
+                    return {"status": "error", "error": f"Phone {phone_id!r} has no transport"}
+                port = engine.get_transport_port(cfg.transport_id)
+            if call_mgr is not None:
+                active_call_id = call_mgr.get_active_call_id(phone_id)
+        info = await pcap_mgr.start(
+            interface=interface,
+            port=port,
+            phone_id=phone_id,
+            call_id=active_call_id,
+        )
+        return {
+            "status": "ok",
+            "phone_id": phone_id,
+            "call_id": active_call_id,
+            "port": port,
+            **info,
+        }
     except Exception as e:
         log.exception("start_capture failed")
         return {"status": "error", "error": str(e)}
@@ -736,66 +766,84 @@ async def get_pcap(filename: str | None = None) -> dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
+_RECORDINGS_ROOT = Path("/recordings")
+
+
+def _parse_recording_filename(path: Path) -> tuple[str | None, int | None]:
+    """Infer (phone_id, call_id) from a recording's path + filename.
+
+    New layout — `/recordings/<phone_id>/call_<call_id>_<ts>.wav`:
+      * phone_id comes from the parent directory name;
+      * call_id from stem parts[1].
+
+    Legacy flat layout — `/recordings/call_<phone_id>_<call_id>_<ts>.wav`:
+      * phone_id from stem parts[1];
+      * call_id from stem parts[2].
+
+    Anything that doesn't match returns (None, None).
+    """
+    stem = path.stem  # e.g. "call_0_20260101_120000" or "call_a_0_20260101_120000"
+    parts = stem.split("_")
+    if len(parts) < 2 or parts[0] != "call":
+        return None, None
+
+    parent = path.parent
+    if parent.name and parent != _RECORDINGS_ROOT:
+        # new layout — phone_id in dir name
+        try:
+            return parent.name, int(parts[1])
+        except ValueError:
+            return parent.name, None
+    # legacy flat layout — phone_id embedded after "call_"
+    if len(parts) >= 3:
+        try:
+            return parts[1], int(parts[2])
+        except ValueError:
+            return parts[1], None
+    return None, None
+
+
 @mcp.tool()
 async def list_recordings(
     phone_id: str | None = None,
     call_id: int | None = None,
 ) -> dict[str, Any]:
-    """List call recordings across every phone's configured recordings_dir.
+    """List every WAV under /recordings/, optionally filtered by phone/call.
 
-    Recording is off by default — only phones created with `recordings_dir=...`
-    (or with `recordings_dir:` set in the YAML profile) produce files.
-
-    Recordings are named `call_<phone_id>_<call_id>_<timestamp>.wav`. With
-    `phone_id`, the result is narrowed to that phone's directory. With
-    `call_id` (optionally combined), narrowed further to one call.
+    Recording is always-on — every call lands in
+    `/recordings/<phone_id>/call_<call_id>_<ts>.wav` along with a
+    `.meta.json` sidecar. This tool also surfaces pre-refactor flat files
+    (`call_<phone_id>_<call_id>_<ts>.wav` directly under `/recordings/`)
+    so historical data stays visible.
     """
-    assert registry is not None
     try:
-        # Collect every configured recordings directory, paired with its phone_id.
-        dirs: list[tuple[str, Path]] = []
-        for pid in registry.list_phone_ids():
-            if phone_id is not None and pid != phone_id:
-                continue
-            cfg = registry.get_config(pid)
-            if cfg and cfg.recordings_dir:
-                dirs.append((pid, Path(cfg.recordings_dir)))
+        if not _RECORDINGS_ROOT.exists():
+            return {"recordings": [], "total_count": 0, "root": str(_RECORDINGS_ROOT)}
 
         recordings: list[dict[str, Any]] = []
-        seen_paths: set[str] = set()  # guards against two phones sharing a dir
-        for owner_pid, d in dirs:
-            if not d.exists():
+        for f in _RECORDINGS_ROOT.rglob("*.wav"):
+            if not f.is_file():
                 continue
-            for f in d.glob("call_*.wav"):
-                if str(f) in seen_paths:
-                    continue
-                seen_paths.add(str(f))
-                parts = f.stem.split("_")  # ['call', '<phone_id>', '<call_id>', 'YYYYMMDD', 'HHMMSS']
-                file_phone = parts[1] if len(parts) >= 3 else None
-                file_call = None
-                if len(parts) >= 3:
-                    try:
-                        file_call = int(parts[2])
-                    except ValueError:
-                        pass
-                if phone_id is not None and file_phone != phone_id:
-                    continue
-                if call_id is not None and file_call != call_id:
-                    continue
-                recordings.append({
-                    "filename": f.name,
-                    "file_path": str(f),
-                    "file_size": f.stat().st_size,
-                    "phone_id": file_phone,
-                    "call_id": file_call,
-                    "owner_phone_id": owner_pid,
-                })
+            file_phone, file_call = _parse_recording_filename(f)
+            if phone_id is not None and file_phone != phone_id:
+                continue
+            if call_id is not None and file_call != call_id:
+                continue
+            meta_path = f.with_suffix(".meta.json")
+            recordings.append({
+                "filename": f.name,
+                "file_path": str(f),
+                "file_size": f.stat().st_size,
+                "phone_id": file_phone,
+                "call_id": file_call,
+                "meta_path": str(meta_path) if meta_path.exists() else None,
+            })
 
         recordings.sort(key=lambda r: r["file_path"], reverse=True)
         return {
             "recordings": recordings,
             "total_count": len(recordings),
-            "searched_dirs": sorted({str(d) for _, d in dirs}),
+            "root": str(_RECORDINGS_ROOT),
         }
     except Exception as e:
         log.exception("list_recordings failed")
