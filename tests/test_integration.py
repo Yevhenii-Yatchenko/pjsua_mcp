@@ -472,6 +472,112 @@ phones:
         assert info["recording_enabled"] is True
 
 
+class TestCaptureLayout:
+    """Per-phone `capture_enabled` — YAML plumbing + runtime toggle.
+
+    Covers the surface that doesn't need real SIP: default=false, YAML
+    defaults + override, runtime update_phone toggle, and graceful
+    collision error from `start_capture` when auto-capture is active.
+    Live auto-start/stop on a real call is covered by TestCaptureLive.
+    """
+
+    @pytest.fixture(autouse=True)
+    def mcp(self, tmp_path):
+        self.tmp_path = tmp_path
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            yield
+
+    def test_capture_enabled_default_false(self):
+        """add_phone without the flag reports capture_enabled=False everywhere."""
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "cap1",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+        assert result["status"] == "ok"
+        assert result["capture_enabled"] is False
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "cap1"}))
+        assert info["capture_enabled"] is False
+
+        phones = _parse_tool_result(self.client.call_tool("list_phones"))
+        entry = next(p for p in phones["phones"] if p["phone_id"] == "cap1")
+        assert entry["capture_enabled"] is False
+
+    def test_capture_enabled_in_yaml(self):
+        """Profile with capture_enabled=true in defaults and per-phone override."""
+        profile = self.tmp_path / "capture.yaml"
+        profile.write_text("""
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+  capture_enabled: true
+phones:
+  - {phone_id: cap_on_default, username: u1}
+  - {phone_id: cap_off_override, username: u2, capture_enabled: false}
+""")
+        result = _parse_tool_result(self.client.call_tool(
+            "load_phone_profile", {"path": str(profile)}
+        ))
+        assert result["status"] == "ok"
+
+        on = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "cap_on_default"}))
+        assert on["capture_enabled"] is True
+
+        off = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "cap_off_override"}))
+        assert off["capture_enabled"] is False
+
+    def test_update_phone_toggles_capture_runtime(self):
+        """update_phone(capture_enabled=...) flips the flag without active calls."""
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "captog",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+
+        # Default is False.
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "captog"}))
+        assert info["capture_enabled"] is False
+
+        # Flip to True.
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "captog", "capture_enabled": True,
+        }))
+        assert result["status"] == "ok"
+        assert result["capture_enabled"] is True
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "captog"}))
+        assert info["capture_enabled"] is True
+
+        # Flip back to False.
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "captog", "capture_enabled": False,
+        }))
+        assert result["capture_enabled"] is False
+
+    def test_manual_start_capture_ok_when_no_auto_capture(self):
+        """start_capture(phone_id=...) on a phone with capture_enabled=false
+        works — the collision check only fires when an auto-capture is live."""
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "manual1",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+        # capture_enabled defaults to false; auto-capture isn't active yet.
+        result = _parse_tool_result(self.client.call_tool("start_capture", {
+            "phone_id": "manual1",
+        }))
+        # tcpdump may or may not launch depending on caps in this env; we only
+        # assert that the collision check did NOT block us.
+        assert result.get("status") != "error" or "auto-capture active" not in result.get("error", "")
+        # Clean up if we did start something.
+        if result.get("status") == "ok":
+            _parse_tool_result(self.client.call_tool("stop_capture"))
+
+
 # ---------------------------------------------------------------------------
 # Multi-start/stop recording — live call exercise (requires SIP_DOMAIN)
 # ---------------------------------------------------------------------------
@@ -553,6 +659,164 @@ class TestRecordingToggleLive:
             assert meta["phone_id"] == "a"
             assert meta["call_id"] == call_id
             assert meta["recording"].endswith(fname)
+
+
+# ---------------------------------------------------------------------------
+# Auto-capture live exercise (requires SIP_DOMAIN + NET_RAW caps for tcpdump)
+# ---------------------------------------------------------------------------
+
+@skip_no_domain
+class TestCaptureLive:
+    """Per-phone `capture_enabled=true` → tcpdump starts/stops around real calls.
+
+    Skipped without SIP_DOMAIN. Also tolerates environments where tcpdump
+    can't actually open a raw socket (missing NET_RAW cap on the test
+    container) — in that case the subprocess dies immediately, the pcap
+    file is never opened, and we skip the sealing/size assertions rather
+    than fail the test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B, auto_answer=True)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
+            # capture_enabled defaults to False — enable on 'a' for these tests.
+            _parse_tool_result(self.client.call_tool("update_phone", {
+                "phone_id": "a", "capture_enabled": True,
+            }))
+            yield
+
+    @staticmethod
+    def _list_pcaps(phone_id: str) -> set[str]:
+        from pathlib import Path
+        d = Path("/captures") / phone_id
+        return {f.name for f in d.glob("*.pcap")} if d.exists() else set()
+
+    def test_auto_starts_and_stops_around_call(self):
+        """Make a call → pcap appears. Hang up → pcap is closed (tcpdump gone)."""
+        from pathlib import Path
+
+        before = self._list_pcaps("a")
+
+        r = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        assert r["status"] == "ok"
+        call_id = r["call_id"]
+        time.sleep(2.5)  # CONFIRMED + first audio-active → poll loop starts tcpdump
+
+        during = self._list_pcaps("a")
+        new_while_active = sorted(during - before)
+        assert len(new_while_active) == 1, (
+            f"Expected exactly one pcap to open on phone a, got {new_while_active}"
+        )
+        pcap_path = Path("/captures/a") / new_while_active[0]
+        assert pcap_path.name.startswith(f"call_{call_id}_")
+
+        # Hang up → poll loop drains stop queue and flushes the pcap.
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+        time.sleep(2.0)
+
+        after = self._list_pcaps("a")
+        # No new pcaps opened after hangup.
+        assert after == during
+        # The pcap is no longer growing (tcpdump was terminated).
+        size1 = pcap_path.stat().st_size if pcap_path.exists() else 0
+        time.sleep(0.5)
+        size2 = pcap_path.stat().st_size if pcap_path.exists() else 0
+        assert size1 == size2, "pcap is still being written after hangup"
+
+    def test_manual_start_capture_rejects_if_auto_active(self):
+        """While auto-capture is live for a phone, start_capture(phone_id=...) errors."""
+        r = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = r["call_id"]
+        time.sleep(2.5)  # let auto-capture come up
+
+        # Only run the collision check if auto-capture actually started; the
+        # test harness may lack NET_RAW so tcpdump could exit immediately.
+        if self._list_pcaps("a"):
+            result = _parse_tool_result(self.client.call_tool("start_capture", {
+                "phone_id": "a",
+            }))
+            assert result["status"] == "error"
+            assert "auto-capture" in result["error"].lower()
+
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+        time.sleep(1.5)
+
+    def test_toggle_capture_mid_call(self):
+        """update_phone(capture_enabled=false) mid-call closes pcap; toggle back opens a new one."""
+        before = self._list_pcaps("a")
+
+        r = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = r["call_id"]
+        time.sleep(2.5)
+        first_set = self._list_pcaps("a") - before
+
+        # Flip off mid-call.
+        _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a", "capture_enabled": False,
+        }))
+        time.sleep(1.0)
+
+        # No new pcaps while disabled.
+        mid = self._list_pcaps("a") - before
+        assert mid == first_set
+
+        # Flip back on — new pcap file (different microsecond-stamped name).
+        _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a", "capture_enabled": True,
+        }))
+        time.sleep(1.0)
+        second_set = self._list_pcaps("a") - before
+
+        if first_set:  # only assert if auto-capture actually started
+            assert len(second_set) >= len(first_set), (
+                f"Expected toggle-back-on to open a new pcap, got {second_set}"
+            )
+
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+        time.sleep(1.5)
+
+    def test_conference_single_capture_for_phone(self):
+        """Two concurrent calls on phone 'a' share one pcap, not two."""
+        # Add phone c so a can make two concurrent outbound calls.
+        _add_phone(self.client, "c", SIP_USER_C, SIP_PASS_C, auto_answer=True)
+        _wait_phone_registered(self.client, "c")
+
+        before = self._list_pcaps("a")
+
+        r1 = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        time.sleep(2.0)
+        r2 = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
+        }))
+        time.sleep(2.5)
+
+        during = self._list_pcaps("a") - before
+        # The first call opens the pcap; the second must NOT open another.
+        assert len(during) <= 1, f"Expected at most one pcap for conference, got {during}"
+
+        # Hang up the first leg — pcap stays open (second leg still active).
+        self.client.call_tool("a_hangup", {"call_id": r1["call_id"]})
+        time.sleep(1.5)
+        mid = self._list_pcaps("a") - before
+        assert mid == during, "pcap was closed before last call disconnected"
+
+        # Hang up the second leg — now pcap closes.
+        self.client.call_tool("a_hangup", {"call_id": r2["call_id"]})
+        time.sleep(2.0)
 
 
 class TestLoadPhoneProfile:

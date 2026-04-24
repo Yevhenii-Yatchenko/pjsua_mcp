@@ -16,6 +16,10 @@
 # the paired pcap path. To "disable" recording, just skip the
 # ./recordings bind-mount on docker run and files go to ephemeral
 # container FS.
+#
+# Auto-capture (tcpdump per call) is OFF by default. Opt in per phone
+# with `capture_enabled: true` — pcaps land in /captures/<phone_id>/
+# with the same basename as the recording.
 
 # Keys under `defaults` are merged into every phone entry.
 # Phone-level keys win over defaults.
@@ -29,10 +33,13 @@ defaults:
   srtp: false
   # recording_enabled: true    # default — flip to false to suppress
                                # recording for every phone by default
+  # capture_enabled: false     # default — flip to true to auto-run
+                               # tcpdump on every call
 
 phones:
   - phone_id: a
     username: "1001"
+    capture_enabled: true      # auto-capture only phone a
 
   - phone_id: b
     username: "1002"

@@ -61,7 +61,7 @@ One MCP server process manages N phones side by side. Each phone gets its own `p
 | `add_phone` | Create a transport + SipAccount, send REGISTER, register 22 per-phone action tools |
 | `drop_phone` | Hang up the phone's calls, unregister, close transport, unload its per-phone tools |
 | `get_phone` | Full info for one phone — credentials (sans password), reg state, active calls, `recording_enabled` |
-| `update_phone` | Mutate runtime settings — `auto_answer` / `recording_enabled` (instant), `codecs`, or credentials (forces reregister) |
+| `update_phone` | Mutate runtime settings — `auto_answer` / `recording_enabled` / `capture_enabled` (instant), `codecs`, or credentials (forces reregister) |
 | `load_phone_profile` | Bulk-add every phone listed in a YAML profile. Atomic replace by default (`merge=True` for upsert) |
 | `get_phone_profile_example` | Return a ready-to-edit YAML template, host/container paths, and next-step hints |
 
@@ -321,10 +321,12 @@ carries the context the WAV itself lacks:
 }
 ```
 
-`pcap` is populated only if `start_capture(phone_id="a")` was running
-during the call — in that case the pcap lands in `/captures/<phone_id>/`
-with the same basename as the recording, so audio and signalling pair
-up without any timestamp matching.
+`pcap` is populated whenever a capture was running for the phone during
+the call — either a manual `start_capture(phone_id="a")` or (more
+commonly) the per-phone auto-capture driven by `capture_enabled`. In
+both cases the pcap lives under `/captures/<phone_id>/` with the same
+basename as the recording, so audio and signalling pair up without any
+timestamp matching.
 
 ### Per-phone toggle: `recording_enabled`
 
@@ -388,13 +390,73 @@ Each entry contains:
 
 ## Packet Capture
 
-`start_capture` runs a single host-wide `tcpdump` (container is `network_mode: host`). Pass `phone_id` to auto-filter by that phone's UDP transport port:
+Two independent modes coexist: **manual** (one-shot tcpdump you fire
+from a tool call) and **auto-capture** (per-phone `capture_enabled`
+flag — tcpdump opens on the first audio-active call and closes on the
+last disconnect). Both land under `/captures/<phone_id>/` with the same
+basename as the recording, so pcap and WAV pair up on disk.
+
+### Per-phone auto-capture (`capture_enabled`)
+
+Default is `false` — no tcpdump runs unless you opt in. Turn it on in
+YAML or at runtime; the state is checked per call, so you can flip it
+mid-session:
+
+```yaml
+# config/phones.yaml
+phones:
+  - phone_id: a
+    username: "1001"
+    capture_enabled: true        # every call on 'a' → pcap
+  - phone_id: b
+    username: "1002"             # inherits default → no pcap
+```
 
 ```
-start_capture(phone_id="a")                          # BPF: udp port <a's local port>
-# ... run scenario ...
-stop_capture()
-get_pcap()                                           # file info
+add_phone(phone_id="c", domain="...", username="1003", password="x",
+          capture_enabled=True)                         # opt-in at add time
+update_phone(phone_id="a", capture_enabled=False)       # flip off mid-call
+update_phone(phone_id="a", capture_enabled=True)        # flip back on
+```
+
+On→off during a live call flushes and closes the current pcap; off→on
+opens a fresh pcap with a new microsecond-unique filename. Off→on **does
+not** retroactively capture packets from earlier in the call.
+
+Each auto-capture uses the broad BPF filter `udp`, so a re-INVITE that
+changes the RTP port (hold/unhold, codec swap) does not drop any packets
+mid-call. The tradeoff is disk: on a noisy network the pcap grows faster
+than if we locked to a single port. If you need to trim, split the pcap
+post-hoc — see below.
+
+In a conference (two active calls on one phone) a **single** pcap is
+kept for the phone, not one per leg. The first call starts it; the last
+disconnect closes it.
+
+### Manual capture
+
+Fire tcpdump on demand without the per-phone flag:
+
+```
+start_capture()                       # host-wide → /captures/capture_<ts>.pcap
+start_capture(phone_id="a")           # BPF: udp port <a's local port>
+stop_capture()                        # stops the manual capture
+stop_capture(phone_id="a")            # stops phone 'a's auto-capture
+get_pcap()                            # file info (most recent)
+```
+
+If `start_capture(phone_id="a")` is called while phone `a` already has
+auto-capture running, the call is refused with an explanatory error —
+disable `capture_enabled` first (or stop the auto-capture explicitly).
+
+### Splitting SIP and RTP after the fact
+
+Because the BPF filter is broad (`udp`), the pcap contains both SIP
+signalling and RTP media interleaved. Split with `tshark` post-hoc:
+
+```bash
+tshark -Y 'sip' -r captures/a/call_0_*.pcap -w sip_only.pcap
+tshark -Y 'rtp' -r captures/a/call_0_*.pcap -w rtp_only.pcap
 ```
 
 ## Dynamic Tool Registration
@@ -551,6 +613,7 @@ pjsua_mcp/
 - **SIP log** — `consoleLevel=5` (matching `level=5`) ensures the global log level isn't suppressed. The LogWriter captures everything into a thread-safe bounded deque.
 - **Auto-answer** — deferred to the event poll loop (not inside `onIncomingCall`) to avoid PJSUA2 call state machine issues.
 - **Recording** — per-phone `recording_enabled` flag (default on). When on, writes to `/recordings/<phone_id>/call_<call_id>_<ts>_<us>.wav` plus a `.meta.json` sidecar with call context and the paired pcap path (when a capture is running for the phone). The recorder is connected AFTER player setup to avoid conference bridge disruption and reconnected on every `onCallMediaState`. Local + remote audio mixed into one mono WAV. Toggling `recording_enabled` mid-call via `update_phone` opens/closes distinct WAV segments — each with its own sidecar — so a single call can emit several recordings if the operator wants finer-grained capture.
+- **Auto-capture** — per-phone `capture_enabled` flag (default off). Opens a dedicated `tcpdump -i any udp` subprocess on the first audio-active call and closes it on the last disconnect. Filter stays broad so re-INVITE RTP port changes don't drop packets; split SIP and RTP with `tshark -Y` after the fact. Start/stop requests come from pj callback threads; actual subprocess launches run on the asyncio poll loop via a deque-based pending queue (same pattern as `process_auto_answers`). Conference (2+ calls on one phone) shares a single pcap, counted via `_active_calls_by_phone`.
 - **Re-INVITE** — audio player is reconnected to the new `aud_med` port after re-INVITE (codec change, conference conversion) so TX keeps flowing.
 - **Dynamic tool registration** — `tools_changed=True` capability enabled via `create_initialization_options` monkey-patch; `ctx.session.send_tool_list_changed()` fires after each phone add/drop (once per batch for `load_phone_profile`).
 - **Stale call cleanup** — disconnected calls are removed from tracking; accounts are shut down before re-registration to prevent ghost sessions.

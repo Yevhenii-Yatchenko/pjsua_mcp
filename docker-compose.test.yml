@@ -29,6 +29,12 @@ services:
         condition: service_healthy
     networks:
       - sipnet
+    # tcpdump needs both NET_RAW and NET_ADMIN — the image sets file caps on
+    # /usr/bin/tcpdump for both, but Docker's default bounding set excludes
+    # NET_ADMIN, so without this block the file caps get stripped at exec.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
     environment:
       - SIP_DOMAIN=asterisk
       - SIP_USER_A=6001

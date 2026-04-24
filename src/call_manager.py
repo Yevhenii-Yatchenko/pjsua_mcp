@@ -52,6 +52,11 @@ class SipCall(pj.Call):
         self._player_file: str | None = None
         self._aud_med: pj.AudioMedia | None = None  # cached for play/stop
         self.on_disconnected_cb: Any = None
+        # Fires exactly once, when onCallMediaState sees audio go ACTIVE for
+        # the first time. CallManager wires this to its auto-capture counter
+        # so the tcpdump opens on the first leg of a conference.
+        self.on_first_active_cb: Any = None
+        self._auto_capture_started = False
         self._info: dict[str, Any] = {
             "phone_id": phone_id,
             "state": "NONE",
@@ -92,6 +97,16 @@ class SipCall(pj.Call):
             if mi.type == pj.PJMEDIA_TYPE_AUDIO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
                 aud_med = self.getAudioMedia(i)
                 self._aud_med = aud_med
+                # First active audio for this call → poke CallManager so it
+                # can bump its active-calls-per-phone counter and (if the
+                # phone has capture_enabled) queue an auto-capture start.
+                # Flag guards against re-INVITE / media-refresh replays.
+                if not self._auto_capture_started and self.on_first_active_cb:
+                    self._auto_capture_started = True
+                    try:
+                        self.on_first_active_cb(self.phone_id, ci.id)
+                    except Exception:
+                        log.exception("on_first_active_cb failed for call %d", ci.id)
                 # Connect remote audio to playback device (for recording/monitoring)
                 try:
                     ep = pj.Endpoint.instance()
@@ -377,6 +392,13 @@ class CallManager:
         self._lock = threading.Lock()
         self._call_history: deque[dict] = deque(maxlen=100)
 
+        # Auto-capture: active-call counter per phone + pending queues that
+        # process_auto_captures drains from the asyncio poll loop. Enqueueing
+        # happens from pj callbacks (sync); actual start/stop runs async.
+        self._active_calls_by_phone: dict[str, int] = {}
+        self._auto_capture_pending_start: deque[tuple[str, int | None]] = deque()
+        self._auto_capture_pending_stop: deque[str] = deque()
+
         # Wire registry hooks so callbacks attach to every new phone
         registry.on_phone_added = self._on_phone_added
         registry.on_phone_dropped = self._on_phone_dropped
@@ -422,10 +444,15 @@ class CallManager:
         with self._lock:
             self._incoming_queue.pop(phone_id, None)
             self._auto_answer_pending.pop(phone_id, None)
+            self._active_calls_by_phone.pop(phone_id, None)
             stale_calls = [cid for cid, pid in self._call_phone.items() if pid == phone_id]
             for cid in stale_calls:
                 self._call_phone.pop(cid, None)
                 self._calls.pop(cid, None)
+        # If an auto-capture is still alive for this phone, queue a stop
+        # so the pcap is flushed cleanly before the registry forgets it.
+        if self._pcap_mgr is not None and self._pcap_mgr.is_phone_capturing(phone_id):
+            self._auto_capture_pending_stop.append(phone_id)
 
     def _make_incoming_handler(self, phone_id: str) -> Callable[[int], None]:
         """Factory — closes over phone_id so incoming calls route to the right queue."""
@@ -450,6 +477,7 @@ class CallManager:
             recording_enabled=recording_enabled,
         )
         call.on_disconnected_cb = self._on_call_disconnected
+        call.on_first_active_cb = self._register_call_active
         with self._lock:
             self._calls[call_id] = call
             self._call_phone[call_id] = phone_id
@@ -482,6 +510,89 @@ class CallManager:
                 log.info("[%s] Auto-answered call %d", pid, call_id)
             except Exception:
                 log.exception("[%s] Failed to auto-answer call %d", pid, call_id)
+
+    # ------------------------------------------------------------------
+    # Auto-capture lifecycle — counter + queues drained from poll loop
+    # ------------------------------------------------------------------
+    def _register_call_active(self, phone_id: str, call_id: int) -> None:
+        """Called from pj thread on the first audio-ACTIVE callback per call.
+
+        Increments the active-call counter for this phone; if this is the
+        first active call AND the phone has capture_enabled, queue a
+        start_for_phone to run in the asyncio poll loop.
+        """
+        cfg = self._registry.get_config(phone_id)
+        with self._lock:
+            new_count = self._active_calls_by_phone.get(phone_id, 0) + 1
+            self._active_calls_by_phone[phone_id] = new_count
+        is_first = new_count == 1
+        if is_first and cfg is not None and cfg.capture_enabled:
+            self._auto_capture_pending_start.append((phone_id, call_id))
+
+    async def process_auto_captures(self) -> None:
+        """Drain auto-capture start/stop queues from the asyncio poll loop.
+
+        Counterpart to `process_auto_answers`. The pj callback thread
+        enqueues tuples; this coroutine dequeues and calls the async
+        pcap_mgr methods. Skips items where the desired state already
+        holds (e.g. capture already running, phone dropped mid-flight).
+        """
+        if self._pcap_mgr is None:
+            return
+        while self._auto_capture_pending_start:
+            try:
+                phone_id, call_id = self._auto_capture_pending_start.popleft()
+            except IndexError:
+                break
+            if self._pcap_mgr.is_phone_capturing(phone_id):
+                continue
+            try:
+                await self._pcap_mgr.start_for_phone(phone_id, call_id)
+            except Exception:
+                log.exception("[%s] auto-capture start failed", phone_id)
+        while self._auto_capture_pending_stop:
+            try:
+                phone_id = self._auto_capture_pending_stop.popleft()
+            except IndexError:
+                break
+            if not self._pcap_mgr.is_phone_capturing(phone_id):
+                continue
+            try:
+                await self._pcap_mgr.stop_for_phone(phone_id)
+            except Exception:
+                log.exception("[%s] auto-capture stop failed", phone_id)
+
+    def set_capture_enabled(self, phone_id: str, enabled: bool) -> dict[str, Any]:
+        """Toggle auto-capture for `phone_id`. Applies instantly to live calls.
+
+        Off → on with active calls: queue a start (captures packets from
+        "now" onward — earlier SIP/RTP of the call is NOT retroactively
+        captured).
+        On → off with a live tcpdump: queue a stop; the pcap is flushed
+        and closed, and subsequent calls while the flag stays off will
+        not open a new one.
+        """
+        cfg = self._registry.get_config(phone_id)
+        if cfg is None:
+            raise RuntimeError(f"Phone {phone_id!r} not found")
+        cfg.capture_enabled = enabled
+        if enabled:
+            with self._lock:
+                has_active = self._active_calls_by_phone.get(phone_id, 0) > 0
+                active_cid = next(
+                    (cid for cid, pid in self._call_phone.items() if pid == phone_id),
+                    None,
+                )
+            if (
+                has_active
+                and self._pcap_mgr is not None
+                and not self._pcap_mgr.is_phone_capturing(phone_id)
+            ):
+                self._auto_capture_pending_start.append((phone_id, active_cid))
+        else:
+            if self._pcap_mgr is not None and self._pcap_mgr.is_phone_capturing(phone_id):
+                self._auto_capture_pending_stop.append(phone_id)
+        return {"phone_id": phone_id, "capture_enabled": enabled}
 
     # ------------------------------------------------------------------
     # Phone resolution
@@ -530,6 +641,7 @@ class CallManager:
             recording_enabled=recording_enabled,
         )
         call.on_disconnected_cb = self._on_call_disconnected
+        call.on_first_active_cb = self._register_call_active
         prm = pj.CallOpParam(True)  # True = use default call settings
 
         if headers:
@@ -813,9 +925,16 @@ class CallManager:
         return affected
 
     def _on_call_disconnected(self, info: dict) -> None:
-        """Record call to history and remove from active calls."""
+        """Record call to history and remove from active calls.
+
+        Also runs the auto-capture counter: decrements the per-phone
+        active-call count and, if this was the last active call on a
+        phone with a running auto-capture, queues a stop for
+        `process_auto_captures` to drain.
+        """
+        phone_id = info.get("phone_id")
         self._call_history.append({
-            "phone_id": info.get("phone_id"),
+            "phone_id": phone_id,
             "remote_uri": info.get("remote_uri", ""),
             "duration": info.get("duration", 0),
             "last_status": info.get("last_status", 0),
@@ -833,15 +952,34 @@ class CallManager:
             for pid, queue in self._incoming_queue.items():
                 self._incoming_queue[pid] = [cid for cid in queue if cid in self._calls]
 
+            is_last = False
+            if phone_id is not None and phone_id in self._active_calls_by_phone:
+                count = self._active_calls_by_phone[phone_id] - 1
+                if count <= 0:
+                    self._active_calls_by_phone.pop(phone_id, None)
+                    is_last = True
+                else:
+                    self._active_calls_by_phone[phone_id] = count
+        if (
+            is_last
+            and phone_id is not None
+            and self._pcap_mgr is not None
+            and self._pcap_mgr.is_phone_capturing(phone_id)
+        ):
+            self._auto_capture_pending_stop.append(phone_id)
+
     def cleanup(self) -> None:
         """Clear all call state — called before re-registration."""
         with self._lock:
             self._calls.clear()
             self._call_phone.clear()
+            self._active_calls_by_phone.clear()
             for pid in list(self._incoming_queue):
                 self._incoming_queue[pid].clear()
             for pid in list(self._auto_answer_pending):
                 self._auto_answer_pending[pid].clear()
+        self._auto_capture_pending_start.clear()
+        self._auto_capture_pending_stop.clear()
 
     def list_calls(self, phone_id: str | None = None) -> list[dict]:
         """List all tracked calls with basic status (optionally scoped to one phone)."""

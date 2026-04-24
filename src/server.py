@@ -60,9 +60,14 @@ PHONE_PROFILE_TEMPLATE = """\
 #   mcp__pjsua__load_phone_profile()                               # /config/phones.yaml
 #   mcp__pjsua__load_phone_profile(path="/config/other.yaml")      # another profile
 #
-# Recording is always on. Calls land in /recordings/<phone_id>/ as
-# call_<call_id>_<ts>.wav plus a .meta.json sidecar with codec, duration,
-# remote URI, direction, and (if a capture is running) the paired pcap path.
+# Recording is always on by default. Calls land in /recordings/<phone_id>/
+# as call_<call_id>_<ts>.wav plus a .meta.json sidecar with codec,
+# duration, remote URI, direction, and (if a capture is running) the
+# paired pcap path.
+#
+# Auto-capture is OFF by default. Set `capture_enabled: true` on a phone
+# and tcpdump runs for every call, pcap landing in
+# /captures/<phone_id>/call_<call_id>_<ts>.pcap alongside the recording.
 
 # Keys under `defaults` are merged into every phone entry.
 # Phone-level keys win over defaults.
@@ -76,10 +81,13 @@ defaults:
   srtp: false
   # recording_enabled: true    # default — set false to suppress recording
                                # for every phone that doesn't override it
+  # capture_enabled: false     # default — set true to auto-capture pcaps
+                               # for every phone (tcpdump per call)
 
 phones:
   - phone_id: a
     username: "1001"
+    capture_enabled: true      # per-phone override — only 'a' auto-captures
 
   - phone_id: b
     username: "1002"
@@ -102,6 +110,7 @@ async def _poll_pjsip_events(eng: SipEngine) -> None:
             eng.handle_events(10)
             if call_mgr:
                 call_mgr.process_auto_answers()
+                await call_mgr.process_auto_captures()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -196,6 +205,7 @@ def _add_phone_impl(
     codecs: list[str] | None = None,
     register: bool = True,
     recording_enabled: bool = True,
+    capture_enabled: bool = False,
 ) -> dict[str, Any]:
     """Common add-phone routine — no client notification, no async."""
     assert registry is not None and engine is not None
@@ -224,6 +234,7 @@ def _add_phone_impl(
         codecs=codecs,
         register=register,
         recording_enabled=recording_enabled,
+        capture_enabled=capture_enabled,
     )
 
     tool_names = register_phone_tools(mcp, phone_id, call_mgr, registry)
@@ -239,6 +250,7 @@ def _add_phone_impl(
         "transport": transport,
         "transport_id": cfg.transport_id if cfg else None,
         "recording_enabled": cfg.recording_enabled if cfg else recording_enabled,
+        "capture_enabled": cfg.capture_enabled if cfg else capture_enabled,
         "tools_registered": len(tool_names),
         **reg,
     }
@@ -299,6 +311,7 @@ async def add_phone(
     realm: str | None = None,
     register: bool = True,
     recording_enabled: bool = True,
+    capture_enabled: bool = False,
 ) -> dict[str, Any]:
     """Add a new phone (SIP account) and register its per-phone action tools.
 
@@ -311,6 +324,13 @@ async def add_phone(
     sidecar alongside). Pass `recording_enabled=False` to suppress
     recording for this phone, or flip it at runtime via
     `update_phone(phone_id=..., recording_enabled=...)`.
+
+    Auto-capture defaults to OFF: `capture_enabled=True` opens a
+    per-phone tcpdump subprocess on the first audio-active call and
+    closes it on the last disconnect. The pcap lands in
+    `/captures/<phone_id>/call_<call_id>_<ts>.pcap`, paired by basename
+    with the matching recording. Toggle at runtime via
+    `update_phone(phone_id=..., capture_enabled=...)`.
     """
     try:
         result = _add_phone_impl(
@@ -320,6 +340,7 @@ async def add_phone(
             transport=transport, local_port=local_port,
             codecs=codecs, register=register,
             recording_enabled=recording_enabled,
+            capture_enabled=capture_enabled,
         )
         await asyncio.sleep(1.0)  # give REGISTER a moment
         result.update(registry.get_registration_info(phone_id))
@@ -367,6 +388,7 @@ async def get_phone(phone_id: str) -> dict[str, Any]:
             "transport_id": cfg.transport_id,
             "codecs": cfg.codecs,
             "recording_enabled": cfg.recording_enabled,
+            "capture_enabled": cfg.capture_enabled,
             "active_calls": active_calls,
             "tools": _phone_tools.get(phone_id, []),
             **reg,
@@ -385,6 +407,7 @@ async def update_phone(
     realm: str | None = None,
     srtp: bool | None = None,
     recording_enabled: bool | None = None,
+    capture_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Mutate runtime-parameters of an existing phone.
 
@@ -395,6 +418,10 @@ async def update_phone(
       a new microsecond-unique filename); on→off closes the current WAV
       and writes its `.meta.json` sidecar. A call can cycle through
       on→off→on→... any number of times before DISCONNECTED.
+    capture_enabled — instantaneous auto-capture toggle. off→on during
+      an active call queues a tcpdump start (captures from "now" on; no
+      retroactive packets). on→off flushes and closes the current pcap
+      and future calls won't open a new one while it's off.
     password / realm / srtp — force a fresh REGISTER cycle.
     """
     assert registry is not None and engine is not None and call_mgr is not None
@@ -413,6 +440,8 @@ async def update_phone(
         if recording_enabled is not None:
             cfg.recording_enabled = recording_enabled
             affected_call_ids = call_mgr.set_recording_enabled(phone_id, recording_enabled)
+        if capture_enabled is not None:
+            call_mgr.set_capture_enabled(phone_id, capture_enabled)
         if password is not None:
             cfg.password = password
             reregister_needed = True
@@ -432,6 +461,7 @@ async def update_phone(
             "phone_id": phone_id,
             "reregistered": reregister_needed,
             "recording_enabled": cfg.recording_enabled,
+            "capture_enabled": cfg.capture_enabled,
             **registry.get_registration_info(phone_id),
         }
         if affected_call_ids is not None:
@@ -445,7 +475,7 @@ async def update_phone(
 _PHONE_FIELDS = {
     "phone_id", "domain", "username", "password", "realm", "srtp",
     "auto_answer", "transport", "local_port", "codecs", "register",
-    "recording_enabled",
+    "recording_enabled", "capture_enabled",
 }
 
 # Keys we used to accept but no longer do. If they appear in the profile,
@@ -732,7 +762,7 @@ async def start_capture(
     interface: str = "any",
     port: int | None = None,
 ) -> dict[str, Any]:
-    """Start tcpdump.
+    """Start a manual (host-wide or phone-scoped) tcpdump.
 
     - No `phone_id`: host-wide capture → `/captures/capture_<ts>.pcap`.
     - With `phone_id`: BPF filters by that phone's UDP transport port and
@@ -741,9 +771,25 @@ async def start_capture(
       the active recording's basename (e.g. `call_0_<ts>.pcap` next to
       `/recordings/<phone_id>/call_0_<ts>.wav`), so pcap and wav pair up
       without cross-referencing timestamps.
+
+    If `phone_id` already has an auto-capture running (the phone's
+    `capture_enabled=true`), this call is refused — disable auto-capture
+    first via `update_phone(phone_id=..., capture_enabled=false)` or stop
+    it via `stop_capture(phone_id=...)`.
     """
     assert pcap_mgr is not None and engine is not None and registry is not None
     try:
+        if phone_id is not None and pcap_mgr.is_phone_capturing(phone_id):
+            return {
+                "status": "error",
+                "error": (
+                    f"Phone {phone_id!r} has auto-capture active "
+                    f"(capture_enabled=true). Disable it via "
+                    f"update_phone(phone_id={phone_id!r}, capture_enabled=False) "
+                    f"or stop via stop_capture(phone_id={phone_id!r}) first."
+                ),
+                "phone_id": phone_id,
+            }
         active_call_id: int | None = None
         if phone_id is not None:
             if port is None:
@@ -772,10 +818,21 @@ async def start_capture(
 
 
 @mcp.tool()
-async def stop_capture() -> dict[str, Any]:
-    """Stop the running packet capture."""
+async def stop_capture(phone_id: str | None = None) -> dict[str, Any]:
+    """Stop a packet capture.
+
+    Without `phone_id` — stops the legacy host-wide capture started by
+    `start_capture()`.
+    With `phone_id` — stops the per-phone auto-capture driven by
+    `capture_enabled`. Safe to call either way; returns `status:
+    not_running` for per-phone calls if nothing was active.
+    """
     assert pcap_mgr is not None
     try:
+        if phone_id is not None:
+            info = await pcap_mgr.stop_for_phone(phone_id)
+            status = info.pop("status", None) or "ok"
+            return {"status": status, **info}
         info = await pcap_mgr.stop()
         return {"status": "ok", **info}
     except Exception as e:
