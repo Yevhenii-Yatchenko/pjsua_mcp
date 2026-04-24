@@ -60,14 +60,14 @@ PHONE_PROFILE_TEMPLATE = """\
 #   mcp__pjsua__load_phone_profile()                               # /config/phones.yaml
 #   mcp__pjsua__load_phone_profile(path="/config/other.yaml")      # another profile
 #
-# Recording is always on by default. Calls land in /recordings/<phone_id>/
-# as call_<call_id>_<ts>.wav plus a .meta.json sidecar with codec,
-# duration, remote URI, direction, and (if a capture is running) the
-# paired pcap path.
-#
-# Auto-capture is OFF by default. Set `capture_enabled: true` on a phone
-# and tcpdump runs for every call, pcap landing in
-# /captures/<phone_id>/call_<call_id>_<ts>.pcap alongside the recording.
+# Both recording and auto-capture default to OFF. Opt in per phone:
+#   - `recording_enabled: true` → /recordings/<phone_id>/call_<id>_<ts>.wav
+#     plus a .meta.json sidecar (codec, duration, remote URI, direction,
+#     and — if capture is also on — the paired pcap path).
+#   - `capture_enabled: true`   → /captures/<phone_id>/call_<id>_<ts>.pcap
+#     from a dedicated tcpdump subprocess that spans the whole call.
+# When both are on, the WAV and pcap share a basename so they line up
+# on disk without any timestamp matching.
 
 # Keys under `defaults` are merged into every phone entry.
 # Phone-level keys win over defaults.
@@ -79,15 +79,16 @@ defaults:
   auto_answer: false
   register: true
   srtp: false
-  # recording_enabled: true    # default — set false to suppress recording
-                               # for every phone that doesn't override it
+  # recording_enabled: false   # default — set true to record every call
+                               # to /recordings/<phone_id>/*.wav
   # capture_enabled: false     # default — set true to auto-capture pcaps
                                # for every phone (tcpdump per call)
 
 phones:
   - phone_id: a
     username: "1001"
-    capture_enabled: true      # per-phone override — only 'a' auto-captures
+    recording_enabled: true    # per-phone override — 'a' records
+    capture_enabled: true      # per-phone override — 'a' also pcap-captures
 
   - phone_id: b
     username: "1002"
@@ -96,7 +97,7 @@ phones:
   - phone_id: c
     username: "1003"
     auto_answer: true
-    # recording_enabled: false  # per-phone override wins over defaults
+    # recording_enabled: true   # per-phone override wins over defaults
     # Per-phone override:
     # password: "c_specific_pw"
     # realm: "example.realm"
@@ -204,7 +205,7 @@ def _add_phone_impl(
     local_port: int = 0,
     codecs: list[str] | None = None,
     register: bool = True,
-    recording_enabled: bool = True,
+    recording_enabled: bool = False,
     capture_enabled: bool = False,
 ) -> dict[str, Any]:
     """Common add-phone routine — no client notification, no async."""
@@ -310,7 +311,7 @@ async def add_phone(
     srtp: bool = False,
     realm: str | None = None,
     register: bool = True,
-    recording_enabled: bool = True,
+    recording_enabled: bool = False,
     capture_enabled: bool = False,
 ) -> dict[str, Any]:
     """Add a new phone (SIP account) and register its per-phone action tools.
@@ -319,13 +320,13 @@ async def add_phone(
     `<phone_id>_hangup`, etc. become visible via
     `notifications/tools/list_changed`.
 
-    Recording defaults to on: every call on this phone is written to
-    `/recordings/<phone_id>/call_<call_id>_<ts>.wav` (with a `.meta.json`
-    sidecar alongside). Pass `recording_enabled=False` to suppress
-    recording for this phone, or flip it at runtime via
+    Recording defaults to OFF: pass `recording_enabled=True` (or set it
+    in the YAML profile) to write every call on this phone to
+    `/recordings/<phone_id>/call_<call_id>_<ts>.wav` alongside a
+    `.meta.json` sidecar. Toggle at runtime via
     `update_phone(phone_id=..., recording_enabled=...)`.
 
-    Auto-capture defaults to OFF: `capture_enabled=True` opens a
+    Auto-capture also defaults to OFF: `capture_enabled=True` opens a
     per-phone tcpdump subprocess on the first audio-active call and
     closes it on the last disconnect. The pcap lands in
     `/captures/<phone_id>/call_<call_id>_<ts>.pcap`, paired by basename

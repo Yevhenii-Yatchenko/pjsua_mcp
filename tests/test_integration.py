@@ -162,6 +162,8 @@ def _add_phone(
     *,
     auto_answer: bool = False,
     codecs: list[str] | None = None,
+    recording_enabled: bool = False,
+    capture_enabled: bool = False,
 ) -> dict:
     result = _parse_tool_result(client.call_tool("add_phone", {
         "phone_id": phone_id,
@@ -170,6 +172,8 @@ def _add_phone(
         "password": password,
         "auto_answer": auto_answer,
         "codecs": codecs,
+        "recording_enabled": recording_enabled,
+        "capture_enabled": capture_enabled,
     }))
     assert result["status"] == "ok", f"add_phone failed: {result}"
     return result
@@ -383,18 +387,18 @@ phones:
     # recording_enabled toggle — per-phone + runtime + multi-start/stop
     # ------------------------------------------------------------------
 
-    def test_recording_enabled_default_true(self):
-        """add_phone without the flag should report recording_enabled=True."""
+    def test_recording_enabled_default_false(self):
+        """add_phone without the flag should report recording_enabled=False (opt-in)."""
         result = _parse_tool_result(self.client.call_tool("add_phone", {
             "phone_id": "rec1",
             "domain": "127.0.0.1", "username": "u", "password": "p",
             "register": False,
         }))
         assert result["status"] == "ok"
-        assert result["recording_enabled"] is True
+        assert result["recording_enabled"] is False
 
         info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rec1"}))
-        assert info["recording_enabled"] is True
+        assert info["recording_enabled"] is False
 
     def test_recording_enabled_false_in_yaml(self):
         """Profile with recording_enabled=false surfaces through get_phone."""
@@ -428,32 +432,32 @@ phones:
             "register": False,
         }))
 
-        # Default is True.
+        # Default is False.
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rectog"}))
+        assert info["recording_enabled"] is False
+
+        # Flip to True.
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "rectog", "recording_enabled": True,
+        }))
+        assert result["status"] == "ok"
+        assert result["recording_enabled"] is True
+        assert result["affected_call_ids"] == []  # no active calls
+
         info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rectog"}))
         assert info["recording_enabled"] is True
 
-        # Flip to False.
+        # Flip back to False.
         result = _parse_tool_result(self.client.call_tool("update_phone", {
             "phone_id": "rectog", "recording_enabled": False,
         }))
-        assert result["status"] == "ok"
         assert result["recording_enabled"] is False
-        assert result["affected_call_ids"] == []  # no active calls
 
         info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rectog"}))
         assert info["recording_enabled"] is False
 
-        # Flip back to True.
-        result = _parse_tool_result(self.client.call_tool("update_phone", {
-            "phone_id": "rectog", "recording_enabled": True,
-        }))
-        assert result["recording_enabled"] is True
-
-        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rectog"}))
-        assert info["recording_enabled"] is True
-
     def test_legacy_yaml_without_key_loads(self):
-        """Backward-compat: profiles without recording_enabled default to True."""
+        """Profiles without recording_enabled now default to False (opt-in)."""
         profile = self.tmp_path / "legacy_nokey.yaml"
         profile.write_text("""
 defaults:
@@ -469,7 +473,7 @@ phones:
         assert result["status"] == "ok"
 
         info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "legacy1"}))
-        assert info["recording_enabled"] is True
+        assert info["recording_enabled"] is False
 
 
 class TestCaptureLayout:
@@ -595,7 +599,9 @@ class TestRecordingToggleLive:
         with McpClient() as client:
             client.send_initialize()
             self.client = client
-            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            # Recording now defaults to OFF — explicitly enable on the phone
+            # whose WAV segments this test counts.
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A, recording_enabled=True)
             _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B, auto_answer=True)
             _wait_phone_registered(self.client, "a")
             _wait_phone_registered(self.client, "b")

@@ -31,7 +31,7 @@ class PhoneConfig:
     local_port: int = 0
     codecs: list[str] | None = None
     transport_id: int | None = None
-    recording_enabled: bool = True
+    recording_enabled: bool = False
     capture_enabled: bool = False
 
 
@@ -131,7 +131,7 @@ class PhoneRegistry:
         local_port: int = 0,
         codecs: list[str] | None = None,
         register: bool = True,
-        recording_enabled: bool = True,
+        recording_enabled: bool = False,
         capture_enabled: bool = False,
     ) -> SipAccount:
         """Create a transport, a SipAccount, and (optionally) REGISTER.
@@ -285,7 +285,7 @@ class PhoneRegistry:
                 "transport": cfg.transport if cfg else "udp",
                 "local_port": cfg.local_port if cfg else 0,
                 "transport_id": cfg.transport_id if cfg else None,
-                "recording_enabled": cfg.recording_enabled if cfg else True,
+                "recording_enabled": cfg.recording_enabled if cfg else False,
                 "capture_enabled": cfg.capture_enabled if cfg else False,
                 **reg,
             }

@@ -293,7 +293,9 @@ a_list_calls()                                       # compact summary incl. DIS
 
 ## Call Recording (per-phone toggle, paired pcap)
 
-Recording is on by default. Every call on a phone is written to the
+Recording is **off by default** — opt in per phone with
+`recording_enabled: true` in YAML or `recording_enabled=True` in
+`add_phone`. When enabled, every call on the phone is written to the
 container path `/recordings/<phone_id>/` as two paired files:
 
 ```
@@ -330,7 +332,7 @@ timestamp matching.
 
 ### Per-phone toggle: `recording_enabled`
 
-Each phone carries a `recording_enabled` flag (default `true`). Set it
+Each phone carries a `recording_enabled` flag (default `false`). Set it
 up-front in YAML or at runtime — toggles take effect instantly on every
 active call of that phone:
 
@@ -339,21 +341,21 @@ active call of that phone:
 defaults:
   domain: sip.example.com
   password: xxx
-  recording_enabled: false       # silence the whole stand by default
+  # recording_enabled: false      # default — nobody records
 phones:
   - phone_id: a
     username: "1001"
-    recording_enabled: true      # per-phone override wins
+    recording_enabled: true       # per-phone opt-in
   - phone_id: b
-    username: "1002"             # inherits defaults → no recording
+    username: "1002"              # stays off
 ```
 
 ```
 add_phone(phone_id="c", domain="...", username="1003", password="x",
-          recording_enabled=False)                        # opt-out at add time
+          recording_enabled=True)                         # opt-in at add time
 
-update_phone(phone_id="a", recording_enabled=False)       # flip off mid-call
-update_phone(phone_id="a", recording_enabled=True)        # flip back on
+update_phone(phone_id="a", recording_enabled=True)        # flip on mid-call
+update_phone(phone_id="a", recording_enabled=False)       # flip back off
 ```
 
 Every `off → on` opens a fresh WAV with a new microsecond-unique filename
@@ -364,7 +366,7 @@ WAV+sidecar pairs under `/recordings/<phone_id>/`, not one. Use
 a given call; `<phone>_get_recording(call_id=...)` returns only the
 currently-open segment.
 
-**To disable recording entirely at the filesystem level**, drop the
+**To hide recording files from the host entirely**, drop the
 `./recordings` bind mount from your `docker-compose.yml` — `/recordings`
 will live inside the ephemeral container FS and disappear with `--rm`.
 
@@ -612,7 +614,7 @@ pjsua_mcp/
 - **stdout protection** — C-level fd 1 is redirected to stderr at startup. MCP JSON-RPC uses a saved copy of the original stdout fd. Prevents pjlib console output from corrupting the MCP channel.
 - **SIP log** — `consoleLevel=5` (matching `level=5`) ensures the global log level isn't suppressed. The LogWriter captures everything into a thread-safe bounded deque.
 - **Auto-answer** — deferred to the event poll loop (not inside `onIncomingCall`) to avoid PJSUA2 call state machine issues.
-- **Recording** — per-phone `recording_enabled` flag (default on). When on, writes to `/recordings/<phone_id>/call_<call_id>_<ts>_<us>.wav` plus a `.meta.json` sidecar with call context and the paired pcap path (when a capture is running for the phone). The recorder is connected AFTER player setup to avoid conference bridge disruption and reconnected on every `onCallMediaState`. Local + remote audio mixed into one mono WAV. Toggling `recording_enabled` mid-call via `update_phone` opens/closes distinct WAV segments — each with its own sidecar — so a single call can emit several recordings if the operator wants finer-grained capture.
+- **Recording** — per-phone `recording_enabled` flag (default off — opt in per phone). When on, writes to `/recordings/<phone_id>/call_<call_id>_<ts>_<us>.wav` plus a `.meta.json` sidecar with call context and the paired pcap path (when a capture is running for the phone). The recorder is connected AFTER player setup to avoid conference bridge disruption and reconnected on every `onCallMediaState`. Local + remote audio mixed into one mono WAV. Toggling `recording_enabled` mid-call via `update_phone` opens/closes distinct WAV segments — each with its own sidecar — so a single call can emit several recordings if the operator wants finer-grained capture.
 - **Auto-capture** — per-phone `capture_enabled` flag (default off). Opens a dedicated `tcpdump -i any udp` subprocess on the first audio-active call and closes it on the last disconnect. Filter stays broad so re-INVITE RTP port changes don't drop packets; split SIP and RTP with `tshark -Y` after the fact. Start/stop requests come from pj callback threads; actual subprocess launches run on the asyncio poll loop via a deque-based pending queue (same pattern as `process_auto_answers`). Conference (2+ calls on one phone) shares a single pcap, counted via `_active_calls_by_phone`.
 - **Re-INVITE** — audio player is reconnected to the new `aud_med` port after re-INVITE (codec change, conference conversion) so TX keeps flowing.
 - **Dynamic tool registration** — `tools_changed=True` capability enabled via `create_initialization_options` monkey-patch; `ctx.session.send_tool_list_changed()` fires after each phone add/drop (once per batch for `load_phone_profile`).

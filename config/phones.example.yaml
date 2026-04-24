@@ -10,16 +10,16 @@
 # This file is the canonical template; get_phone_profile_example() returns
 # the same content over MCP for callers who don't have filesystem access.
 #
-# Recording is always on. Every call lands in /recordings/<phone_id>/
-# as call_<call_id>_<ts>.wav along with a .meta.json sidecar containing
-# codec, duration, remote URI, direction, and (if a capture is running)
-# the paired pcap path. To "disable" recording, just skip the
-# ./recordings bind-mount on docker run and files go to ephemeral
-# container FS.
+# Recording AND auto-capture both default to OFF. Opt in per phone:
 #
-# Auto-capture (tcpdump per call) is OFF by default. Opt in per phone
-# with `capture_enabled: true` — pcaps land in /captures/<phone_id>/
-# with the same basename as the recording.
+#   recording_enabled: true   → /recordings/<phone_id>/call_<id>_<ts>.wav
+#                               plus a .meta.json sidecar (codec, duration,
+#                               remote URI, direction, paired pcap path).
+#   capture_enabled: true     → /captures/<phone_id>/call_<id>_<ts>.pcap
+#                               (tcpdump per call; broad udp BPF filter).
+#
+# When both are on, the WAV and pcap share a basename so they pair up
+# on disk without any timestamp matching.
 
 # Keys under `defaults` are merged into every phone entry.
 # Phone-level keys win over defaults.
@@ -31,15 +31,16 @@ defaults:
   auto_answer: false
   register: true
   srtp: false
-  # recording_enabled: true    # default — flip to false to suppress
-                               # recording for every phone by default
+  # recording_enabled: false   # default — flip to true to record every
+                               # call on every phone by default
   # capture_enabled: false     # default — flip to true to auto-run
                                # tcpdump on every call
 
 phones:
   - phone_id: a
     username: "1001"
-    capture_enabled: true      # auto-capture only phone a
+    recording_enabled: true    # per-phone override — only 'a' records
+    capture_enabled: true      # per-phone override — only 'a' captures
 
   - phone_id: b
     username: "1002"
@@ -48,7 +49,7 @@ phones:
   - phone_id: c
     username: "1003"
     auto_answer: true
-    # recording_enabled: false  # per-phone override wins over defaults
+    # recording_enabled: true   # per-phone override wins over defaults
     # Per-phone override:
     # password: "c_specific_pw"
     # realm: "example.realm"

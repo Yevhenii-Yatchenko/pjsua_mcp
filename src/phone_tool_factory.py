@@ -226,7 +226,7 @@ def register_phone_tools(
         try:
             info = call_mgr.get_call_info(phone_id=phone_id, call_id=call_id)
             cfg = registry.get_config(phone_id)
-            rec_enabled = cfg.recording_enabled if cfg else True
+            rec_enabled = cfg.recording_enabled if cfg else False
             rec_file = info.get("recording_file")
             if not rec_file:
                 return {
