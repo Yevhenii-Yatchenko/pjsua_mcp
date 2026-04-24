@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import pytest
-import pjsua2 as pj
 
 
 @pytest.fixture(scope="session")
 def pjsua_endpoint():
-    """Session-scoped live PJSUA2 endpoint (no network, null audio)."""
+    """Session-scoped live PJSUA2 endpoint (no network, null audio).
+
+    Lazy import of pjsua2 — lets tests that don't need the endpoint
+    (e.g. scenario_engine unit tests) run in environments without the
+    pjsua2 C extension.
+    """
+    import pjsua2 as pj
+
     ep = pj.Endpoint()
     ep.libCreate()
 

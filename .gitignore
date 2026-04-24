@@ -9,3 +9,4 @@ captures/
 recordings/
 .claude/
 .env
+.venv/
