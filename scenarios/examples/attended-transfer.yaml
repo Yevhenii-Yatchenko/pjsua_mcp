@@ -1,0 +1,34 @@
+name: attended-transfer-example
+description: >
+  Demonstrates attended transfer via inline scenario hooks (no pattern wrapper).
+  A calls B, B answers. After A-B is confirmed, A places A on hold, dials C,
+  waits ~2s for consult, then REFER/Replaces to stitch B directly with C.
+
+phones: [a, b, c]
+
+patterns:
+  - {use: wait-for-registration, phone_id: a}
+  - {use: wait-for-registration, phone_id: b}
+  - {use: wait-for-registration, phone_id: c}
+  - {use: auto-answer, phone_id: b, delay_ms: 200}
+  - {use: auto-answer, phone_id: c, delay_ms: 200}
+  - {use: make-call-and-wait-confirmed, phone_id: a, dest_uri: "sip:6002@asterisk"}
+
+# Inline hooks — orchestrate the transfer directly without a composite pattern.
+hooks:
+  - when: call.state.confirmed
+    on_phone: a
+    once: true
+    then:
+      - wait: 1000ms
+      - hold
+      - make_call: {phone_id: a, to: "sip:6003@asterisk"}
+      - wait: 2500ms
+      - attended_transfer
+
+# Wait until A drops BOTH legs (match on second disconnect — call_id filter
+# would be more robust but is implementation-dependent).
+stop_on:
+  - {phone_id: c, event: call.state.disconnected}
+
+timeout_ms: 20000

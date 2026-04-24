@@ -1,0 +1,38 @@
+name: sip-14744-minimal
+description: >
+  Simplified placeholder for SIP-14744 flow: two parallel callers into a
+  queue-like role played by phone B. Does NOT reproduce the PortaSIP CQ
+  callback logic — that needs a real B2BUA. This scenario proves the engine
+  can orchestrate two parallel outbound calls with deterministic timing,
+  DTMF injection, and parallel hangup. Replace phone B's `auto-answer` with
+  a CQ/AA-aware pattern once those are implemented.
+
+phones: [a, b, caller2]
+
+patterns:
+  # Barriers first — do not proceed until all 3 phones have REGISTERed.
+  - {use: wait-for-registration, phone_id: a, timeout_ms: 5000}
+  - {use: wait-for-registration, phone_id: b, timeout_ms: 5000}
+  - {use: wait-for-registration, phone_id: caller2, timeout_ms: 5000}
+
+  # Phone B plays the "queue" — answers both legs immediately.
+  - {use: auto-answer, phone_id: b, delay_ms: 100}
+
+  # Caller2 (modelling user B from the ticket) calls first and stays in queue.
+  - {use: send-dtmf-on-confirmed, phone_id: caller2, digits: "1", initial_delay_ms: 300}
+  - {use: hangup-after-duration, phone_id: caller2, duration_ms: 20000}
+
+  # Phone A (modelling user A from the ticket) calls second, presses 1 to
+  # enter the same queue. Engineer expects callback / no-callback outcome.
+  - {use: send-dtmf-on-confirmed, phone_id: a, digits: "1", initial_delay_ms: 300}
+  - {use: hangup-after-duration, phone_id: a, duration_ms: 25000}
+
+  # Initial outbound calls — 500ms apart so the queue sees them as sequential.
+  - {use: make-call-and-wait-confirmed, phone_id: caller2, dest_uri: "sip:1002@asterisk", timeout_ms: 10000}
+  - {use: make-call-and-wait-confirmed, phone_id: a, dest_uri: "sip:1002@asterisk", timeout_ms: 10000}
+
+stop_on:
+  - {phone_id: a, event: call.state.disconnected}
+  - {phone_id: caller2, event: call.state.disconnected}
+
+timeout_ms: 45000

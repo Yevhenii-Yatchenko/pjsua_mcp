@@ -1,0 +1,51 @@
+name: conference-example
+description: >
+  Three-way audio bridge on phone A. A calls both B and C in parallel, waits
+  for both legs to reach CONFIRMED, then conferences them via the local
+  pjsua audio-bridge (NOT a SIP-native conference).
+
+phones: [a, b, c]
+
+patterns:
+  - {use: wait-for-registration, phone_id: a}
+  - {use: wait-for-registration, phone_id: b}
+  - {use: wait-for-registration, phone_id: c}
+  - {use: auto-answer, phone_id: b, delay_ms: 100}
+  - {use: auto-answer, phone_id: c, delay_ms: 100}
+
+initial_actions:
+  - {action: make_call, phone_id: a, to: "sip:6002@asterisk"}
+  - {action: make_call, phone_id: a, to: "sip:6003@asterisk"}
+
+hooks:
+  # After both outbound calls have been set up, A's second confirmed fires,
+  # at which point both legs are confirmed and we can bridge.
+  # Simple race-safe approach: wait for 2 confirmed events total via emit/count.
+  - when: call.state.confirmed
+    on_phone: a
+    once: false   # fires twice, but only second triggers the conference
+    then:
+      - emit: {name: conf_leg_ready}
+
+  # When we see 2 conf_leg_ready events, we can bridge.
+  # Simpler: a single fixed-delay hook on the SECOND confirmed.
+  # (MVP: ignore race; just wait 2s after first confirmed.)
+  - when: call.state.confirmed
+    on_phone: a
+    once: true
+    then:
+      - wait: 2500ms
+      - action: conference
+        phone_id: a
+        call_ids: auto    # engine resolves to all active calls on phone a
+      - wait: 5000ms
+      - hangup_all: {phone_id: a}   # tear down all legs on A
+
+stop_on:
+  - {phone_id: a, event: call.state.disconnected}
+
+# NOTE: stop_on catches the first disconnect — since hangup_all drops both
+# legs near-simultaneously, that's fine. A scenario that needs *both* legs
+# down would use stop_on.call_id or count via emit+match.
+
+timeout_ms: 20000

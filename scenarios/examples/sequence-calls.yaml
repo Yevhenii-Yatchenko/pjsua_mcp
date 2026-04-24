@@ -1,0 +1,50 @@
+name: sequence-calls-example
+description: >
+  Place N short calls in sequence from phone A, one after another. Each call
+  auto-hangs-up after per_call_duration. Useful for stress-testing session
+  cleanup / call-history rotation.
+
+  NOTE: this is NOT a race-free sequence — the second make_call fires when
+  the first disconnects, which assumes the disconnect is triggered by our
+  hangup (not peer). Good enough for stress tests.
+
+phones: [a, b]
+
+patterns:
+  - {use: wait-for-registration, phone_id: a}
+  - {use: wait-for-registration, phone_id: b}
+  - {use: auto-answer, phone_id: b, delay_ms: 100}
+
+initial_actions:
+  # Kick off the first call. Subsequent calls are triggered by hook below.
+  - {action: make_call, phone_id: a, to: "sip:6002@asterisk"}
+
+hooks:
+  # Each confirmed → hangup after 2s
+  - when: call.state.confirmed
+    on_phone: a
+    once: false
+    then:
+      - wait: 2000ms
+      - hangup
+
+  # After a disconnects, place next call (simple counter would need state —
+  # for MVP we just chain once or twice manually).
+  - when: call.state.disconnected
+    on_phone: a
+    once: true
+    then:
+      - wait: 500ms
+      - make_call: {phone_id: a, to: "sip:6002@asterisk"}
+
+  # After the SECOND disconnect, stop the scenario via emit.
+  - when: call.state.disconnected
+    on_phone: a
+    once: true
+    then:
+      - emit: {name: sequence_done}
+
+stop_on:
+  - {event: "user.sequence_done"}
+
+timeout_ms: 20000

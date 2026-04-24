@@ -1,0 +1,24 @@
+name: hello-world
+description: >
+  Smoke-test scenario that drives the engine through every MVP pattern:
+  two phones register, A calls B, B auto-answers after 500ms, A sends a
+  single DTMF '1' as soon as the call is confirmed, then A tears down the
+  call 5 seconds later. Expects B's incoming, A's confirmed, DTMF send,
+  and A's clean disconnect.
+
+# Phones are assumed to be already provisioned via add_phone / load_phone_profile.
+# This scenario does NOT provision phones — it only composes patterns against them.
+phones: [a, b]
+
+patterns:
+  - {use: wait-for-registration, phone_id: a, timeout_ms: 5000}
+  - {use: wait-for-registration, phone_id: b, timeout_ms: 5000}
+  - {use: auto-answer, phone_id: b, delay_ms: 500}
+  - {use: send-dtmf-on-confirmed, phone_id: a, digits: "1", initial_delay_ms: 200}
+  - {use: hangup-after-duration, phone_id: a, duration_ms: 5000}
+  - {use: make-call-and-wait-confirmed, phone_id: a, dest_uri: "sip:1002@asterisk", timeout_ms: 10000}
+
+stop_on:
+  - {phone_id: a, event: call.state.disconnected}
+
+timeout_ms: 20000
