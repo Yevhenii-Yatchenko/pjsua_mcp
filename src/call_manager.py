@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import pjsua2 as pj
 
+from .scenario_engine.event_bus import Event, emit_global
 from .sip_engine import SipEngine
 from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 
@@ -89,6 +90,34 @@ class SipCall(pj.Call):
         log.info(
             "[%s] Call %d state: %s (%s) remote=%s",
             self.phone_id, ci.id, ci.stateText, _call_state_name(ci.state), ci.remoteUri,
+        )
+        state_name = _call_state_name(ci.state).lower()
+        emit_global(
+            Event(
+                type=f"call.state.{state_name}",
+                phone_id=self.phone_id,
+                call_id=ci.id,
+                data={
+                    "state": state_name,
+                    "remote_uri": ci.remoteUri,
+                    "last_status": ci.lastStatusCode,
+                    "last_status_text": ci.lastReason,
+                    "direction": self._direction,
+                },
+            )
+        )
+
+    def onDtmfDigit(self, prm: pj.OnDtmfDigitParam) -> None:  # pragma: no cover - hardware event
+        ci = self.getInfo()
+        digit = str(getattr(prm, "digit", "")) or ""
+        log.info("[%s] Call %d DTMF: %s", self.phone_id, ci.id, digit)
+        emit_global(
+            Event(
+                type="dtmf.in",
+                phone_id=self.phone_id,
+                call_id=ci.id,
+                data={"digit": digit, "method": "rfc2833"},
+            )
         )
 
     def onCallMediaState(self, prm: pj.OnCallMediaStateParam) -> None:

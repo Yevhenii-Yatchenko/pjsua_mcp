@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import pjsua2 as pj
 
+from .scenario_engine.event_bus import Event, emit_global
 from .sip_engine import SipEngine
 
 log = logging.getLogger(__name__)
@@ -65,6 +66,25 @@ class SipAccount(pj.Account):
             "[%s] Registration state: active=%s status=%d %s",
             self.phone_id, info.regIsActive, info.regStatus, info.regStatusText,
         )
+        if info.regIsActive:
+            evt_type = "reg.success"
+        elif info.regStatus == 0:
+            evt_type = "reg.started"
+        elif info.regExpiresSec == 0:
+            evt_type = "reg.unregistered"
+        else:
+            evt_type = "reg.failed"
+        emit_global(
+            Event(
+                type=evt_type,
+                phone_id=self.phone_id,
+                data={
+                    "status_code": info.regStatus,
+                    "reason": info.regStatusText,
+                    "expires": info.regExpiresSec,
+                },
+            )
+        )
 
     def onIncomingCall(self, prm: pj.OnIncomingCallParam) -> None:
         log.info("[%s] Incoming call: call_id=%d", self.phone_id, prm.callId)
@@ -83,6 +103,18 @@ class SipAccount(pj.Account):
         with self._lock:
             self._messages.append(msg)
         log.info("[%s] Received MESSAGE from %s: %s", self.phone_id, prm.fromUri, prm.msgBody[:50])
+        emit_global(
+            Event(
+                type="im.received",
+                phone_id=self.phone_id,
+                data={
+                    "from": prm.fromUri,
+                    "to": prm.toUri,
+                    "body": prm.msgBody,
+                    "content_type": prm.contentType,
+                },
+            )
+        )
 
     def get_messages(self, last_n: int | None = None) -> list[dict]:
         with self._lock:
