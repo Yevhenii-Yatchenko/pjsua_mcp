@@ -1,0 +1,47 @@
+# Keep the Docker build context small and credential-free. Anything listed
+# here is excluded from the tarball sent to `docker build` / `docker buildx`
+# — even if it is referenced in Dockerfile COPY directives it stays off the
+# builder, so nothing secret or bulky leaks into image layers.
+
+# VCS
+.git
+.gitignore
+.github
+
+# Local build artifacts
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+
+# Test caches
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.tox
+htmlcov
+coverage.xml
+
+# Runtime data — bind-mounted at container start, not needed at build time
+captures
+recordings
+plans
+
+# Editor / OS cruft
+.vscode
+.idea
+.DS_Store
+*.swp
+
+# Local secrets / configs — live on the host, never baked into the image
+.env
+config/phones.yaml
+
+# Internal ops — not needed in the artifact image
+docker-compose.test.yml
+tests/asterisk
+scripts

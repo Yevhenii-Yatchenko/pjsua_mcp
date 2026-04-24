@@ -417,6 +417,48 @@ The full suite runs in ~2 minutes (~90 tests).
 └──────────────────────────────────────────────────────────┘
 ```
 
+## Publishing to Harbor (or any OCI registry)
+
+This repo ships only the image artifact. Distribution to clients (wrapper scripts, slash-commands, MCP config) belongs to a separate **plugin repo** that references the published image by tag.
+
+### One-time setup
+
+1. Put registry coordinates in `.env` (gitignored; see `.env.example`):
+   ```
+   HARBOR_HOST=harbor.example.corp
+   HARBOR_PROJECT=voip-tools
+   HARBOR_IMAGE=pjsua-mcp
+   ```
+2. Cache credentials once: `docker login "$HARBOR_HOST"` — they live in `~/.docker/config.json`.
+
+### Publish a release (manual)
+
+```bash
+./scripts/publish.sh v0.3.0                   # builds, tags :v0.3.0 + :latest, pushes both
+./scripts/publish.sh v0.3.0-rc1 --no-latest   # pre-release — keep :latest pointing at stable
+./scripts/publish.sh v0.3.0 --platform linux/amd64,linux/arm64  # multi-arch via buildx
+```
+
+The script is read-only until `docker push` runs — safe to dry-run manually. `.dockerignore` keeps the build context small (excludes `captures/`, `recordings/`, `config/phones.yaml`, `.env`, CI files), so nothing secret or bulky gets shipped into image layers.
+
+### How clients consume it
+
+In your plugin-repo's wrapper script:
+
+```bash
+IMAGE="${PJSUA_MCP_IMAGE:-harbor.example.corp/voip-tools/pjsua-mcp:v0.3.0}"
+exec docker run -i --rm \
+  --network host \
+  --cap-add NET_RAW --cap-add NET_ADMIN \
+  --user "$(id -u):$(id -g)" \
+  -v "$CONFIG_DIR:/config:ro" \
+  -v "$DATA_DIR/captures:/captures" \
+  -v "$DATA_DIR/recordings:/recordings" \
+  "$IMAGE"
+```
+
+Pin a **specific semver tag** in the plugin — never `:latest` for production clients — so a breaking image change doesn't silently land on every user's machine.
+
 ## Project Structure
 
 ```
@@ -448,9 +490,13 @@ pjsua_mcp/
 │       ├── pjsip.conf
 │       ├── extensions.conf
 │       └── modules.conf
+├── scripts/
+│   └── publish.sh             # Build + tag + push image to Harbor (manual one-liner)
 ├── Dockerfile                 # Multi-stage: build pjproject + runtime
+├── .dockerignore              # Trim build context (ignore recordings/captures/secrets)
 ├── docker-compose.yml         # Mounts ./config (ro), ./recordings, ./captures
 ├── docker-compose.test.yml    # Asterisk + test runner on sipnet
+├── .env.example               # UID/GID + HARBOR_HOST/HARBOR_PROJECT (copy to .env)
 ├── requirements.txt           # mcp[cli]>=1.27.0, PyYAML, pydantic, pytest
 ├── pyproject.toml
 └── .mcp.json                  # MCP client config for AI assistants
