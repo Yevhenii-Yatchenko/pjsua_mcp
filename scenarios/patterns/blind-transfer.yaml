@@ -1,0 +1,36 @@
+name: blind-transfer
+version: 1.0.0
+description: After a call reaches CONFIRMED and an optional delay, REFER the peer to a new target.
+tags: [transfer, outgoing, single-phone]
+rationale: >
+  Blind transfer (unattended REFER) — UA-in-middle drops out after sending
+  REFER; the two remaining parties negotiate a new leg. Delay allows a brief
+  conversation period before the transfer to make the scenario realistic.
+params:
+  phone_id: {type: string, required: true, pattern: "^[a-z0-9_]{1,32}$"}
+  transfer_to: {type: string, required: true, pattern: "^sips?:.+@.+"}
+  after_ms: {type: integer, default: 2000, minimum: 0, maximum: 60000}
+examples:
+  - use: blind-transfer
+    phone_id: b
+    transfer_to: "sip:1003@asterisk"
+    after_ms: 2000
+failure_modes:
+  - transfer_to unreachable — REFER returns 404/408/503
+  - call.state.confirmed never fires — transfer never scheduled
+---
+hooks:
+  - when: call.state.confirmed
+    on_phone: "{{ phone_id }}"
+    once: true
+    then:
+      {% if after_ms > 0 %}
+      - wait: "{{ after_ms }}ms"
+      {% endif %}
+      - blind_transfer: {to: "{{ transfer_to }}"}
+expected_timeline:
+  - event: call.state.confirmed
+    phone_id: "{{ phone_id }}"
+  - action: blind_transfer
+    to: "{{ transfer_to }}"
+    after_ms: "{{ after_ms }}"

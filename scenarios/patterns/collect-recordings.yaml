@@ -1,0 +1,28 @@
+name: collect-recordings
+version: 1.0.0
+description: On scenario.stopped, log the recording paths for each phone as a post-mortem artefact.
+tags: [teardown, coordinator]
+rationale: >
+  Leaves a clear trail in the timeline so CI / log parsers can locate the
+  WAV files produced by the run without re-scanning /recordings.
+params:
+  phone_ids:
+    type: array
+    required: true
+    items: {type: string, pattern: "^[a-z0-9_]{1,32}$"}
+examples:
+  - use: collect-recordings
+    phone_ids: [a, b]
+---
+hooks:
+  - when: scenario.stopped
+    once: true
+    then:
+      {% for pid in phone_ids %}
+      - log: "collect recordings for phone {{ pid }}"
+      {% endfor %}
+expected_timeline:
+  - event: scenario.stopped
+  {% for pid in phone_ids %}
+  - action: log
+  {% endfor %}

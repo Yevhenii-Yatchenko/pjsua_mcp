@@ -1,0 +1,36 @@
+name: wait-for-registration
+version: 1.0.0
+description: Passes when the target phone publishes reg.success; fails on timeout.
+tags: [setup, registration, single-phone]
+rationale: >
+  Registration is inherently async and must be settled before any call flow.
+  This pattern gates scenario progress on the REGISTER success callback so
+  downstream patterns (make_call etc.) do not fire before the endpoint is
+  ready.
+params:
+  phone_id:
+    type: string
+    required: true
+    pattern: "^[a-z0-9_]{1,32}$"
+  timeout_ms:
+    type: integer
+    default: 5000
+    minimum: 100
+    maximum: 60000
+examples:
+  - use: wait-for-registration
+    phone_id: a
+    timeout_ms: 5000
+failure_modes:
+  - reg.failed (status_code 4xx/5xx)
+  - scenario.timeout (no reg.success within timeout_ms)
+---
+hooks:
+  - when: reg.failed
+    on_phone: "{{ phone_id }}"
+    then:
+      - log: "phone {{ phone_id }} REGISTER failed"
+expected_timeline:
+  - event: reg.success
+    phone_id: "{{ phone_id }}"
+    within_ms: "{{ timeout_ms }}"

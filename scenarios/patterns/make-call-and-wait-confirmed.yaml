@@ -1,0 +1,46 @@
+name: make-call-and-wait-confirmed
+version: 1.0.0
+description: Place a call from phone_id to dest_uri as an initial scenario action.
+tags: [outgoing, basic, single-phone]
+rationale: >
+  Most scenarios begin with a single outbound call. This pattern packages that
+  call-initiation as a scenario-level initial_action so the caller does not
+  need to repeat make_call + argument plumbing across multiple scenarios.
+params:
+  phone_id:
+    type: string
+    required: true
+    pattern: "^[a-z0-9_]{1,32}$"
+  dest_uri:
+    type: string
+    required: true
+    pattern: "^sips?:.+@.+"
+  timeout_ms:
+    type: integer
+    default: 10000
+    minimum: 500
+    maximum: 60000
+examples:
+  - use: make-call-and-wait-confirmed
+    phone_id: a
+    dest_uri: "sip:1002@asterisk"
+    timeout_ms: 10000
+failure_modes:
+  - call.state.disconnected with non-200 status (486, 480, 503, ...)
+  - no response at all (network issue, callee offline)
+---
+initial_actions:
+  - action: make_call
+    phone_id: "{{ phone_id }}"
+    dest_uri: "{{ dest_uri }}"
+hooks: []
+expected_timeline:
+  - action: make_call
+    phone_id: "{{ phone_id }}"
+    dest_uri: "{{ dest_uri }}"
+  - event: call.state.calling
+    phone_id: "{{ phone_id }}"
+    within_ms: 1000
+  - event: call.state.confirmed
+    phone_id: "{{ phone_id }}"
+    within_ms: "{{ timeout_ms }}"

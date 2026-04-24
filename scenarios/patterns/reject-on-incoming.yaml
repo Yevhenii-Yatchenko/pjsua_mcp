@@ -1,0 +1,26 @@
+name: reject-on-incoming
+version: 1.0.0
+description: Automatically reject incoming calls on phone_id with a specific status code.
+tags: [incoming, basic, single-phone]
+rationale: >
+  Used for "busy subscriber" / "do-not-disturb" tests; also handy to prove
+  the rejected-call path emits expected 4xx/5xx toward the caller.
+params:
+  phone_id: {type: string, required: true, pattern: "^[a-z0-9_]{1,32}$"}
+  status_code: {type: integer, default: 486, enum: [486, 480, 603, 403]}
+examples:
+  - use: reject-on-incoming
+    phone_id: b
+    status_code: 486
+---
+hooks:
+  - when: call.state.incoming
+    on_phone: "{{ phone_id }}"
+    once: false
+    then:
+      - reject: {code: {{ status_code }}}
+expected_timeline:
+  - event: call.state.incoming
+    phone_id: "{{ phone_id }}"
+  - action: reject
+    status_code: "{{ status_code }}"

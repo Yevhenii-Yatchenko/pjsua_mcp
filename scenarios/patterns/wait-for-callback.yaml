@@ -1,0 +1,33 @@
+name: wait-for-callback
+version: 1.0.0
+description: After initial outbound call, listen for an incoming call on the same phone (B2BUA callback flow).
+tags: [callback, incoming, single-phone, race-prone]
+rationale: >
+  SIP-14744-style flows: the user dials a queue, gets offered a callback,
+  confirms, and PS calls them back. The callee side of that callback lands
+  as a fresh incoming INVITE on the original phone.
+params:
+  phone_id: {type: string, required: true, pattern: "^[a-z0-9_]{1,32}$"}
+  timeout_ms: {type: integer, default: 30000, minimum: 1000, maximum: 300000}
+  auto_answer: {type: boolean, default: true}
+examples:
+  - use: wait-for-callback
+    phone_id: a
+    timeout_ms: 30000
+failure_modes:
+  - no callback within timeout_ms — indicates B2BUA failed to trigger
+  - callback arrives but with wrong Call-ID / remote URI
+---
+hooks:
+  - when: call.state.incoming
+    on_phone: "{{ phone_id }}"
+    once: true
+    then:
+      - log: "callback received on {{ phone_id }}"
+      {% if auto_answer %}
+      - answer
+      {% endif %}
+expected_timeline:
+  - event: call.state.incoming
+    phone_id: "{{ phone_id }}"
+    within_ms: "{{ timeout_ms }}"
