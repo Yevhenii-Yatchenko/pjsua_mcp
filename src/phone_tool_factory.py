@@ -225,17 +225,28 @@ def register_phone_tools(
     async def get_recording(call_id: int | None = None) -> dict[str, Any]:
         try:
             info = call_mgr.get_call_info(phone_id=phone_id, call_id=call_id)
+            cfg = registry.get_config(phone_id)
+            rec_enabled = cfg.recording_enabled if cfg else True
             rec_file = info.get("recording_file")
             if not rec_file:
-                return {"status": "error", "error": "No recording available for this call",
-                        "phone_id": phone_id}
+                return {
+                    "status": "error",
+                    "error": "No recording currently active for this call",
+                    "phone_id": phone_id,
+                    "recording_enabled": rec_enabled,
+                }
             path = Path(rec_file)
             if not path.exists():
-                return {"status": "error", "error": f"Recording file not found: {rec_file}",
-                        "phone_id": phone_id}
+                return {
+                    "status": "error",
+                    "error": f"Recording file not found: {rec_file}",
+                    "phone_id": phone_id,
+                    "recording_enabled": rec_enabled,
+                }
             meta_path = path.with_suffix(".meta.json")
             return {
                 "phone_id": phone_id,
+                "recording_enabled": rec_enabled,
                 "recording_file": rec_file,
                 "filename": path.name,
                 "file_size": path.stat().st_size,
@@ -244,7 +255,11 @@ def register_phone_tools(
         except Exception as e:
             return _error_response("get_recording", phone_id, e)
 
-    _add(get_recording, "get_recording", f"Get WAV recording file for a call on phone {phone_id!r}.")
+    _add(get_recording, "get_recording",
+         f"Get the LATEST active WAV for a call on phone {phone_id!r}. "
+         f"A single call can have multiple WAVs when recording_enabled "
+         f"toggles mid-call — use `list_recordings(phone_id=..., call_id=...)` "
+         f"to see every segment.")
 
     # ------------------------------------------------------------------
     # Messaging

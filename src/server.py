@@ -74,6 +74,8 @@ defaults:
   auto_answer: false
   register: true
   srtp: false
+  # recording_enabled: true    # default — set false to suppress recording
+                               # for every phone that doesn't override it
 
 phones:
   - phone_id: a
@@ -86,6 +88,7 @@ phones:
   - phone_id: c
     username: "1003"
     auto_answer: true
+    # recording_enabled: false  # per-phone override wins over defaults
     # Per-phone override:
     # password: "c_specific_pw"
     # realm: "example.realm"
@@ -192,6 +195,7 @@ def _add_phone_impl(
     local_port: int = 0,
     codecs: list[str] | None = None,
     register: bool = True,
+    recording_enabled: bool = True,
 ) -> dict[str, Any]:
     """Common add-phone routine — no client notification, no async."""
     assert registry is not None and engine is not None
@@ -219,6 +223,7 @@ def _add_phone_impl(
         local_port=local_port,
         codecs=codecs,
         register=register,
+        recording_enabled=recording_enabled,
     )
 
     tool_names = register_phone_tools(mcp, phone_id, call_mgr, registry)
@@ -233,6 +238,7 @@ def _add_phone_impl(
         "auto_answer": auto_answer,
         "transport": transport,
         "transport_id": cfg.transport_id if cfg else None,
+        "recording_enabled": cfg.recording_enabled if cfg else recording_enabled,
         "tools_registered": len(tool_names),
         **reg,
     }
@@ -292,6 +298,7 @@ async def add_phone(
     srtp: bool = False,
     realm: str | None = None,
     register: bool = True,
+    recording_enabled: bool = True,
 ) -> dict[str, Any]:
     """Add a new phone (SIP account) and register its per-phone action tools.
 
@@ -299,10 +306,11 @@ async def add_phone(
     `<phone_id>_hangup`, etc. become visible via
     `notifications/tools/list_changed`.
 
-    Recording is always on: every call on this phone is written to
+    Recording defaults to on: every call on this phone is written to
     `/recordings/<phone_id>/call_<call_id>_<ts>.wav` (with a `.meta.json`
-    sidecar alongside). Mount that directory on the host if you want the
-    files to persist across container restarts.
+    sidecar alongside). Pass `recording_enabled=False` to suppress
+    recording for this phone, or flip it at runtime via
+    `update_phone(phone_id=..., recording_enabled=...)`.
     """
     try:
         result = _add_phone_impl(
@@ -311,6 +319,7 @@ async def add_phone(
             realm=realm, srtp=srtp, auto_answer=auto_answer,
             transport=transport, local_port=local_port,
             codecs=codecs, register=register,
+            recording_enabled=recording_enabled,
         )
         await asyncio.sleep(1.0)  # give REGISTER a moment
         result.update(registry.get_registration_info(phone_id))
@@ -357,6 +366,7 @@ async def get_phone(phone_id: str) -> dict[str, Any]:
             "local_port": cfg.local_port,
             "transport_id": cfg.transport_id,
             "codecs": cfg.codecs,
+            "recording_enabled": cfg.recording_enabled,
             "active_calls": active_calls,
             "tools": _phone_tools.get(phone_id, []),
             **reg,
@@ -374,25 +384,35 @@ async def update_phone(
     password: str | None = None,
     realm: str | None = None,
     srtp: bool | None = None,
+    recording_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Mutate runtime-parameters of an existing phone.
 
     auto_answer — instantaneous.
     codecs — endpoint-wide priorities (affects all phones).
+    recording_enabled — instantaneous; flips recording on/off on every
+      currently active call of this phone. off→on starts a new WAV (with
+      a new microsecond-unique filename); on→off closes the current WAV
+      and writes its `.meta.json` sidecar. A call can cycle through
+      on→off→on→... any number of times before DISCONNECTED.
     password / realm / srtp — force a fresh REGISTER cycle.
     """
-    assert registry is not None and engine is not None
+    assert registry is not None and engine is not None and call_mgr is not None
     try:
         cfg = registry.get_config(phone_id)
         if cfg is None:
             return {"status": "error", "error": f"Phone {phone_id!r} not registered"}
 
         reregister_needed = False
+        affected_call_ids: list[int] | None = None
         if auto_answer is not None:
             cfg.auto_answer = auto_answer
         if codecs is not None:
             engine.set_codecs(codecs)
             cfg.codecs = codecs
+        if recording_enabled is not None:
+            cfg.recording_enabled = recording_enabled
+            affected_call_ids = call_mgr.set_recording_enabled(phone_id, recording_enabled)
         if password is not None:
             cfg.password = password
             reregister_needed = True
@@ -407,9 +427,16 @@ async def update_phone(
             registry.reregister_phone(phone_id)
             await asyncio.sleep(1.0)
 
-        return {"status": "ok", "phone_id": phone_id,
-                "reregistered": reregister_needed,
-                **registry.get_registration_info(phone_id)}
+        response: dict[str, Any] = {
+            "status": "ok",
+            "phone_id": phone_id,
+            "reregistered": reregister_needed,
+            "recording_enabled": cfg.recording_enabled,
+            **registry.get_registration_info(phone_id),
+        }
+        if affected_call_ids is not None:
+            response["affected_call_ids"] = affected_call_ids
+        return response
     except Exception as e:
         log.exception("update_phone failed")
         return {"status": "error", "error": str(e), "phone_id": phone_id}
@@ -418,6 +445,7 @@ async def update_phone(
 _PHONE_FIELDS = {
     "phone_id", "domain", "username", "password", "realm", "srtp",
     "auto_answer", "transport", "local_port", "codecs", "register",
+    "recording_enabled",
 }
 
 # Keys we used to accept but no longer do. If they appear in the profile,

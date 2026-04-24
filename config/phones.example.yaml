@@ -27,6 +27,8 @@ defaults:
   auto_answer: false
   register: true
   srtp: false
+  # recording_enabled: true    # default — flip to false to suppress
+                               # recording for every phone by default
 
 phones:
   - phone_id: a
@@ -39,6 +41,7 @@ phones:
   - phone_id: c
     username: "1003"
     auto_answer: true
+    # recording_enabled: false  # per-phone override wins over defaults
     # Per-phone override:
     # password: "c_specific_pw"
     # realm: "example.realm"

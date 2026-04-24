@@ -34,6 +34,7 @@ class SipCall(pj.Call):
         phone_id: str = DEFAULT_PHONE_ID,
         direction: str = "outbound",
         pcap_mgr: "PcapManager | None" = None,
+        recording_enabled: bool = True,
     ) -> None:
         super().__init__(account, call_id)
         self.phone_id = phone_id
@@ -43,7 +44,10 @@ class SipCall(pj.Call):
         self._recorder: pj.AudioMediaRecorder | None = None
         self._recording_file: str | None = None
         self._recording_started_at: str | None = None
-        self._meta_written = False
+        self._recording_enabled = recording_enabled
+        # Toggle flipped to on while media isn't ready yet — start as soon
+        # as onCallMediaState provides an aud_med.
+        self._pending_start = False
         self._player: pj.AudioMediaPlayer | None = None
         self._player_file: str | None = None
         self._aud_med: pj.AudioMedia | None = None  # cached for play/stop
@@ -110,7 +114,7 @@ class SipCall(pj.Call):
                 # player.startTransmit(aud_med) can disrupt existing
                 # connections on the conference bridge, so recorder must
                 # be connected last and reconnected on every media state change.
-                self._ensure_recording(ci.id, aud_med)
+                self._reconnect_recorder(ci.id, aud_med)
 
                 # Try to get codec info
                 try:
@@ -122,83 +126,127 @@ class SipCall(pj.Call):
         log.info("[%s] Call %d media state updated", self.phone_id, ci.id)
 
     # --- Recording ---
+    #
+    # State machine (guarded by self._recording_enabled):
+    #   idle     → _recorder is None, _pending_start=False
+    #   pending  → toggle asked for recording but media not yet active
+    #   active   → _recorder is not None, _recording_file set
+    #
+    # _start_recording creates a fresh recorder with a microsecond-precision
+    # filename, so off→on toggles during one call produce distinct WAVs.
+    # _stop_recording writes the sidecar meta for the just-closed segment
+    # and resets state back to idle — a later _start_recording writes a new
+    # meta alongside the new WAV.
 
-    def _ensure_recording(self, call_id: int, aud_med: pj.AudioMedia) -> None:
-        """Create recorder once, (re)connect it to aud_med every time.
+    def _start_recording(self, call_id: int, aud_med: pj.AudioMedia | None) -> None:
+        """Start a new recording segment. Idempotent — returns early if already active."""
+        if not self._recording_enabled:
+            return
+        if self._recorder is not None:
+            return  # already recording
+        if aud_med is None:
+            # Media not active yet — flip pending and let _reconnect_recorder
+            # finish the job when onCallMediaState fires.
+            self._pending_start = True
+            return
 
-        Writes to `/recordings/<phone_id>/call_<call_id>_<ts>.wav`. If the
-        recordings root is missing or not writable (e.g. container launched
-        without the volume mount), this becomes a no-op — the call still
-        works, just nothing gets written.
-
-        Must be called AFTER the player is set up — player.startTransmit()
-        can disrupt existing conference bridge connections.
-        """
-        # Create recorder file once per call
-        if self._recorder is None:
+        try:
+            recordings_path = RECORDINGS_ROOT / self.phone_id
             try:
-                recordings_path = RECORDINGS_ROOT / self.phone_id
-                try:
-                    recordings_path.mkdir(parents=True, exist_ok=True)
-                except Exception as e:
-                    # Missing / read-only root — recording silently off.
-                    log.info(
-                        "[%s] Recording skipped: %s not writable (%s)",
-                        self.phone_id, recordings_path, e,
-                    )
-                    return
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"call_{call_id}_{timestamp}.wav"
-                filepath = recordings_path / filename
-
-                recorder = pj.AudioMediaRecorder()
-                recorder.createRecorder(str(filepath))
-                self._recorder = recorder
-                self._recording_file = str(filepath)
-                self._recording_started_at = datetime.now(timezone.utc).isoformat()
-                with self._lock:
-                    self._info["recording_file"] = str(filepath)
-                log.info("[%s] Created recorder for call %d: %s", self.phone_id, call_id, filepath)
-            except Exception:
-                log.exception("Failed to create recorder for call %d", call_id)
+                recordings_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                log.info(
+                    "[%s] Recording skipped: %s not writable (%s)",
+                    self.phone_id, recordings_path, e,
+                )
                 return
+            # Microsecond suffix so rapid off→on→off→on cycles never collide.
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"call_{call_id}_{timestamp}.wav"
+            filepath = recordings_path / filename
 
-        # (Re)connect: remote audio → recorder
+            recorder = pj.AudioMediaRecorder()
+            recorder.createRecorder(str(filepath))
+            self._recorder = recorder
+            self._recording_file = str(filepath)
+            self._recording_started_at = datetime.now(timezone.utc).isoformat()
+            self._pending_start = False
+            with self._lock:
+                self._info["recording_file"] = str(filepath)
+            log.info("[%s] Created recorder for call %d: %s", self.phone_id, call_id, filepath)
+        except Exception:
+            log.exception("Failed to create recorder for call %d", call_id)
+            return
+
         try:
             aud_med.startTransmit(self._recorder)
         except Exception:
-            log.exception("Failed to connect recorder for call %d", call_id)
+            log.exception("Failed to connect remote audio to recorder for call %d", call_id)
 
-        # Also connect local audio (player/MOH) → recorder for full mix
         if self._player is not None:
             try:
                 self._player.startTransmit(self._recorder)
             except Exception:
                 log.exception("Failed to connect player to recorder for call %d", call_id)
 
+    def _reconnect_recorder(self, call_id: int, aud_med: pj.AudioMedia) -> None:
+        """Rewire recorder to a (re-)activated aud_med port.
+
+        Called from onCallMediaState. If recording isn't enabled this is a
+        no-op. If a toggle-on arrived before media was ready, this is where
+        the deferred start finally happens.
+        """
+        if not self._recording_enabled:
+            return
+        if self._pending_start or self._recorder is None:
+            self._start_recording(call_id, aud_med)
+            return
+        # Recorder exists — re-INVITE or media-state refresh hands us a new
+        # aud_med port, so reconnect remote + local audio to the recorder.
+        try:
+            aud_med.startTransmit(self._recorder)
+        except Exception:
+            log.exception("Failed to reconnect recorder for call %d", call_id)
+        if self._player is not None:
+            try:
+                self._player.startTransmit(self._recorder)
+            except Exception:
+                log.exception("Failed to reconnect player to recorder for call %d", call_id)
+
     def _stop_recording(self) -> None:
-        """Stop recording and write sidecar meta (called on DISCONNECTED)."""
-        if self._recorder is not None:
-            log.info("[%s] Stopping recording: %s", self.phone_id, self._recording_file)
-            self._recorder = None
+        """Close the current recording segment and write its meta sidecar.
+
+        Idempotent — if no recorder is active, does nothing. Leaves the
+        call in a state ready for another _start_recording if the toggle
+        flips back on before DISCONNECTED.
+        """
+        if self._recorder is None:
+            self._pending_start = False
+            return
+        log.info("[%s] Stopping recording: %s", self.phone_id, self._recording_file)
         self._write_meta_sidecar()
+        self._recorder = None
+        self._recording_file = None
+        self._recording_started_at = None
+        self._pending_start = False
+        with self._lock:
+            self._info["recording_file"] = None
 
     def _write_meta_sidecar(self) -> None:
-        """Write `<recording>.meta.json` with call context. Idempotent per call."""
-        if self._meta_written or not self._recording_file:
+        """Write `<recording>.meta.json` for the currently active segment."""
+        if not self._recording_file:
             return
         try:
             rec_path = Path(self._recording_file)
             meta_path = rec_path.with_suffix(".meta.json")
             with self._lock:
                 info = dict(self._info)
-            # Try to grab call_id from pjsua; fall back to filename parse.
             try:
                 ci = self.getInfo()
                 call_id: int | None = ci.id
             except Exception:
                 call_id = None
-                stem = rec_path.stem  # "call_<id>_<date>_<time>"
+                stem = rec_path.stem  # "call_<id>_<date>_<time>_<us>"
                 parts = stem.split("_")
                 if len(parts) >= 2:
                     try:
@@ -226,7 +274,6 @@ class SipCall(pj.Call):
                 "pcap": pcap_path,
             }
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            self._meta_written = True
             log.info("[%s] Wrote recording meta: %s", self.phone_id, meta_path)
         except Exception:
             log.exception("Failed to write recording meta for %s", self._recording_file)
@@ -393,18 +440,21 @@ class CallManager:
         if acc is None:
             log.warning("[%s] Incoming call %d for unknown phone", phone_id, call_id)
             return
+        cfg = self._registry.get_config(phone_id)
+        recording_enabled = cfg.recording_enabled if cfg else True
         call = SipCall(
             acc, call_id,
             phone_id=phone_id,
             direction="inbound",
             pcap_mgr=self._pcap_mgr,
+            recording_enabled=recording_enabled,
         )
         call.on_disconnected_cb = self._on_call_disconnected
         with self._lock:
             self._calls[call_id] = call
             self._call_phone[call_id] = phone_id
             self._incoming_queue.setdefault(phone_id, []).append(call_id)
-            if self._registry.get_config(phone_id) and self._registry.get_config(phone_id).auto_answer:
+            if cfg and cfg.auto_answer:
                 self._auto_answer_pending.setdefault(phone_id, []).append(call_id)
         log.info("[%s] Incoming call %d queued", phone_id, call_id)
 
@@ -469,12 +519,15 @@ class CallManager:
         pid = self._resolve_phone(phone_id)
         self._ensure_incoming_handler(pid)
         acc = self._registry.require_account(pid)
+        cfg = self._registry.get_config(pid)
+        recording_enabled = cfg.recording_enabled if cfg else True
 
         call = SipCall(
             acc,
             phone_id=pid,
             direction="outbound",
             pcap_mgr=self._pcap_mgr,
+            recording_enabled=recording_enabled,
         )
         call.on_disconnected_cb = self._on_call_disconnected
         prm = pj.CallOpParam(True)  # True = use default call settings
@@ -728,6 +781,36 @@ class CallManager:
         prm = pj.CallOpParam()
         prm.flag = pj.PJSUA_CALL_UNHOLD
         call.reinvite(prm)
+
+    def set_recording_enabled(self, phone_id: str, enabled: bool) -> list[int]:
+        """Flip recording on/off for every active call on `phone_id`.
+
+        On (off→on): starts a fresh recorder with a new microsecond-unique
+        filename for each active call — or marks the call pending if media
+        isn't active yet (then onCallMediaState picks it up).
+
+        Off (on→off): closes the active recorder and writes its meta sidecar.
+        A subsequent on→off→on produces a second distinct WAV + meta pair.
+
+        Returns the list of call_ids that were touched.
+        """
+        with self._lock:
+            calls = [
+                (cid, c) for cid, c in self._calls.items()
+                if self._call_phone.get(cid) == phone_id
+            ]
+        affected: list[int] = []
+        for cid, call in calls:
+            call._recording_enabled = enabled
+            if enabled:
+                if call._aud_med is not None:
+                    call._start_recording(cid, call._aud_med)
+                else:
+                    call._pending_start = True
+            else:
+                call._stop_recording()
+            affected.append(cid)
+        return affected
 
     def _on_call_disconnected(self, info: dict) -> None:
         """Record call to history and remove from active calls."""

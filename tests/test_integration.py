@@ -379,6 +379,181 @@ phones:
         finally:
             flat_file.unlink(missing_ok=True)
 
+    # ------------------------------------------------------------------
+    # recording_enabled toggle — per-phone + runtime + multi-start/stop
+    # ------------------------------------------------------------------
+
+    def test_recording_enabled_default_true(self):
+        """add_phone without the flag should report recording_enabled=True."""
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "rec1",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+        assert result["status"] == "ok"
+        assert result["recording_enabled"] is True
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rec1"}))
+        assert info["recording_enabled"] is True
+
+    def test_recording_enabled_false_in_yaml(self):
+        """Profile with recording_enabled=false surfaces through get_phone."""
+        profile = self.tmp_path / "recoff.yaml"
+        profile.write_text("""
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+  recording_enabled: false
+phones:
+  - {phone_id: rec_off_default, username: u1}
+  - {phone_id: rec_on_override, username: u2, recording_enabled: true}
+""")
+        result = _parse_tool_result(self.client.call_tool(
+            "load_phone_profile", {"path": str(profile)}
+        ))
+        assert result["status"] == "ok"
+
+        off = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rec_off_default"}))
+        assert off["recording_enabled"] is False
+
+        on = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rec_on_override"}))
+        assert on["recording_enabled"] is True
+
+    def test_update_phone_toggles_recording_runtime(self):
+        """update_phone(recording_enabled=...) flips state even without active calls."""
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "rectog",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+        }))
+
+        # Default is True.
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rectog"}))
+        assert info["recording_enabled"] is True
+
+        # Flip to False.
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "rectog", "recording_enabled": False,
+        }))
+        assert result["status"] == "ok"
+        assert result["recording_enabled"] is False
+        assert result["affected_call_ids"] == []  # no active calls
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rectog"}))
+        assert info["recording_enabled"] is False
+
+        # Flip back to True.
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "rectog", "recording_enabled": True,
+        }))
+        assert result["recording_enabled"] is True
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "rectog"}))
+        assert info["recording_enabled"] is True
+
+    def test_legacy_yaml_without_key_loads(self):
+        """Backward-compat: profiles without recording_enabled default to True."""
+        profile = self.tmp_path / "legacy_nokey.yaml"
+        profile.write_text("""
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+phones:
+  - {phone_id: legacy1, username: u1}
+""")
+        result = _parse_tool_result(self.client.call_tool(
+            "load_phone_profile", {"path": str(profile)}
+        ))
+        assert result["status"] == "ok"
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "legacy1"}))
+        assert info["recording_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# Multi-start/stop recording — live call exercise (requires SIP_DOMAIN)
+# ---------------------------------------------------------------------------
+
+@skip_no_domain
+class TestRecordingToggleLive:
+    """Exercise off→on→off→on toggles during a live call.
+
+    Separate fixture from TestRecordingLayout because we need two registered
+    phones to drive an end-to-end audio session.
+    """
+
+    @pytest.fixture(autouse=True)
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B, auto_answer=True)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
+            yield
+
+    def test_multi_start_stop_creates_separate_files(self):
+        """Toggle recording off/on twice mid-call → 3 distinct WAV segments."""
+        from pathlib import Path
+
+        rec_dir = Path("/recordings/a")
+        before = {f.name for f in rec_dir.glob("*.wav")} if rec_dir.exists() else set()
+
+        # Start the call; phone B auto-answers.
+        r = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        assert r["status"] == "ok"
+        call_id = r["call_id"]
+        time.sleep(2.0)  # media active → first WAV starts
+
+        # on → off : close WAV #1
+        _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a", "recording_enabled": False,
+        }))
+        time.sleep(0.4)
+
+        # off → on : open WAV #2
+        _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a", "recording_enabled": True,
+        }))
+        time.sleep(0.4)
+
+        # on → off : close WAV #2
+        _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a", "recording_enabled": False,
+        }))
+        time.sleep(0.4)
+
+        # off → on : open WAV #3
+        _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a", "recording_enabled": True,
+        }))
+        time.sleep(0.4)
+
+        # Hang up → close WAV #3.
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+        time.sleep(1.0)
+
+        after = {f.name for f in rec_dir.glob("*.wav")}
+        new_files = sorted(after - before)
+        assert len(new_files) == 3, f"Expected 3 WAV segments, got {new_files}"
+
+        # All filenames unique (microsecond suffix differs).
+        assert len(set(new_files)) == 3
+
+        # Every WAV has a matching .meta.json sidecar with the call_id.
+        for fname in new_files:
+            meta_path = rec_dir / (Path(fname).stem + ".meta.json")
+            assert meta_path.exists(), f"Missing sidecar for {fname}"
+            meta = json.loads(meta_path.read_text())
+            assert meta["phone_id"] == "a"
+            assert meta["call_id"] == call_id
+            assert meta["recording"].endswith(fname)
+
 
 class TestLoadPhoneProfile:
     """Profile loader — no SIP_DOMAIN needed (all phones use register=False)."""

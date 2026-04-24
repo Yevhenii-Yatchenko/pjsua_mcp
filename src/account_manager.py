@@ -31,6 +31,7 @@ class PhoneConfig:
     local_port: int = 0
     codecs: list[str] | None = None
     transport_id: int | None = None
+    recording_enabled: bool = True
 
 
 class SipAccount(pj.Account):
@@ -129,6 +130,7 @@ class PhoneRegistry:
         local_port: int = 0,
         codecs: list[str] | None = None,
         register: bool = True,
+        recording_enabled: bool = True,
     ) -> SipAccount:
         """Create a transport, a SipAccount, and (optionally) REGISTER.
 
@@ -153,6 +155,7 @@ class PhoneRegistry:
             transport=transport,
             local_port=local_port,
             codecs=codecs,
+            recording_enabled=recording_enabled,
         )
 
         # Per-phone transport
@@ -279,6 +282,7 @@ class PhoneRegistry:
                 "transport": cfg.transport if cfg else "udp",
                 "local_port": cfg.local_port if cfg else 0,
                 "transport_id": cfg.transport_id if cfg else None,
+                "recording_enabled": cfg.recording_enabled if cfg else True,
                 **reg,
             }
             result.append(entry)
@@ -308,6 +312,7 @@ class PhoneRegistry:
             local_port=cfg.local_port,
             codecs=cfg.codecs,
             register=True,
+            recording_enabled=cfg.recording_enabled,
         )
 
     def send_message(
