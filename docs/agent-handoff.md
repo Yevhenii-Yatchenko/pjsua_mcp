@@ -289,3 +289,78 @@ a_get_active_calls()                           # live call state
 get_sip_log(phone_id="a", last_n=20)           # recent SIP trace
 list_recordings(phone_id="a")                  # WAVs produced
 ```
+
+## Part 9 — Stand-specific quirks: PortaSIP (192.168.1.202)
+
+If the test plan is being run against the live PortaSIP stand instead of
+the local Asterisk container (see `docs/agent-integration-plan.md`), be
+aware of the following observed behaviours. They aren't engine bugs —
+they're idiosyncrasies of the production B2BUA, and several test
+assertions need to be relaxed accordingly. Source: real run captured in
+`docs/integration-runs/2026-04-25-1706.md`.
+
+### 9.1 Fork-and-fallback routing + shadow registrations
+
+INVITEs to a PortaSIP extension are forked to **all** registered contacts
+of that account, including stale ones. Symptom: the test phone sees
+`call.state.incoming` briefly, the call vanishes, and A reaches CONFIRMED
+against a different endpoint (often `192.168.1.108:61573` or similar).
+
+- Workaround: provision your `b`/`c` against accounts that have **no
+  shadow registrations** (during the 2026-04-25 run that meant 123003
+  and 123004 instead of the spec's 123001/123002).
+- Mitigation: set `auto_answer=true` on `b` (or use the auto-answer
+  pattern with `delay_ms <= 200`) so your test phone wins the answer
+  race against any stale contact.
+- After ~6 s of no-answer the stand CANCELs the unrejected legs, so a
+  scenario with `timeout_ms < 6000` will appear to "succeed" against the
+  shadow client without you noticing.
+
+### 9.2 `486 Busy Here` does not propagate end-to-end
+
+When `b` rejects an inbound INVITE with 486, PortaSIP **falls back** to
+another endpoint in the routing table (voicemail, hunt-group, etc.) that
+likely answers 200. From A's perspective the call was *answered*, not
+rejected. The reject scenario (Pass C) cannot be validated end-to-end on
+this stand without first disabling the fallback rule on the account.
+
+### 9.3 Wrong-password REGISTER returns `200 Authorization failure`
+
+PortaSIP answers a bad-credentials REGISTER with `SIP/2.0 200
+Authorization failure` (status=200 with a "failure" reason text) instead
+of the standard `401`/`403`. Pjsua reads 200 as success → `is_registered`
+stays `true`, and the engine's `reg.failed` event never fires.
+
+- Implication: tests that drive `reg.failed` via `update_phone(password="wrong")`
+  cannot run against this stand. Skip the row.
+
+### 9.4 B2BUA topology hiding rewrites every Contact
+
+PortaSIP rewrites all `Contact:` headers in dialog responses to point at
+itself (`192.168.1.201:5070` in the 2026-04-25 run). Implications:
+
+- `remote_contact` in `get_call_info()` always shows the proxy address,
+  not the actual peer. Tests that verify "after attended-transfer A's
+  remote_contact flipped to C" do not work — both before and after, A
+  sees the proxy.
+- Use the **timeline** + `get_sip_log` (REFER + Replaces presence) to
+  validate transfers, not Contact-header diffing.
+
+### 9.5 `last_status=603 Decline` for clean BYE
+
+`a_get_call_history()` reports `last_status=603 Decline` on calls that
+ended via a normal `BYE` (peer-initiated or `hangup` action). Internally
+PortaSIP returns 603 in the BYE response instead of 200. This means:
+
+- Any `stop_on.match: {last_status: 200}` assertion will fail to match a
+  cleanly-disconnected call. Use `last_status: "2xx"` only when the
+  status_code class actually reflects success in the SIP semantics, or
+  drop the predicate entirely if you only care that the call disconnected.
+
+### 9.6 No `100 Trying` / `180 Ringing` for some account classes
+
+Certain account classes on the stand collapse `100 Trying → 200 OK` with
+no `180/183` provisional in between, so `call.state.early` is never
+emitted. Treat its absence as expected on this stand; not all flows
+generate it.
+
