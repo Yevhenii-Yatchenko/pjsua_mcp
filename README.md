@@ -4,6 +4,8 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI assistants contr
 
 One MCP server process manages N phones side by side. Each phone gets its own `pj.Account` and its own UDP transport inside a single `pj.Endpoint`. When you add a phone the server registers 22 per-phone action tools (`<phone_id>_make_call`, `<phone_id>_hangup`, …) via `mcp.add_tool()` and fires `notifications/tools/list_changed`; when you drop the phone those tools disappear again.
 
+On top of those atomic tools, the server ships an **event-driven scenario engine** (`src/scenario_engine/`) — an LLM agent describes a multi-step SIP flow once as a YAML scenario, and the engine executes the whole thing inside its own asyncio loop without per-step LLM-turn latency. Scenarios compose atomic **patterns** (14 ship out-of-the-box) or define inline `hooks:` for one-off flows, and return a complete timeline of every event + action for post-mortem inspection. See the **Scenario Engine** section below.
+
 ## Architecture
 
 ```
@@ -17,6 +19,18 @@ One MCP server process manages N phones side by side. Each phone gets its own `p
 ┌──────────────────────────────────────────────────────────────┐
 │  PJSUA MCP Server (one Docker container)                     │
 │                                                              │
+│  ┌───────────────────── scenario engine ─────────────────┐   │
+│  │ EventBus ◄── emit reg.* / call.state.* / dtmf.* / im  │   │
+│  │    ▲           from pjsua callbacks                   │   │
+│  │    │                                                  │   │
+│  │ HookRuntime   PatternLoader    ActionExecutor         │   │
+│  │    │          (Jinja YAML,      (maps 19 actions      │   │
+│  │    │           JSONSchema)       to CallManager etc.) │   │
+│  │    │                                                  │   │
+│  │ Orchestrator ──► run_scenario / validate_scenario /   │   │
+│  │                  list_patterns / get_pattern          │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                       ▼                                      │
 │  ┌────────────┐  ┌───────────────┐  ┌─────────────────────┐  │
 │  │ SipEngine  │  │ PhoneRegistry │  │     CallManager     │  │
 │  │ (Endpoint, │  │  dict[pid]    │  │  dict[call_id],     │  │
@@ -52,7 +66,7 @@ One MCP server process manages N phones side by side. Each phone gets its own `p
 
 ## MCP Tools
 
-### Static (14 — always present)
+### Static (19 — always present)
 
 #### Phone CRUD
 | Tool | Description |
@@ -75,6 +89,15 @@ One MCP server process manages N phones side by side. Each phone gets its own `p
 | `stop_capture` | Stop the running capture |
 | `get_pcap` | Info about the most recent (or named) pcap file |
 | `list_recordings` | Walk `/recordings/` (and legacy flat files) for every WAV; filter by `phone_id` / `call_id` |
+
+#### Scenario engine
+| Tool | Description |
+|------|-------------|
+| `list_patterns` | Discover the 14 atomic patterns. Filter by `tags=["dtmf", …]` or fuzzy `query=` on name+description |
+| `get_pattern` | Full spec for one pattern — metadata, raw Jinja body template, and a rendered example using the pattern's first `examples:` entry |
+| `get_scenario_template` | Ready-to-edit scenario YAML skeleton + structured reference of every event type and action |
+| `validate_scenario` | Static dry-run — catches unknown patterns, bad params, unknown actions, unknown event types, malformed hooks — without touching pjsua |
+| `run_scenario` | Execute a scenario (dict or YAML path), auto-validates first, returns full timeline + status + errors |
 
 ### Per-phone dynamic (22 per active phone)
 
@@ -101,7 +124,7 @@ Registered when `add_phone` (or `load_phone_profile`) brings a phone online; unr
 | `a_register` / `a_unregister` | Fresh REGISTER cycle / de-REGISTER (symmetric pair) |
 | `a_get_registration_status` | Quick reg state for phone a |
 
-Total surface with N phones: 14 + 22·N.
+Total surface with N phones: 19 + 22·N.
 
 ## Quick Start
 
@@ -189,80 +212,266 @@ mcp__pjsua__add_phone(phone_id="alice",
 mcp__pjsua__drop_phone(phone_id="alice")
 ```
 
-## Call Scenarios
+## Call Scenarios — two styles
 
-All examples assume the profile is already loaded (phones `a`, `b`, `c` online). Replace the SIP URIs with your own.
+The server supports two modes for driving calls:
 
-### Basic call: A calls B
+- **Atomic-tool mode** — call per-phone tools directly (`a_make_call`,
+  `b_answer_call`, …) and poll between steps with `time.sleep`. Good for
+  interactive debugging and one-off experiments.
+- **Scenario-engine mode** — describe the whole flow as a YAML scenario and
+  hand it to `run_scenario`. The engine arms hooks against its event bus
+  and drives the flow in one tight asyncio loop, so timings are
+  deterministic and there's no per-step LLM-turn latency. Good for
+  reproducible test cases and ticket reproducers.
+
+The examples below show the engine form (preferred for repeatable work);
+the atomic-tool equivalent is always available as a fallback.
+
+All examples assume the profile is already loaded (`a`, `b`, `c` online).
+Replace URIs with your registrar's.
+
+### Basic call: A → B with DTMF
+
+```yaml
+# scenario
+name: a-to-b-dtmf
+phones: [a, b]
+patterns:
+  - {use: auto-answer, phone_id: b, delay_ms: 500}
+  - {use: send-dtmf-on-confirmed, phone_id: a, digits: "1234"}
+  - {use: hangup-after-duration, phone_id: a, duration_ms: 5000}
+  - {use: make-call-and-wait-confirmed, phone_id: a,
+     dest_uri: "sip:002@sip.example.com"}
+stop_on: [{phone_id: a, event: call.state.disconnected}]
+timeout_ms: 15000
+```
+
+```python
+run_scenario(scenario=<dict above>)
+# Returns: {status: "ok", timeline: [...events + actions with ms offsets...]}
+```
+
+Atomic-tool equivalent:
 
 ```
-a_make_call(dest_uri="sip:002@sip.example.com")      # → call_id=0 on a
+a_make_call(dest_uri="sip:002@sip.example.com")
 # b auto-answers (auto_answer: true in profile)
-a_get_call_info(call_id=0)                            # state, codec, RTP
+a_send_dtmf(call_id=0, digits="1234")
 a_hangup(call_id=0)
-a_get_call_history()                                  # completed call record
 ```
 
 ### Auto-answer (IVR / bot mode)
 
-Set `auto_answer: true` for a phone in the YAML, or toggle at runtime:
-
+Set `auto_answer: true` for a phone in YAML or toggle at runtime:
 ```
 update_phone(phone_id="b", auto_answer=True)
 ```
-
-Incoming calls are answered with 200 OK automatically.
+…or build it into the scenario with the `auto-answer` pattern.
 
 ### Blind transfer: B transfers A → C
 
+```yaml
+name: blind-transfer
+phones: [a, b, c]
+patterns:
+  - {use: auto-answer, phone_id: b, delay_ms: 200}
+  - {use: auto-answer, phone_id: c, delay_ms: 200}
+  - {use: blind-transfer, phone_id: b,
+     transfer_to: "sip:003@sip.example.com", after_ms: 2000}
+  - {use: hangup-after-duration, phone_id: a, duration_ms: 5000}
+  - {use: make-call-and-wait-confirmed, phone_id: a,
+     dest_uri: "sip:002@sip.example.com"}
+stop_on: [{phone_id: c, event: call.state.disconnected}]
+timeout_ms: 12000
 ```
-# A called B, B is in the call:
-b_blind_transfer(dest_uri="sip:003@sip.example.com")
-# B drops; A is now connected to C (auto-answers if configured)
-```
+
+Atomic-tool equivalent: see `b_blind_transfer(dest_uri=...)`.
 
 ### Attended transfer: B holds A, consults C, bridges A ↔ C
 
-```
-b_hold(call_id=0)                                    # put A on hold
-b_make_call(dest_uri="sip:003@sip.example.com")      # consult with C → call_id=1
-b_attended_transfer(call_id=0, dest_call_id=1)       # bridge A↔C, B exits
+The flow has enough steps that it's clearer as **inline scenario hooks**
+than as a composite pattern:
+
+```yaml
+name: attended-transfer
+phones: [a, b, c]
+patterns:
+  - {use: auto-answer, phone_id: b, delay_ms: 200}
+  - {use: auto-answer, phone_id: c, delay_ms: 200}
+  - {use: make-call-and-wait-confirmed, phone_id: a,
+     dest_uri: "sip:002@sip.example.com"}
+hooks:
+  - when: call.state.confirmed
+    on_phone: a
+    once: true
+    then:
+      - wait: 1000ms
+      - hold
+      - make_call: {phone_id: a, to: "sip:003@sip.example.com"}
+      - wait: 2500ms
+      - attended_transfer
+stop_on: [{phone_id: c, event: call.state.disconnected}]
+timeout_ms: 15000
 ```
 
-Both legs must belong to the same phone — cross-phone attended transfer returns an error with a clear message.
+Both legs must belong to the same phone — cross-phone attended transfer
+returns an error with a clear message.
 
 ### 3-way conference
 
-```
-a_make_call(dest_uri="sip:002@sip.example.com")      # → call_id=0 on a
-a_make_call(dest_uri="sip:003@sip.example.com")      # → call_id=1 on a
-a_conference(call_ids=[0, 1])                        # bridge all legs
+```yaml
+name: conference
+phones: [a, b, c]
+patterns:
+  - {use: auto-answer, phone_id: b, delay_ms: 100}
+  - {use: auto-answer, phone_id: c, delay_ms: 100}
+initial_actions:
+  - {action: make_call, phone_id: a, to: "sip:002@sip.example.com"}
+  - {action: make_call, phone_id: a, to: "sip:003@sip.example.com"}
+hooks:
+  - when: call.state.confirmed
+    on_phone: a
+    once: true
+    then:
+      - wait: 2500ms
+      - action: conference
+        phone_id: a
+        call_ids: auto        # engine resolves to all active calls on a
+      - wait: 5000ms
+      - hangup_all: {phone_id: a}
+stop_on: [{phone_id: a, event: call.state.disconnected}]
+timeout_ms: 20000
 ```
 
 ### Codec selection & mid-call change
 
-```
-# Profile: defaults.codecs=[PCMA]  → endpoint-wide priority
-get_codecs()                                         # see current priorities
-a_make_call(dest_uri="sip:002@sip.example.com")
-set_codecs(codecs=["PCMU"], phone_id="a", call_id=0)  # re-INVITE that call
-a_get_call_info(call_id=0)                           # codec changed
+Endpoint priority from YAML profile (`defaults.codecs: [PCMA]`); mid-call
+re-INVITE via the `reinvite-codec-change` pattern:
+
+```yaml
+patterns:
+  - {use: reinvite-codec-change, phone_id: a, new_codec: G722,
+     trigger_at_ms: 3000}
+  - {use: hangup-after-duration, phone_id: a, duration_ms: 5000}
+  - {use: make-call-and-wait-confirmed, phone_id: a,
+     dest_uri: "sip:002@sip.example.com"}
 ```
 
 ### SIP messaging
 
-```
-a_send_message(dest_uri="sip:002@sip.example.com", body="Hello!")
-b_get_messages()                                     # check b's inbox
+```yaml
+initial_actions:
+  - {action: send_message, phone_id: a,
+     to: "sip:002@sip.example.com", body: "Hello!"}
+stop_on: [{event: im.received, phone_id: b}]
+timeout_ms: 2000
 ```
 
-### Monitoring
+### Monitoring (always atomic — read-only introspection)
 
 ```
-list_phones()                                        # reg state + active-call counts
-a_get_active_calls()                                 # a's active calls with RTP
-a_list_calls()                                       # compact summary incl. DISCONNECTED
+list_phones()                # reg state + active-call counts
+a_get_active_calls()         # a's active calls with RTP
+a_list_calls()               # compact summary incl. DISCONNECTED
+get_sip_log(phone_id="a", last_n=30)
 ```
+
+## Scenario Engine
+
+**Goal.** Let an LLM write a multi-step SIP flow once and have it execute
+deterministically. The engine replaces "call tool, wait 2 s, call next
+tool" loops (which burn wall-clock on LLM-turn latency and race against
+real SIP timers) with a YAML flow that runs in one asyncio loop.
+
+### Five tools in a typical workflow
+
+```python
+list_patterns()                              # discover the 14 atomic patterns
+get_pattern(name="auto-answer")              # inspect one — spec + rendered example
+get_scenario_template()                      # grab the YAML skeleton + event/action reference
+validate_scenario(scenario=<dict-or-path>)   # static dry-run (no pjsua touched)
+run_scenario(scenario=<dict-or-path>)        # execute and return the timeline
+```
+
+### Pattern library (14 atomic)
+
+Each pattern wraps one action with an optional delay. Composite flows
+(attended transfer, conferences, IVR navigation) live as **inline `hooks:`**
+in scenarios, not as composite patterns — see `scenarios/examples/`.
+
+| Pattern | Listens to | Dispatches |
+|---|---|---|
+| `wait-for-registration` | `reg.success` / `reg.failed` | — |
+| `auto-answer` | `call.state.incoming` | `answer` |
+| `make-call-and-wait-confirmed` | — (initial action) | `make_call` |
+| `send-dtmf-on-confirmed` | `call.state.confirmed` | `send_dtmf` |
+| `hangup-after-duration` | `call.state.confirmed` | `wait` + `hangup` |
+| `reject-on-incoming` | `call.state.incoming` | `reject` |
+| `blind-transfer` | `call.state.confirmed` | `wait` + `blind_transfer` |
+| `hold-and-resume` | `call.state.confirmed` | `hold` + `unhold` with waits |
+| `wait-for-callback` | `call.state.incoming` | optional `answer` |
+| `respond-to-dtmf` | `dtmf.in` (matched digit) | user action |
+| `fail-fast-on-error` | `call.state.disconnected` (bad code) | `emit` |
+| `play-audio-on-confirmed` | `call.state.confirmed` | `play_audio` |
+| `reinvite-codec-change` | `call.state.confirmed` | `set_codecs` |
+| `collect-recordings` | `scenario.stopped` | `log` per phone |
+
+### Event taxonomy
+
+Hooks listen on:
+- **Call state**: `call.state.{calling,incoming,early,connecting,confirmed,disconnected}`
+- **DTMF**: `dtmf.in`, `dtmf.out`
+- **Registration**: `reg.{started,success,failed,unregistered}`
+- **Messaging**: `im.received`
+- **Scenario lifecycle**: `scenario.{started,stopped}`
+- **User-emitted**: `user.<name>` (from the `emit` action)
+
+### Action vocabulary (19 actions)
+
+- **Call control**: `answer`, `hangup`, `hangup_all`, `reject`, `hold`,
+  `unhold`, `send_dtmf`, `blind_transfer`, `attended_transfer`,
+  `conference`, `make_call`
+- **Media**: `play_audio`, `stop_audio`, `send_message`, `set_codecs`
+- **Flow control**: `wait`, `wait_until`, `emit`, `checkpoint`, `log`
+
+Defaults inherited at dispatch time: `phone_id` from hook's `on_phone` or
+triggering event, `call_id` from the triggering event.
+
+### `stop_on` filters
+
+```yaml
+stop_on:
+  - phone_id: a
+    event: call.state.disconnected
+    call_id: 2                       # specific call-id
+  - event: call.state.disconnected
+    match: {last_status: "4xx"}      # predicate — supports exact, list,
+                                     # "4xx"/"5xx", "~regex"
+```
+
+### Pre-flight validation
+
+`run_scenario` auto-runs `validate_scenario` first. Typos (wrong pattern
+name, wrong action, wrong event prefix, missing required params) return
+`status="error"` in <100 ms — no wall-clock burned on the timeout.
+
+### Bundled example scenarios (`scenarios/examples/`)
+
+- `hello-world.yaml` — A→B, auto-answer, DTMF, hangup
+- `blind-transfer.yaml` — UA-in-middle REFER
+- `attended-transfer.yaml` — hold + consult + REFER/Replaces
+- `conference.yaml` — 2 outbound calls + local audio bridge
+- `ivr-navigation.yaml` — multi-step DTMF menu walk
+- `sequence-calls.yaml` — serial short calls
+- `sip-14744-minimal.yaml` — placeholder reproducer for ticket SIP-14744
+
+### More docs
+
+- `docs/scenarios-guide.md` — concept, inline hooks, `stop_on` filters, when NOT to use scenarios
+- `scenarios/patterns/SCHEMA.md` — formal pattern file format + Jinja context
+- `docs/agent-handoff.md` — runbook for a test-running agent
+- `docs/agent-test-plan.md` — 11-scenario matrix covering every MCP tool
 
 ## Call Info & RTP Statistics
 
@@ -483,7 +692,7 @@ The `tools_changed=True` capability is opt-in in the MCP protocol; the server en
 docker compose run --rm --entrypoint pytest pjsua-mcp tests/ -m "not integration" -v
 ```
 
-Covers SipEngine lifecycle, PhoneRegistry CRUD + two-account isolation, CallManager lookups, PcapManager, SipLogWriter. Fast (~1 s), no network.
+Covers SipEngine lifecycle, PhoneRegistry CRUD + two-account isolation, CallManager lookups, PcapManager, SipLogWriter, plus the full **scenario engine** suite: EventBus pub/sub + threading, PatternRegistry schema validation against all 14 shipped patterns, HookRuntime match semantics, every wired action via MockCallManager, TimelineRecorder offsets, pre-flight validator covering every `scenarios/examples/` YAML. Fast (~7 s, ~210 tests), no network.
 
 ### Integration tests (self-contained)
 
@@ -491,7 +700,7 @@ Covers SipEngine lifecycle, PhoneRegistry CRUD + two-account isolation, CallMana
 docker compose -f docker-compose.test.yml run --build --rm test-runner
 ```
 
-Runs one MCP server subprocess per test class + an Asterisk PBX container on an isolated Docker network (ext 6001/6002/6003). Exercises registration, outbound/inbound calls, blind + attended transfer, conference, codec negotiation, SIP MESSAGE, reject, history, YAML profile loading (replace vs merge), dynamic tool add/remove, cross-phone attended-transfer rejection, per-phone recording layout with paired pcap and `.meta.json` sidecar.
+Runs one MCP server subprocess per test class + an Asterisk PBX container on an isolated Docker network (ext 6001/6002/6003). Exercises registration, outbound/inbound calls, blind + attended transfer, conference, codec negotiation, SIP MESSAGE, reject, history, YAML profile loading (replace vs merge), dynamic tool add/remove, cross-phone attended-transfer rejection, per-phone recording layout with paired pcap and `.meta.json` sidecar. Also includes the scenario-engine integration stub (`tests/scenarios/`) that runs `hello-world.yaml` end-to-end against Asterisk.
 
 The full suite runs in ~2 minutes (~90 tests).
 
@@ -566,42 +775,91 @@ Pin a **specific semver tag** in the plugin — never `:latest` for production c
 ```
 pjsua_mcp/
 ├── src/
-│   ├── server.py              # MCP entry point, 14 static tool definitions, lifespan
-│   ├── sip_engine.py          # Endpoint lifecycle, per-phone transport create/close, codecs
-│   ├── account_manager.py     # PhoneRegistry, PhoneConfig, SipAccount, legacy shims
-│   ├── call_manager.py        # SipCall, per-phone queues, incoming-call routing
-│   ├── phone_tool_factory.py  # 22 closures × N phones; add_tool / remove_tool
-│   ├── sip_logger.py          # Custom LogWriter → bounded deque
-│   └── pcap_manager.py        # tcpdump subprocess management
+│   ├── server.py                    # MCP entry point, 19 static tool definitions, lifespan
+│   ├── sip_engine.py                # Endpoint lifecycle, per-phone transport create/close, codecs
+│   ├── account_manager.py           # PhoneRegistry, PhoneConfig, SipAccount (emits reg.* / im.* events)
+│   ├── call_manager.py              # SipCall, per-phone queues, incoming routing (emits call.state.* / dtmf.in)
+│   ├── phone_tool_factory.py        # 22 closures × N phones; add_tool / remove_tool
+│   ├── sip_logger.py                # Custom LogWriter → bounded deque
+│   ├── pcap_manager.py              # tcpdump subprocess management
+│   └── scenario_engine/             # Event-driven scenario runtime
+│       ├── event_bus.py             # Thread-safe pub/sub; wildcard subscribe; wait_for
+│       ├── pattern_loader.py        # Jinja + JSONSchema; PatternRegistry over scenarios/patterns/
+│       ├── hook_runtime.py          # Arm hooks, match events, dispatch actions
+│       ├── action_executor.py       # 19 actions → CallManager / PhoneRegistry / SipEngine
+│       ├── orchestrator.py          # ScenarioRunner — arms hooks, runs initial_actions, awaits stop_on
+│       ├── timeline.py              # Chronological event+action recorder with ms offsets
+│       ├── validator.py             # Pre-flight static checker (typos, unknown patterns/actions/events)
+│       └── filters.py               # Custom Jinja filters (sip_user, sip_host, ms_to_sec, …)
+├── scenarios/
+│   ├── patterns/                    # 14 atomic reusable patterns + SCHEMA.md
+│   │   ├── SCHEMA.md                # Pattern format spec (two-doc YAML with Jinja body)
+│   │   ├── auto-answer.yaml
+│   │   ├── blind-transfer.yaml
+│   │   ├── collect-recordings.yaml
+│   │   ├── fail-fast-on-error.yaml
+│   │   ├── hangup-after-duration.yaml
+│   │   ├── hold-and-resume.yaml
+│   │   ├── make-call-and-wait-confirmed.yaml
+│   │   ├── play-audio-on-confirmed.yaml
+│   │   ├── reinvite-codec-change.yaml
+│   │   ├── reject-on-incoming.yaml
+│   │   ├── respond-to-dtmf.yaml
+│   │   ├── send-dtmf-on-confirmed.yaml
+│   │   ├── wait-for-callback.yaml
+│   │   └── wait-for-registration.yaml
+│   └── examples/                    # 7 ready-to-run scenario YAMLs
+│       ├── hello-world.yaml
+│       ├── blind-transfer.yaml
+│       ├── attended-transfer.yaml
+│       ├── conference.yaml
+│       ├── ivr-navigation.yaml
+│       ├── sequence-calls.yaml
+│       └── sip-14744-minimal.yaml
+├── docs/
+│   ├── scenarios-guide.md           # Concept, inline hooks, stop_on filters
+│   ├── agent-handoff.md             # Runbook for test-running agent
+│   ├── agent-test-plan.md           # 11-scenario matrix across every MCP tool
+│   └── superpowers/                 # Specs + plans from brainstorming sessions
 ├── config/
-│   ├── phones.example.yaml    # YAML profile template (tracked)
-│   └── .gitignore             # ignores phones.yaml (real credentials stay out of git)
+│   ├── phones.example.yaml          # YAML profile template (tracked)
+│   └── .gitignore                   # ignores phones.yaml (real credentials stay out of git)
 ├── audio/
-│   └── moh.wav                # Default MOH — CC0, FreeSWITCH/MUSOPEN
+│   └── moh.wav                      # Default MOH — CC0, FreeSWITCH/MUSOPEN
 ├── tests/
 │   ├── conftest.py
 │   ├── test_sip_engine.py
 │   ├── test_sip_logger.py
-│   ├── test_account_manager.py     # legacy single-account API kept compatible
-│   ├── test_phone_registry.py      # multi-phone registry + two-account isolation
+│   ├── test_account_manager.py         # legacy single-account API kept compatible
+│   ├── test_phone_registry.py          # multi-phone registry + two-account isolation
 │   ├── test_call_manager.py
 │   ├── test_pcap_manager.py
-│   ├── test_integration.py         # end-to-end against Asterisk
+│   ├── test_integration.py             # end-to-end against Asterisk
+│   ├── scenario_engine/                # 118 unit + symbolic tests for the engine
+│   │   ├── test_event_bus.py
+│   │   ├── test_pattern_loader.py
+│   │   ├── test_hook_runtime.py
+│   │   ├── test_orchestrator.py
+│   │   ├── test_timeline.py
+│   │   ├── test_validator.py
+│   │   └── test_actions_direct.py
+│   ├── scenarios/                      # Integration test — scenario engine vs Asterisk
+│   │   └── test_hello_world_integration.py
 │   └── asterisk/
 │       ├── Dockerfile
 │       ├── pjsip.conf
 │       ├── extensions.conf
 │       └── modules.conf
 ├── scripts/
-│   └── publish.sh             # Build + tag + push image to Harbor (manual one-liner)
-├── Dockerfile                 # Multi-stage: build pjproject + runtime
-├── .dockerignore              # Trim build context (ignore recordings/captures/secrets)
-├── docker-compose.yml         # Mounts ./config (ro), ./recordings, ./captures
-├── docker-compose.test.yml    # Asterisk + test runner on sipnet
-├── .env.example               # UID/GID + HARBOR_HOST/HARBOR_PROJECT (copy to .env)
-├── requirements.txt           # mcp[cli]>=1.27.0, PyYAML, pydantic, pytest
+│   └── publish.sh                   # Build + tag + push image to Harbor (manual one-liner)
+├── Dockerfile                       # Multi-stage: build pjproject + runtime
+├── .dockerignore                    # Trim build context (ignore recordings/captures/secrets)
+├── docker-compose.yml               # Mounts ./config (ro), ./recordings, ./captures
+├── docker-compose.test.yml          # Asterisk + test runner on sipnet
+├── .env.example                     # UID/GID + HARBOR_HOST/HARBOR_PROJECT (copy to .env)
+├── requirements.txt                 # mcp[cli], PyYAML, pydantic, pytest, jinja2, jsonschema
 ├── pyproject.toml
-└── .mcp.json                  # MCP client config for AI assistants
+└── .mcp.json                        # MCP client config for AI assistants
 ```
 
 ## Technical Notes
