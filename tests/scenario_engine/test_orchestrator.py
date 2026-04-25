@@ -48,8 +48,10 @@ class MockCallManager:
         self.bus.emit(Event(type="call.state.disconnected", phone_id=phone_id, call_id=call_id, data={"last_status": status_code}))
 
     def send_dtmf(self, call_id, digits, phone_id=None):
+        # No emit here — symmetric with the real CallManager.send_dtmf,
+        # which also doesn't emit. ActionExecutor._a_send_dtmf is the one
+        # that fires `dtmf.out` after the dial returns.
         self.calls.append(("send_dtmf", {"phone_id": phone_id, "call_id": call_id, "digits": digits}))
-        self.bus.emit(Event(type="dtmf.out", phone_id=phone_id, call_id=call_id, data={"digit": digits}))
 
     def hold(self, call_id, phone_id=None):
         self.calls.append(("hold", {"phone_id": phone_id, "call_id": call_id}))
@@ -80,10 +82,13 @@ class MockCallManager:
 
 
 class MockRegistry:
-    """Minimal PhoneRegistry stub that just records send_message calls."""
+    """Minimal PhoneRegistry stub — records send_message and answers
+    get_registration_info from a writable dict (pre-set by tests that
+    want to drive the synthetic-reg-success replay)."""
 
-    def __init__(self) -> None:
+    def __init__(self, reg_state: dict[str, dict] | None = None) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self._reg_state: dict[str, dict] = reg_state or {}
 
     def send_message(self, dest_uri, body, phone_id=None, content_type="text/plain"):
         self.calls.append(("send_message", {
@@ -91,16 +96,27 @@ class MockRegistry:
             "body": body, "content_type": content_type,
         }))
 
+    def get_registration_info(self, phone_id):
+        return dict(self._reg_state.get(phone_id, {"is_registered": False}))
+
 
 class MockEngine:
-    """Minimal SipEngine stub that records set_codecs calls."""
+    """Minimal SipEngine stub. Records set_codecs and counts thread-registration
+    calls (which ActionExecutor._run_pj makes before every dispatch, see P0 fix
+    commit 5292cf4)."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.thread_registrations: int = 0
 
     def set_codecs(self, codecs):
         self.calls.append(("set_codecs", {"codecs": list(codecs)}))
         return [{"codec": c, "priority": 250 - i} for i, c in enumerate(codecs)]
+
+    def register_current_thread(self) -> None:
+        # Idempotent in production (gated by libIsThreadRegistered).
+        # Tests just count to verify the helper actually runs.
+        self.thread_registrations += 1
 
 
 def _run(coro):
@@ -595,6 +611,71 @@ def test_conference_auto_fills_call_ids() -> None:
         confs = [c for c in cm.calls if c[0] == "conference"]
         assert confs, f"conference not called; got {cm.calls}"
         assert confs[0][1]["call_ids"] == [10, 20]
+
+    _run(inner())
+
+
+def test_synthetic_reg_success_emitted_for_preregistered_phone() -> None:
+    """Phones already registered before run_scenario starts get a synthetic
+    reg.success event so wait-for-registration / similar barriers don't time out."""
+
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        reg = MockRegistry(reg_state={
+            "a": {"is_registered": True, "status_code": 200, "reason": "OK", "expires": 600},
+            "b": {"is_registered": False},
+        })
+        runner = _spin_runner(PATTERNS_DIR, cm, reg, MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="synth-reg-replay",
+            phones=["a", "b"],
+            patterns=[],
+            stop_on=[{"phone_id": "a", "event": "reg.success"}],
+            timeout_ms=500,
+        )
+        result = await runner.run(scenario)
+        # Should stop because synthetic reg.success arrived for `a`.
+        assert result.status == "ok", f"reason={result.reason}"
+        # Verify the synthetic event landed in the timeline marked as such.
+        reg_events = [
+            e for e in result.timeline
+            if e["kind"] == "event" and e["type"] == "reg.success"
+        ]
+        assert reg_events, f"no reg.success in timeline: {result.timeline}"
+        assert reg_events[0]["phone_id"] == "a"
+        assert reg_events[0]["data"].get("synthetic") is True
+        # `b` was not registered → no synthetic emit for it.
+        assert all(e["phone_id"] != "b" for e in reg_events)
+
+    _run(inner())
+
+
+def test_synthetic_reg_replay_skipped_when_registry_is_none() -> None:
+    """ScenarioRunner with `registry=None` (engine-only tests) must not crash."""
+
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        from src.scenario_engine.orchestrator import ScenarioRunner
+        from src.scenario_engine.pattern_loader import PatternRegistry
+        pr = PatternRegistry(PATTERNS_DIR); pr.scan()
+        runner = ScenarioRunner(
+            bus=bus, pattern_registry=pr, call_manager=cm,
+            registry=None, loop=loop,
+        )
+        scenario = Scenario(
+            name="no-registry",
+            phones=["a"],
+            patterns=[],
+            stop_on=[{"phone_id": "a", "event": "user.never_fires"}],
+            timeout_ms=100,
+        )
+        result = await runner.run(scenario)
+        assert result.status == "timeout"
 
     _run(inner())
 

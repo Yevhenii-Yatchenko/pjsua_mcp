@@ -261,6 +261,42 @@ def test_hangup_all_without_phone_id_is_global() -> None:
     _run(inner())
 
 
+def test_send_dtmf_action_emits_dtmf_out_event() -> None:
+    """ActionExecutor._a_send_dtmf must emit `dtmf.out` after dispatch — required
+    for symmetry with `dtmf.in` (which fires from pjsua's onDtmfDigit callback)."""
+
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="dtmf-out-emission",
+            phones=["a"],
+            patterns=[],
+            initial_actions=[
+                {"action": "send_dtmf", "phone_id": "a", "call_id": 7, "digits": "42"},
+            ],
+            stop_on=[{"phone_id": "a", "event": "dtmf.out"}],
+            timeout_ms=500,
+        )
+        t0 = time.monotonic()
+        result = await runner.run(scenario)
+        elapsed = time.monotonic() - t0
+        assert result.status == "ok", f"reason={result.reason}"
+        # Should resolve fast: emit happens immediately after the dispatch.
+        assert elapsed < 0.30, f"dtmf.out emit was slow; elapsed={elapsed}"
+        outs = [e for e in result.timeline if e["type"] == "dtmf.out" and e["kind"] == "event"]
+        assert outs, f"no dtmf.out in timeline: {result.timeline}"
+        assert outs[0]["data"].get("digits") == "42"
+        assert outs[0]["data"].get("method") == "rfc2833"
+        assert outs[0]["call_id"] == 7
+        assert outs[0]["phone_id"] == "a"
+
+    _run(inner())
+
+
 def test_checkpoint_and_log_land_in_timeline() -> None:
     async def inner() -> None:
         loop = asyncio.get_running_loop()

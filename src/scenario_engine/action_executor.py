@@ -215,6 +215,15 @@ class ActionExecutor:
             "send_dtmf", pid, cid, {"digits": str(digits)}, hook.hook_id, hook.pattern_name
         )
         await self._run_pj(lambda: self._cm.send_dtmf(call_id=cid, digits=str(digits), phone_id=pid))
+        # Symmetric with `dtmf.in` (emitted by SipCall.onDtmfDigit). pjsua's
+        # outbound DTMF path has no callback, so the engine fires the event
+        # itself once the dial succeeded.
+        self._bus.emit(Event(
+            type="dtmf.out",
+            phone_id=pid,
+            call_id=cid,
+            data={"digits": str(digits), "method": "rfc2833"},
+        ))
 
     async def _a_blind_transfer(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]

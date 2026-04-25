@@ -242,6 +242,36 @@ class ScenarioRunner:
             sub_id = self._bus.subscribe(ev_type, make_stop_handler(stop_spec))
             stop_sub_ids.append(sub_id)
 
+        # ---- Replay registration state for pre-registered phones ----
+        # `reg.success` fires once at add_phone time. If phones are
+        # provisioned BEFORE run_scenario starts (the common case in our
+        # test stand), patterns hooking on reg.success would silently time
+        # out waiting for an event that already passed. Emit a synthetic
+        # reg.success now so those hooks (and the timeline) see it. The
+        # `synthetic: true` marker keeps this distinguishable from a real
+        # registration cycle in debugging.
+        if self._registry is not None:
+            for pid in scenario.phones:
+                get_info = getattr(self._registry, "get_registration_info", None)
+                if get_info is None:
+                    continue
+                try:
+                    info = get_info(pid)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not info.get("is_registered"):
+                    continue
+                self._bus.emit(Event(
+                    type="reg.success",
+                    phone_id=pid,
+                    data={
+                        "status_code": info.get("status_code", 200),
+                        "reason": info.get("reason", ""),
+                        "expires": info.get("expires", 0),
+                        "synthetic": True,
+                    },
+                ))
+
         # ---- Initial actions ----
         init_actions: list[Any] = list(scenario.initial_actions)
         for p in instantiated:
