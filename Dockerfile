@@ -76,6 +76,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY src/ /app/src/
 COPY tests/ /app/tests/
 COPY audio/ /app/audio/
+COPY scenarios/ /app/scenarios/
 COPY pyproject.toml /app/pyproject.toml
 
 WORKDIR /app
