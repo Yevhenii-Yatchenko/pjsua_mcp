@@ -118,6 +118,16 @@ class ActionExecutor:
             "log": self._a_log,
         }
 
+    async def _run_pj(self, fn: Any) -> Any:
+        """Run a pjlib-touching sync callable in the executor, registering the
+        worker thread with pjlib first. Required because pjlib asserts on
+        unregistered threads (`pj_thread_this`); see project memory."""
+        def wrapped() -> Any:
+            if self._engine is not None:
+                self._engine.register_current_thread()
+            return fn()
+        return await self._loop.run_in_executor(None, wrapped)
+
     async def execute(
         self,
         actions: list[Any],
@@ -157,19 +167,13 @@ class ActionExecutor:
         self._rec.record_action(
             "answer", pid, cid, {"status_code": code}, hook.hook_id, hook.pattern_name
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.answer_call(phone_id=pid, call_id=cid, status_code=code),
-        )
+        await self._run_pj(lambda: self._cm.answer_call(phone_id=pid, call_id=cid, status_code=code))
 
     async def _a_hangup(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
         cid = args.get("call_id")
         self._rec.record_action("hangup", pid, cid, {}, hook.hook_id, hook.pattern_name)
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.hangup(phone_id=pid, call_id=cid),
-        )
+        await self._run_pj(lambda: self._cm.hangup(phone_id=pid, call_id=cid))
 
     async def _a_hangup_all(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         """Teardown: hang up every active call. Scoped to a phone if phone_id
@@ -178,10 +182,7 @@ class ActionExecutor:
         self._rec.record_action(
             "hangup_all", pid, None, {}, hook.hook_id, hook.pattern_name
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.hangup_all(phone_id=pid),
-        )
+        await self._run_pj(lambda: self._cm.hangup_all(phone_id=pid))
 
     async def _a_reject(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
@@ -190,22 +191,19 @@ class ActionExecutor:
         self._rec.record_action(
             "reject", pid, cid, {"status_code": code}, hook.hook_id, hook.pattern_name
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.reject_call(phone_id=pid, call_id=cid, status_code=code),
-        )
+        await self._run_pj(lambda: self._cm.reject_call(phone_id=pid, call_id=cid, status_code=code))
 
     async def _a_hold(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
         cid = args["call_id"]
         self._rec.record_action("hold", pid, cid, {}, hook.hook_id, hook.pattern_name)
-        await self._loop.run_in_executor(None, lambda: self._cm.hold(call_id=cid, phone_id=pid))
+        await self._run_pj(lambda: self._cm.hold(call_id=cid, phone_id=pid))
 
     async def _a_unhold(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
         cid = args["call_id"]
         self._rec.record_action("unhold", pid, cid, {}, hook.hook_id, hook.pattern_name)
-        await self._loop.run_in_executor(None, lambda: self._cm.unhold(call_id=cid, phone_id=pid))
+        await self._run_pj(lambda: self._cm.unhold(call_id=cid, phone_id=pid))
 
     async def _a_send_dtmf(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
@@ -216,10 +214,7 @@ class ActionExecutor:
         self._rec.record_action(
             "send_dtmf", pid, cid, {"digits": str(digits)}, hook.hook_id, hook.pattern_name
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.send_dtmf(call_id=cid, digits=str(digits), phone_id=pid),
-        )
+        await self._run_pj(lambda: self._cm.send_dtmf(call_id=cid, digits=str(digits), phone_id=pid))
 
     async def _a_blind_transfer(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
@@ -230,10 +225,7 @@ class ActionExecutor:
         self._rec.record_action(
             "blind_transfer", pid, cid, {"to": to}, hook.hook_id, hook.pattern_name
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.blind_transfer(dest_uri=to, phone_id=pid, call_id=cid),
-        )
+        await self._run_pj(lambda: self._cm.blind_transfer(dest_uri=to, phone_id=pid, call_id=cid))
 
     async def _a_attended_transfer(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         """REFER/Replaces. Both call_id and dest_call_id must belong to the same phone."""
@@ -244,12 +236,9 @@ class ActionExecutor:
             "attended_transfer", pid, cid,
             {"dest_call_id": dest_cid}, hook.hook_id, hook.pattern_name,
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.attended_transfer(
+        await self._run_pj(lambda: self._cm.attended_transfer(
                 phone_id=pid, call_id=cid, dest_call_id=dest_cid
-            ),
-        )
+            ))
 
     async def _a_conference(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         """Bridge multiple calls via the local pjsua conference port.
@@ -261,8 +250,8 @@ class ActionExecutor:
         pid = args["phone_id"]
         call_ids = args.get("call_ids") or args.get("value")
         if call_ids in (None, "auto", ""):
-            active = await self._loop.run_in_executor(
-                None, lambda: self._cm.get_active_calls(phone_id=pid)
+            active = await self._run_pj(
+                lambda: self._cm.get_active_calls(phone_id=pid)
             )
             cids = [int(c["call_id"]) for c in active]
             if len(cids) < 2:
@@ -277,10 +266,7 @@ class ActionExecutor:
             "conference", pid, None,
             {"call_ids": cids}, hook.hook_id, hook.pattern_name,
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.conference(call_ids=cids, phone_id=pid),
-        )
+        await self._run_pj(lambda: self._cm.conference(call_ids=cids, phone_id=pid))
 
     async def _a_make_call(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args.get("phone_id") or args.get("from_phone")
@@ -293,10 +279,7 @@ class ActionExecutor:
         self._rec.record_action(
             "make_call", pid, None, {"dest_uri": to}, hook.hook_id, hook.pattern_name
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.make_call(dest_uri=to, phone_id=pid, headers=headers),
-        )
+        await self._run_pj(lambda: self._cm.make_call(dest_uri=to, phone_id=pid, headers=headers))
 
     async def _a_play_audio(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
@@ -309,10 +292,7 @@ class ActionExecutor:
             "play_audio", pid, cid,
             {"file": str(path), "loop": loop}, hook.hook_id, hook.pattern_name,
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.play_audio(file_path=str(path), phone_id=pid, call_id=cid, loop=loop),
-        )
+        await self._run_pj(lambda: self._cm.play_audio(file_path=str(path), phone_id=pid, call_id=cid, loop=loop))
 
     async def _a_stop_audio(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         pid = args["phone_id"]
@@ -320,10 +300,7 @@ class ActionExecutor:
         self._rec.record_action(
             "stop_audio", pid, cid, {}, hook.hook_id, hook.pattern_name
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._cm.stop_audio(phone_id=pid, call_id=cid),
-        )
+        await self._run_pj(lambda: self._cm.stop_audio(phone_id=pid, call_id=cid))
 
     async def _a_send_message(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         """Out-of-dialog SIP MESSAGE (page-mode IM)."""
@@ -340,12 +317,9 @@ class ActionExecutor:
             {"to": to, "body": body, "content_type": ct},
             hook.hook_id, hook.pattern_name,
         )
-        await self._loop.run_in_executor(
-            None,
-            lambda: self._registry.send_message(
+        await self._run_pj(lambda: self._registry.send_message(
                 dest_uri=to, body=body, phone_id=pid, content_type=ct
-            ),
-        )
+            ))
 
     async def _a_set_codecs(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
         """Change endpoint codec priorities; optionally re-INVITE a call."""
@@ -364,11 +338,10 @@ class ActionExecutor:
             {"codecs": codecs}, hook.hook_id, hook.pattern_name,
         )
         # 1) Endpoint-wide priority change.
-        await self._loop.run_in_executor(None, lambda: self._engine.set_codecs(codecs))
+        await self._run_pj(lambda: self._engine.set_codecs(codecs))
         # 2) Optionally re-INVITE a specific call to renegotiate with new SDP.
         if pid and cid is not None:
-            await self._loop.run_in_executor(
-                None, lambda: self._cm.unhold(call_id=int(cid), phone_id=pid)
+            await self._run_pj(lambda: self._cm.unhold(call_id=int(cid), phone_id=pid)
             )
 
     async def _a_wait(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
@@ -376,8 +349,7 @@ class ActionExecutor:
         ms = _parse_ms(raw if raw is not None else 0)
         self._rec.record_action(
             "wait", args.get("phone_id"), args.get("call_id"),
-            {"ms": ms}, hook.hook_id, hook.pattern_name,
-        )
+            {"ms": ms}, hook.hook_id, hook.pattern_name)
         await asyncio.sleep(ms / 1000.0)
 
     async def _a_wait_until(self, args: dict[str, Any], hook: "Hook", ev: Event) -> None:
