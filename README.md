@@ -23,12 +23,12 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 │  │ EventBus ◄── emit reg.* / call.state.* / dtmf.* / im  │   │
 │  │    ▲           from pjsua callbacks                   │   │
 │  │    │                                                  │   │
-│  │ HookRuntime   PatternLoader    ActionExecutor         │   │
-│  │    │          (Jinja YAML,      (maps 19 actions      │   │
-│  │    │           JSONSchema)       to CallManager etc.) │   │
-│  │    │                                                  │   │
-│  │ Orchestrator ──► run_scenario / validate_scenario /   │   │
-│  │                  list_patterns / get_pattern          │   │
+│  │ HookRuntime                    ActionExecutor         │   │
+│  │    │                            (maps 19 actions       │   │
+│  │    │                             to CallManager etc.)  │   │
+│  │    │                                                   │   │
+│  │ Orchestrator ──► run_scenario / validate_scenario /    │   │
+│  │                  get_scenario_template                 │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                       ▼                                      │
 │  ┌────────────┐  ┌───────────────┐  ┌─────────────────────┐  │
@@ -66,7 +66,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 
 ## MCP Tools
 
-### Static (19 — always present)
+### Static (17 — always present)
 
 #### Phone CRUD
 | Tool | Description |
@@ -93,10 +93,8 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 #### Scenario engine
 | Tool | Description |
 |------|-------------|
-| `list_patterns` | Discover the 14 atomic patterns. Filter by `tags=["dtmf", …]` or fuzzy `query=` on name+description |
-| `get_pattern` | Full spec for one pattern — metadata, raw Jinja body template, and a rendered example using the pattern's first `examples:` entry |
 | `get_scenario_template` | Ready-to-edit scenario YAML skeleton + structured reference of every event type and action |
-| `validate_scenario` | Static dry-run — catches unknown patterns, bad params, unknown actions, unknown event types, malformed hooks — without touching pjsua |
+| `validate_scenario` | Static dry-run — catches unknown actions, unknown event types, malformed hooks — without touching pjsua |
 | `run_scenario` | Execute a scenario (dict or YAML path), auto-validates first, returns full timeline + status + errors |
 
 ### Per-phone dynamic (22 per active phone)
@@ -124,7 +122,7 @@ Registered when `add_phone` (or `load_phone_profile`) brings a phone online; unr
 | `a_register` / `a_unregister` | Fresh REGISTER cycle / de-REGISTER (symmetric pair) |
 | `a_get_registration_status` | Quick reg state for phone a |
 
-Total surface with N phones: 19 + 22·N.
+Total surface with N phones: 17 + 22·N.
 
 ## Quick Start
 
@@ -384,38 +382,18 @@ deterministically. The engine replaces "call tool, wait 2 s, call next
 tool" loops (which burn wall-clock on LLM-turn latency and race against
 real SIP timers) with a YAML flow that runs in one asyncio loop.
 
-### Five tools in a typical workflow
+### Three tools in a typical workflow
 
 ```python
-list_patterns()                              # discover the 14 atomic patterns
-get_pattern(name="auto-answer")              # inspect one — spec + rendered example
 get_scenario_template()                      # grab the YAML skeleton + event/action reference
 validate_scenario(scenario=<dict-or-path>)   # static dry-run (no pjsua touched)
 run_scenario(scenario=<dict-or-path>)        # execute and return the timeline
 ```
 
-### Pattern library (14 atomic)
-
-Each pattern wraps one action with an optional delay. Composite flows
-(attended transfer, conferences, IVR navigation) live as **inline `hooks:`**
-in scenarios, not as composite patterns — see `scenarios/examples/`.
-
-| Pattern | Listens to | Dispatches |
-|---|---|---|
-| `wait-for-registration` | `reg.success` / `reg.failed` | — |
-| `auto-answer` | `call.state.incoming` | `answer` |
-| `make-call-and-wait-confirmed` | — (initial action) | `make_call` |
-| `send-dtmf-on-confirmed` | `call.state.confirmed` | `send_dtmf` |
-| `hangup-after-duration` | `call.state.confirmed` | `wait` + `hangup` |
-| `reject-on-incoming` | `call.state.incoming` | `reject` |
-| `blind-transfer` | `call.state.confirmed` | `wait` + `blind_transfer` |
-| `hold-and-resume` | `call.state.confirmed` | `hold` + `unhold` with waits |
-| `wait-for-callback` | `call.state.incoming` | optional `answer` |
-| `respond-to-dtmf` | `dtmf.in` (matched digit) | user action |
-| `fail-fast-on-error` | `call.state.disconnected` (bad code) | `emit` |
-| `play-audio-on-confirmed` | `call.state.confirmed` | `play_audio` |
-| `reinvite-codec-change` | `call.state.confirmed` | `set_codecs` |
-| `collect-recordings` | `scenario.stopped` | `log` per phone |
+Scenarios are authored as **inline `hooks:`** — `when: <event>` + `then: [<actions>]`.
+See `scenarios/examples/` and the `pjsua-scenarios` skill for the canonical
+shape, the coordinator-hook idiom, and worked examples (blind transfer,
+attended transfer).
 
 ### Event taxonomy
 
@@ -452,9 +430,9 @@ stop_on:
 
 ### Pre-flight validation
 
-`run_scenario` auto-runs `validate_scenario` first. Typos (wrong pattern
-name, wrong action, wrong event prefix, missing required params) return
-`status="error"` in <100 ms — no wall-clock burned on the timeout.
+`run_scenario` auto-runs `validate_scenario` first. Typos (wrong action,
+wrong event prefix, malformed hooks) return `status="error"` in <100 ms —
+no wall-clock burned on the timeout.
 
 ### Bundled example scenarios (`scenarios/examples/`)
 

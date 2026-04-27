@@ -14,12 +14,9 @@ add_phone(phone_id="a", domain="asterisk", username="6001", password="test123")
 add_phone(phone_id="b", domain="asterisk", username="6002", password="test123",
           auto_answer=False)
 
-# 2. List available patterns
-list_patterns()                   # all 20
-list_patterns(tags=["dtmf"])      # narrow by tag
-get_pattern("auto-answer")        # full spec
-
-# 3. Compose + run
+# 2. Compose + run (patterns referenced by `use:` resolve from
+#    scenarios/patterns/ on the server). Prefer authoring new flows as
+#    inline `hooks:` — see the `pjsua-scenarios` skill.
 run_scenario(scenario={
     "name": "a-calls-b-with-dtmf",
     "phones": ["a", "b"],

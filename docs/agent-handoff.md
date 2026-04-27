@@ -16,9 +16,9 @@ scratch — instructions for that below.
 2. **Read the two canonical docs** (in this order):
    - `docs/scenarios-guide.md` — scenario format + inline hooks + stop_on filters
    - `scenarios/patterns/SCHEMA.md` — action vocabulary + event taxonomy
-3. **Confirm pattern library is loaded:**
+3. **Confirm scenario engine is reachable:**
    ```
-   list_patterns()   # expect 14 patterns returned
+   get_scenario_template()   # returns YAML skeleton + event/action reference
    ```
    If this returns an error, the MCP server isn't up.
 
@@ -171,12 +171,12 @@ Match each step in the narrative to an **event type** from the taxonomy:
 - "3s pass" → timer inside a hook's `then:`
 - "A puts on hold" → action inside a hook fired on that timer
 
-### Step 3 — Decide patterns vs inline
+### Step 3 — Write inline hooks
 
-For each reaction:
-- If a pattern already captures it (check `list_patterns(tags=[...])`) —
-  compose it: `{use: auto-answer, phone_id: b, delay_ms: 300}`
-- If not — write an inline hook directly in the scenario's `hooks:` list
+For each reaction, write an inline hook directly in the scenario's `hooks:`
+list. Legacy pattern composition via `{use: ...}` still resolves from
+`scenarios/patterns/` for old YAMLs but is no longer the recommended
+authoring style — the `list_patterns` / `get_pattern` MCP tools were removed.
 
 ### Step 4 — Assemble the YAML
 
@@ -282,8 +282,7 @@ a_register()
 ## Part 8 — Quick sanity commands (keep handy)
 
 ```python
-list_patterns()                                # what's in the library
-get_pattern("auto-answer")                     # full spec + rendered body
+get_scenario_template()                        # YAML skeleton + event/action ref
 list_phones()                                  # all phones + reg status
 a_get_active_calls()                           # live call state
 get_sip_log(phone_id="a", last_n=20)           # recent SIP trace

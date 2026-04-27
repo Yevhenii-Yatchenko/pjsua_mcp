@@ -28,7 +28,7 @@ from .pcap_manager import PcapManager
 from .phone_tool_factory import register_phone_tools, unregister_phone_tools
 from .scenario_engine.event_bus import EventBus, set_default_bus
 from .scenario_engine.orchestrator import run_scenario as run_scenario_impl
-from .scenario_engine.pattern_loader import PatternError, PatternRegistry
+from .scenario_engine.pattern_loader import PatternRegistry
 
 # All Python logging goes to stderr — stdout is the MCP channel
 logging.basicConfig(
@@ -140,8 +140,9 @@ async def lifespan(server: FastMCP):
     call_mgr = CallManager(engine, registry, pcap_mgr=pcap_mgr)
 
     # Scenario engine plumbing — bus is the default for pjsua callbacks to
-    # emit events (reg.*, call.state.*, dtmf.*). PatternRegistry scans
-    # scenarios/patterns/ at startup; rescanned on every list_patterns call.
+    # emit events (reg.*, call.state.*, dtmf.*). PatternRegistry is kept for
+    # scenarios that still reference legacy `patterns:` blocks; new scenarios
+    # should use inline hooks. The registry is no longer exposed via MCP.
     event_bus = EventBus(loop=asyncio.get_running_loop())
     set_default_bus(event_bus)
     pattern_registry = PatternRegistry(_PATTERNS_DIR)
@@ -962,76 +963,8 @@ async def list_recordings(
 
 
 # ---------------------------------------------------------------------------
-# Scenario engine tools — list_patterns / get_pattern / run_scenario
+# Scenario engine tools — validate_scenario / get_scenario_template / run_scenario
 # ---------------------------------------------------------------------------
-@mcp.tool()
-async def list_patterns(
-    tags: list[str] | None = None,
-    query: str | None = None,
-    rescan: bool = False,
-) -> dict[str, Any]:
-    """List available scenario patterns.
-
-    Filters: `tags` (any-of match), `query` (case-insensitive substring on
-    name + description). Set `rescan=true` to re-read the patterns directory
-    (useful after editing YAML files without restarting the server).
-    """
-    global pattern_registry
-    if pattern_registry is None:
-        return {"status": "error", "error": "pattern registry not initialised"}
-    if rescan:
-        try:
-            pattern_registry.scan()
-        except Exception as e:
-            log.exception("rescan failed")
-            return {"status": "error", "error": str(e)}
-    try:
-        patterns = pattern_registry.list(tags=tags, query=query)
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-    return {
-        "status": "ok",
-        "patterns": patterns,
-        "total": len(patterns),
-        "errors": pattern_registry.errors(),
-    }
-
-
-@mcp.tool()
-async def get_pattern(
-    name: str,
-    render_example: bool = True,
-) -> dict[str, Any]:
-    """Get the full specification of a pattern.
-
-    Returns metadata, raw `body_template` (Jinja YAML), and — when
-    `render_example=True` and the pattern declares examples — a `rendered_body`
-    block showing hooks / initial_actions / expected_timeline after template
-    substitution with the first example's params. This is the easiest way to
-    see what a pattern actually does.
-    """
-    if pattern_registry is None:
-        return {"status": "error", "error": "pattern registry not initialised"}
-    try:
-        spec = pattern_registry.get_full_spec(name)
-    except PatternError as e:
-        return {"status": "error", "error": str(e)}
-    if render_example and spec.get("examples"):
-        ex = spec["examples"][0]
-        params = {k: v for k, v in ex.items() if k != "use"}
-        try:
-            pat = pattern_registry.instantiate(name, params)
-            spec["rendered_body"] = {
-                "params_used": pat.resolved_params,
-                "hooks": pat.hooks,
-                "initial_actions": pat.initial_actions,
-                "expected_timeline": pat.expected_timeline,
-            }
-        except PatternError as e:
-            spec["rendered_body"] = {"error": str(e)}
-    return {"status": "ok", "pattern": spec}
-
-
 @mcp.tool()
 async def validate_scenario(scenario: dict[str, Any] | str) -> dict[str, Any]:
     """Dry-run check for a scenario — catch typos / unknown patterns / bad events
