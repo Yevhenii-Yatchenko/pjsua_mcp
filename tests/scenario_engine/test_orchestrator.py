@@ -653,6 +653,43 @@ def test_synthetic_reg_success_emitted_for_preregistered_phone() -> None:
     _run(inner())
 
 
+def test_scenario_started_fires_after_hooks_are_armed() -> None:
+    """Coordinator-hook idiom: `when: scenario.started` must catch its own
+    trigger. Earlier the bus event was emitted before scenario.hooks were
+    armed, so the hook silently missed it; this regresses that fix."""
+
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="coordinator-hook-smoke",
+            phones=["a"],
+            patterns=[],
+            hooks=[
+                {
+                    "when": "scenario.started",
+                    "once": True,
+                    "then": [
+                        {"emit": {"name": "coordinator_ran"}},
+                    ],
+                },
+            ],
+            stop_on=[{"event": "user.coordinator_ran"}],
+            timeout_ms=500,
+        )
+        result = await runner.run(scenario)
+        assert result.status == "ok", f"reason={result.reason}"
+        # Stop must have come from the coordinator's emit, not from timeout.
+        assert any(
+            e["type"] == "user.coordinator_ran" for e in result.timeline
+        ), "coordinator hook never fired its emit"
+
+    _run(inner())
+
+
 def test_synthetic_reg_replay_skipped_when_registry_is_none() -> None:
     """ScenarioRunner with `registry=None` (engine-only tests) must not crash."""
 

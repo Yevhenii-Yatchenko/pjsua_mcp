@@ -148,7 +148,9 @@ class ScenarioRunner:
         recorder = TimelineRecorder(self._bus, timeline)
         recorder.start()
         recorder.record_meta("scenario.started", {"name": scenario.name, "phones": scenario.phones})
-        self._bus.emit(Event(type="scenario.started", data={"name": scenario.name}))
+        # NB: the `scenario.started` bus event is emitted AFTER all hooks +
+        # stop_on subscribers are armed (see below). Otherwise a coordinator
+        # hook with `when: scenario.started` would miss its own trigger.
 
         executor = ActionExecutor(
             call_manager=self._cm,
@@ -271,6 +273,12 @@ class ScenarioRunner:
                         "synthetic": True,
                     },
                 ))
+
+        # ---- Now everything is wired: emit the scenario.started bus event ----
+        # Hooks that listen for it (notably "coordinator" hooks chaining
+        # wait_until to drive multi-stage flows) only see it if they were
+        # armed first — see comment near recorder.record_meta above.
+        self._bus.emit(Event(type="scenario.started", data={"name": scenario.name}))
 
         # ---- Initial actions ----
         init_actions: list[Any] = list(scenario.initial_actions)
