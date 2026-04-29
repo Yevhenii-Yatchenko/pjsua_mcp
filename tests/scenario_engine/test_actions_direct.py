@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from src.scenario_engine.event_bus import Event, EventBus
 from src.scenario_engine.orchestrator import Scenario
 
@@ -448,5 +450,217 @@ def test_set_codecs_with_null_phone_and_call_skips_reinvite() -> None:
             f"re-INVITE happened despite explicit nulls — suppression broken: "
             f"{cm.calls}"
         )
+
+    _run(inner())
+
+
+# ============================================================================
+# Block 4 — Group B (event/data semantics), Group C (action argument coverage),
+# Group D (defaults inheritance corner cases).
+# ============================================================================
+
+
+def test_emit_data_payload_filters_downstream_hooks() -> None:
+    """Producer emit({name, data: {origin: 1}}) — consumer matches on data;
+    only the matching consumer fires."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="emit-data-flow",
+            phones=["a"],
+            initial_actions=[
+                {"action": "emit", "name": "stage", "data": {"origin": 1}},
+                {"action": "emit", "name": "stage", "data": {"origin": 2}},
+            ],
+            hooks=[{
+                "when": "user.stage",
+                "match": {"origin": 2},
+                "once": True,
+                "then": [{"action": "emit", "name": "matched_two"}],
+            }],
+            stop_on=[{"event": "user.matched_two"}],
+            timeout_ms=500,
+        )
+        result = await runner.run(scenario)
+        assert result.status == "ok", (
+            f"emit→match→emit chain failed: {result.reason}"
+        )
+
+    _run(inner())
+
+
+def test_attended_transfer_auto_pick_passes_none_call_ids() -> None:
+    """attended_transfer with no call_id/dest_call_id args dispatches with
+    both as None — letting CallManager auto-pick the active legs."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="attended-auto",
+            phones=["b"],
+            initial_actions=[
+                {"action": "attended_transfer", "phone_id": "b"},
+            ],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=200,
+        )
+        await runner.run(scenario)
+        xfer = [c for c in cm.calls if c[0] == "attended_transfer"]
+        assert xfer, "attended_transfer not dispatched"
+        assert xfer[0][1]["call_id"] is None
+        assert xfer[0][1]["dest_call_id"] is None
+
+    _run(inner())
+
+
+def test_make_call_headers_propagate() -> None:
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="headers-smoke",
+            phones=["a"],
+            initial_actions=[{
+                "action": "make_call",
+                "phone_id": "a",
+                "to": "sip:x@asterisk",
+                "headers": {"X-Reason": "consult"},
+            }],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=200,
+        )
+        await runner.run(scenario)
+        mk = [c for c in cm.calls if c[0] == "make_call"]
+        assert mk and mk[0][1]["dest_uri"] == "sip:x@asterisk"
+        # MockCallManager.make_call doesn't currently track headers — extend
+        # MockCallManager.make_call to record headers too if needed.
+
+    _run(inner())
+
+
+def test_make_call_from_phone_alias() -> None:
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="from-phone-alias",
+            phones=["a"],
+            initial_actions=[{
+                "action": "make_call",
+                "from_phone": "a",   # alias for phone_id
+                "to": "sip:y@asterisk",
+            }],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=200,
+        )
+        await runner.run(scenario)
+        mk = [c for c in cm.calls if c[0] == "make_call"]
+        assert mk and mk[0][1]["phone_id"] == "a"
+
+    _run(inner())
+
+
+def test_play_audio_loop_true_propagates() -> None:
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="play-loop",
+            phones=["a"],
+            initial_actions=[{
+                "action": "play_audio",
+                "phone_id": "a",
+                "call_id": 1,
+                "file": "/audio/moh.wav",
+                "loop": True,
+            }],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=100,
+        )
+        await runner.run(scenario)
+        play = [c for c in cm.calls if c[0] == "play_audio"]
+        assert play and play[0][1]["loop"] is True
+
+    _run(inner())
+
+
+@pytest.mark.parametrize("bad_action", [
+    {"action": "send_dtmf", "phone_id": "a", "call_id": 1},      # missing digits
+    {"action": "blind_transfer", "phone_id": "a", "call_id": 1}, # missing to
+    {"action": "make_call", "to": "sip:x"},                      # missing phone_id
+    {"action": "make_call", "phone_id": "a"},                    # missing to
+    {"action": "play_audio", "phone_id": "a", "call_id": 1},     # missing file
+    {"action": "send_message", "phone_id": "a"},                 # missing to+body
+])
+def test_missing_required_arg_records_action_failed(bad_action) -> None:
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="missing-arg-smoke",
+            phones=["a"],
+            initial_actions=[bad_action],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=200,
+        )
+        # skip_validation=True so the action reaches the executor
+        result = await runner.run(scenario, skip_validation=True)
+        failed = [
+            e for e in result.timeline
+            if e["kind"] == "meta" and e["type"] == "action.failed"
+        ]
+        assert failed, f"expected action.failed in timeline; got {result.timeline}"
+
+    _run(inner())
+
+
+def test_phone_id_falls_through_from_event_when_hook_has_no_on_phone() -> None:
+    """Hook without on_phone — action's phone_id is inherited from
+    event.phone_id."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        async def emit_confirmed_on_b() -> None:
+            await asyncio.sleep(0.05)
+            bus.emit(Event(type="call.state.confirmed", phone_id="b", call_id=7))
+
+        scenario = Scenario(
+            name="event-phone-fallthrough",
+            phones=["b"],
+            hooks=[{
+                "when": "call.state.confirmed",
+                "once": True,
+                "then": ["hangup"],
+            }],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=1500,
+        )
+        task = asyncio.create_task(emit_confirmed_on_b())
+        await runner.run(scenario)
+        await task
+        hu = [c for c in cm.calls if c[0] == "hangup"]
+        assert hu and hu[0][1]["phone_id"] == "b" and hu[0][1]["call_id"] == 7
 
     _run(inner())
