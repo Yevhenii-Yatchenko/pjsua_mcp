@@ -157,3 +157,17 @@ class TestPhoneConfigCodecs:
     def test_phone_config_codecs_round_trip(self):
         cfg = PhoneConfig(domain="x", codecs=["PCMA", "telephone-event"])
         assert cfg.codecs == ["PCMA", "telephone-event"]
+
+    def test_add_phone_accepts_codecs_kwarg(self):
+        """PhoneRegistry.add_phone(codecs=[...]) must accept the kwarg —
+        signature check happens before the engine-init guard."""
+        import pytest
+        registry = PhoneRegistry(SipEngine())
+        with pytest.raises(RuntimeError, match="not initialized"):
+            registry.add_phone(
+                "a",
+                domain="sip.example.com",
+                username="u",
+                password="p",
+                codecs=["PCMA", "telephone-event"],
+            )
