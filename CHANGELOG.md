@@ -3,6 +3,39 @@
 ## [Unreleased]
 
 ### Added
+- `run_scenario` result now includes an `artifacts: {phone_id: {...}}` dict
+  populated post-stop. Each phone in `scenario.phones` maps to either
+  `null` (no recording/pcap created during this run) or a dict with
+  `recording`, `recording_meta`, `pcap` (container paths) and
+  `host_recording`, `host_recording_meta`, `host_pcap` (host-side paths
+  when `PJSUA_MCP_HOST_RECORDINGS_DIR` / `PJSUA_MCP_HOST_CAPTURES_DIR`
+  are set in the env, otherwise `null`). Files are filtered by
+  `mtime ≥ scenario.started_at` so a run never picks up a previous
+  run's artifacts; latest-mtime wins per phone. Backward-compatible —
+  existing fields (`status`, `elapsed_ms`, `timeline`, `errors`,
+  `reason`) unchanged.
+- `src/scenario_engine/artifacts.py:collect_artifacts(...)` — pure
+  helper backing the above. 12 unit tests in
+  `tests/scenario_engine/test_artifacts.py` cover mtime filter,
+  latest-wins, pair-with-meta-sidecar, host path mapping, missing-
+  directory tolerance, recording-disabled-pcap-only edge case.
+- Integration tests `TestRunScenarioArtifacts` in
+  `tests/test_integration.py` covering proposal-04 acceptance criteria
+  against live Asterisk: artifacts populated for both legs of a
+  roundtrip, two sequential runs report distinct recordings,
+  unengaged phones come back as null.
+
+### Configuration
+- New env vars `PJSUA_MCP_HOST_RECORDINGS_DIR` and
+  `PJSUA_MCP_HOST_CAPTURES_DIR` (both optional). When set, the host-
+  side absolute paths of the `/recordings` and `/captures` bind targets
+  are surfaced in `run_scenario.artifacts.<phone>.host_*` fields so
+  out-of-container clients (Claude Code, plugin host) can Read/Bash
+  artifacts without resolving the bind mount themselves. Empty / unset
+  → `host_*` fields come back as `null`. `docker-compose.yml` passes
+  both through; `.env.example` documents the wiring.
+
+### Added
 - MCP tool `get_call_messages(phone_id, call_id, method, direction,
   status_code, cseq, last_n)` — structured counterpart to `get_sip_log`.
   Returns `{messages: [{ts, direction, method, cseq, call_id, from, to,
