@@ -36,6 +36,7 @@ class SipCall(pj.Call):
         direction: str = "outbound",
         pcap_mgr: "PcapManager | None" = None,
         recording_enabled: bool = True,
+        codecs: list[str] | None = None,
     ) -> None:
         super().__init__(account, call_id)
         self.phone_id = phone_id
@@ -46,6 +47,10 @@ class SipCall(pj.Call):
         self._recording_file: str | None = None
         self._recording_started_at: str | None = None
         self._recording_enabled = recording_enabled
+        # Per-phone SDP filter — each outgoing offer/answer this call
+        # produces is rewritten via `filter_audio_codecs` in
+        # `onCallSdpCreated`. None or empty = no filter.
+        self._codecs = list(codecs) if codecs else None
         # Toggle flipped to on while media isn't ready yet — start as soon
         # as onCallMediaState provides an aud_med.
         self._pending_start = False
@@ -119,6 +124,44 @@ class SipCall(pj.Call):
                 data={"digit": digit, "method": "rfc2833"},
             )
         )
+
+    def onCallSdpCreated(self, prm) -> None:
+        """Rewrite outgoing SDP to the per-phone codec subset.
+
+        Fires for every outgoing SDP (initial INVITE offer, 200 OK
+        answer, re-INVITE in either role). The C++ bridge re-parses
+        `prm.sdp.wholeSdp` after we return — see
+        `pjsua2/endpoint.cpp::Endpoint::on_call_sdp_created`. We are
+        called on the asyncio thread (single-threaded by design).
+
+        No-op when `self._codecs` is None/empty — pjsua's endpoint
+        priorities then govern, which after `enable_audio_codec_superset`
+        is just "all audio codecs we know about".
+        """
+        from .sdp_rewriter import filter_audio_codecs
+
+        if not self._codecs:
+            return
+        try:
+            sdp_in = prm.sdp.wholeSdp
+        except AttributeError:
+            return  # defensive — pjsua should always provide .sdp.wholeSdp
+        if not sdp_in:
+            return
+
+        sdp_out = filter_audio_codecs(
+            sdp_in, self._codecs, preserve_dtmf=True,
+        )
+        if sdp_out != sdp_in:
+            prm.sdp.wholeSdp = sdp_out
+            log.debug(
+                "[%s] SDP rewritten — codecs=%s, role=%s",
+                self.phone_id, self._codecs,
+                "answerer" if (
+                    getattr(prm, "remSdp", None)
+                    and getattr(prm.remSdp, "wholeSdp", "")
+                ) else "offerer",
+            )
 
     def onCallMediaState(self, prm: pj.OnCallMediaStateParam) -> None:
         ci = self.getInfo()
@@ -504,6 +547,7 @@ class CallManager:
             direction="inbound",
             pcap_mgr=self._pcap_mgr,
             recording_enabled=recording_enabled,
+            codecs=cfg.codecs if cfg else None,
         )
         call.on_disconnected_cb = self._on_call_disconnected
         call.on_first_active_cb = self._register_call_active
@@ -668,6 +712,7 @@ class CallManager:
             direction="outbound",
             pcap_mgr=self._pcap_mgr,
             recording_enabled=recording_enabled,
+            codecs=cfg.codecs if cfg else None,
         )
         call.on_disconnected_cb = self._on_call_disconnected
         call.on_first_active_cb = self._register_call_active
