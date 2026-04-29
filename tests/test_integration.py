@@ -165,16 +165,18 @@ def _add_phone(
     recording_enabled: bool = False,
     capture_enabled: bool = False,
 ) -> dict:
-    result = _parse_tool_result(client.call_tool("add_phone", {
+    args = {
         "phone_id": phone_id,
         "domain": SIP_DOMAIN,
         "username": username,
         "password": password,
         "auto_answer": auto_answer,
-        "codecs": codecs,
         "recording_enabled": recording_enabled,
         "capture_enabled": capture_enabled,
-    }))
+    }
+    if codecs is not None:
+        args["codecs"] = codecs
+    result = _parse_tool_result(client.call_tool("add_phone", args))
     assert result["status"] == "ok", f"add_phone failed: {result}"
     return result
 
@@ -275,6 +277,38 @@ class TestDynamicTools:
         assert result["status"] == "error"
         assert "invalid" in result["error"].lower()
 
+    def test_add_phone_with_codecs_round_trips(self):
+        """add_phone(codecs=[...]) must persist on cfg.codecs and surface
+        in the response and in get_phone."""
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1",
+            "username": "u", "password": "p",
+            "register": False,
+            "codecs": ["PCMA", "telephone-event"],
+        }))
+        assert result["status"] == "ok"
+        assert result["codecs"] == ["PCMA", "telephone-event"]
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
+        assert info["codecs"] == ["PCMA", "telephone-event"]
+
+    def test_update_phone_codecs_persists(self):
+        """update_phone(codecs=...) updates cfg.codecs synchronously."""
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z", "domain": "127.0.0.1",
+            "username": "u", "password": "p", "register": False,
+            "codecs": ["PCMA"],
+        }))
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "z", "codecs": ["PCMU", "telephone-event"],
+        }))
+        assert result["status"] == "ok"
+        assert result["codecs"] == ["PCMU", "telephone-event"]
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
+        assert info["codecs"] == ["PCMU", "telephone-event"]
+
 
 class TestRecordingLayout:
     """Recording layout — always-on, per-phone subdirs, sidecar meta.
@@ -326,6 +360,28 @@ phones:
         # Both phones loaded; legacy key silently dropped.
         loaded_ids = {p["phone_id"] for p in result["added"]}
         assert loaded_ids == {"p1", "p2"}
+
+    def test_load_phones_per_phone_codecs(self):
+        """`codecs:` is a first-class per-phone field again — defaults
+        merge into each phone, phone-level overrides win."""
+        profile = self.tmp_path / "codecs.yaml"
+        profile.write_text("""
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+  codecs: [PCMA]
+phones:
+  - {phone_id: c1, username: u1}
+  - {phone_id: c2, username: u2, codecs: [PCMU, telephone-event]}
+""")
+        result = _parse_tool_result(self.client.call_tool(
+            "load_phones", {"path": str(profile)}
+        ))
+        assert result["status"] == "ok"
+        by_id = {p["phone_id"]: p for p in result["added"]}
+        assert by_id["c1"]["codecs"] == ["PCMA"]
+        assert by_id["c2"]["codecs"] == ["PCMU", "telephone-event"]
 
     def test_list_recordings_reads_new_layout(self):
         """/recordings/<phone_id>/call_<id>_<ts>.wav is parsed correctly."""
@@ -1417,11 +1473,16 @@ class TestCodecs:
             self.client = client
             yield
 
-    def test_configure_with_codecs(self):
-        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A, codecs=["PCMU"])
+    def test_endpoint_codecs_pin_call_codec(self):
+        """`set_codecs` is endpoint-wide — pinning PCMU before the call
+        forces the SDP to advertise it as the preferred codec."""
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
         _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
         _wait_phone_registered(self.client, "a")
         _wait_phone_registered(self.client, "b")
+
+        # Pin PCMU globally — there is no per-phone codec list.
+        self.client.call_tool("set_codecs", {"codecs": ["PCMU"]})
 
         result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
@@ -1444,10 +1505,12 @@ class TestCodecs:
         assert any("PCMU" in c for c in codec_names)
 
     def test_set_codecs_midcall(self):
-        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A, codecs=["PCMU", "PCMA"])
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
         _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
         _wait_phone_registered(self.client, "a")
         _wait_phone_registered(self.client, "b")
+        # Start with PCMU preferred, then re-INVITE to PCMA mid-call.
+        self.client.call_tool("set_codecs", {"codecs": ["PCMU", "PCMA"]})
 
         result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
