@@ -671,3 +671,220 @@ def test_set_codecs_action_with_and_without_engine() -> None:
 
     _run(with_engine())
     _run(without_engine())
+
+
+# ============================================================================
+# Block 4 Group A — orchestrator-level invariants
+# ============================================================================
+
+
+def test_hook_chain_failure_does_not_affect_other_hooks() -> None:
+    """Hook A's action raises → hook A's remaining actions are skipped,
+    but hook B (armed on a different event) still fires when its event
+    arrives."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        async def emit_sequence() -> None:
+            await asyncio.sleep(0.05)
+            # Trigger hook A — it will raise mid-chain
+            bus.emit(Event(type="user.go_a", phone_id="a", call_id=1))
+            await asyncio.sleep(0.05)
+            # Trigger hook B — must still fire despite A's failure
+            bus.emit(Event(type="user.go_b", phone_id="a", call_id=2))
+
+        scenario = Scenario(
+            name="hook-isolation",
+            phones=["a"],
+            hooks=[
+                {
+                    "when": "user.go_a",
+                    "once": True,
+                    "then": [
+                        # send_dtmf with no `digits` raises ActionError
+                        {"action": "send_dtmf"},
+                        {"action": "hangup"},   # MUST be skipped
+                    ],
+                },
+                {
+                    "when": "user.go_b",
+                    "once": True,
+                    "then": [{"action": "hangup", "phone_id": "a", "call_id": 2}],
+                },
+            ],
+            stop_on=[{"event": "call.state.disconnected", "call_id": 2}],
+            timeout_ms=2000,
+        )
+        task = asyncio.create_task(emit_sequence())
+        result = await runner.run(scenario)
+        await task
+        # Hook B's hangup ran (call_id 2)
+        hb = [c for c in cm.calls if c[0] == "hangup" and c[1]["call_id"] == 2]
+        assert hb, f"hook B was not isolated from hook A's failure: {cm.calls}"
+        # Hook A's hangup did NOT run (call_id 1)
+        ha = [c for c in cm.calls if c[0] == "hangup" and c[1]["call_id"] == 1]
+        assert not ha, "hook A's chain should have aborted before hangup"
+
+    _run(inner())
+
+
+def test_when_as_list_fires_for_either_event() -> None:
+    """Hook with when: [reg.success, reg.failed] fires on EITHER event type."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        async def emit_failed() -> None:
+            await asyncio.sleep(0.05)
+            bus.emit(Event(type="reg.failed", phone_id="a"))
+
+        scenario = Scenario(
+            name="when-list",
+            phones=["a"],
+            hooks=[{
+                "when": ["reg.success", "reg.failed"],
+                "on_phone": "a",
+                "once": True,
+                "then": [{"action": "emit", "name": "either_reg_ev_seen"}],
+            }],
+            stop_on=[{"event": "user.either_reg_ev_seen"}],
+            timeout_ms=1000,
+        )
+        task = asyncio.create_task(emit_failed())
+        result = await runner.run(scenario)
+        await task
+        assert result.status == "ok", f"hook didn't fire on reg.failed: {result.reason}"
+
+    _run(inner())
+
+
+def test_once_false_hook_fires_repeatedly() -> None:
+    """once: false → hook stays armed across multiple matching events."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        async def emit_three_dtmf() -> None:
+            for digit in ("1", "2", "3"):
+                await asyncio.sleep(0.02)
+                bus.emit(Event(type="dtmf.in", phone_id="a", call_id=1,
+                               data={"digit": digit}))
+            await asyncio.sleep(0.05)
+            bus.emit(Event(type="user.done"))
+
+        scenario = Scenario(
+            name="once-false",
+            phones=["a"],
+            hooks=[{
+                "when": "dtmf.in",
+                "on_phone": "a",
+                "once": False,
+                "then": [{"action": "emit", "name": "got_digit"}],
+            }],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=1500,
+        )
+        task = asyncio.create_task(emit_three_dtmf())
+        result = await runner.run(scenario)
+        await task
+        emitted = [
+            e for e in result.timeline
+            if e["kind"] == "event" and e["type"] == "user.got_digit"
+        ]
+        assert len(emitted) == 3, (
+            f"once: false hook fired {len(emitted)} times, expected 3"
+        )
+
+    _run(inner())
+
+
+def test_empty_stop_on_runs_full_duration_with_ok_status() -> None:
+    """No stop_on entries → scenario runs full timeout_ms and returns ok."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="full-duration",
+            phones=["a"],
+            stop_on=[],
+            timeout_ms=200,
+        )
+        t0 = time.monotonic()
+        result = await runner.run(scenario)
+        elapsed = time.monotonic() - t0
+        assert result.status == "ok"
+        assert "full duration" in result.reason or "no stop_on" in result.reason
+        # Should run roughly the timeout
+        assert 0.18 < elapsed < 0.40
+
+    _run(inner())
+
+
+def test_multiple_stop_on_entries_either_can_trigger() -> None:
+    """stop_on with two specs: first matching event ends the scenario."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        async def emit_second_stop() -> None:
+            await asyncio.sleep(0.05)
+            # First stop_on (call.state.disconnected) doesn't fire — emit
+            # the second stop_on event instead
+            bus.emit(Event(type="user.also_stop"))
+
+        scenario = Scenario(
+            name="multi-stop",
+            phones=["a"],
+            stop_on=[
+                {"phone_id": "a", "event": "call.state.disconnected"},
+                {"event": "user.also_stop"},
+            ],
+            timeout_ms=2000,
+        )
+        task = asyncio.create_task(emit_second_stop())
+        result = await runner.run(scenario)
+        await task
+        assert result.status == "ok"
+        # Stopped quickly because user.also_stop matched
+        assert result.elapsed_ms < 500
+
+    _run(inner())
+
+
+def test_scenario_stopped_event_carries_status_and_reason() -> None:
+    """scenario.stopped bus event must include status + reason in data."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        # Subscribe a probe before run
+        captured: list[Event] = []
+        bus.subscribe("scenario.stopped", lambda e: captured.append(e))
+
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+        scenario = Scenario(
+            name="stopped-payload",
+            phones=["a"],
+            stop_on=[{"event": "user.never"}],
+            timeout_ms=100,
+        )
+        result = await runner.run(scenario)
+        # Give the bus dispatch a moment
+        await asyncio.sleep(0.02)
+        assert captured, "scenario.stopped never reached the bus"
+        assert captured[0].data.get("status") == "timeout"
+        assert "timeout" in captured[0].data.get("reason", "").lower()
+
+    _run(inner())
