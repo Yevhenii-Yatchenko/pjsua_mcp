@@ -52,3 +52,11 @@ class TestCodecs:
     def test_get_codecs_before_init(self):
         engine = SipEngine()
         assert engine.get_codecs() == []
+
+
+class TestCodecSuperset:
+    def test_enable_audio_codec_superset_before_init_raises(self):
+        import pytest
+        engine = SipEngine()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            engine.enable_audio_codec_superset()
