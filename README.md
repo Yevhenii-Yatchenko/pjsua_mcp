@@ -75,7 +75,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 | `add_phone` | Create a transport + SipAccount, send REGISTER, register 22 per-phone action tools |
 | `drop_phone` | Hang up the phone's calls, unregister, close transport, unload its per-phone tools |
 | `get_phone` | Full info for one phone — credentials (sans password), reg state, active calls, `recording_enabled` |
-| `update_phone` | Mutate runtime settings — `auto_answer` / `recording_enabled` / `capture_enabled` (instant), `codecs`, or credentials (forces reregister) |
+| `update_phone` | Mutate runtime settings — `auto_answer` / `codecs` (per-phone SDP filter, instant) / `recording_enabled` / `capture_enabled` (instant), or credentials (forces reregister) |
 | `load_phones` | Bulk-add every phone listed in a YAML profile. Atomic replace by default (`merge=True` for upsert) |
 
 #### Global diagnostics
@@ -163,7 +163,7 @@ Minimal profile:
 defaults:                 # optional — merged into every phone, phone-level keys win
   domain: sip.example.com
   password: change_me
-  codecs: [PCMA]
+  codecs: [PCMA, telephone-event]   # default for phones that don't override
   auto_answer: false
 
 phones:
@@ -171,8 +171,18 @@ phones:
     username: "1001"
   - phone_id: b
     username: "1002"
+    codecs: [PCMU, telephone-event]   # phone-level override wins over defaults
     auto_answer: true
 ```
+
+Per-phone `codecs:` is the SDP rewrite filter — every outgoing offer or
+answer this phone produces lists ONLY these codecs. RTP send/receive
+naturally follows because pjsua's media activation picks codecs from
+{SDP-advertised} ∩ {endpoint-enabled} (the endpoint pins a fixed
+superset at startup). DTMF (`telephone-event`) is auto-preserved by
+the rewriter even when not explicitly listed. Endpoint-wide
+`set_codecs` is rarely needed — use it only for mid-call re-INVITEs
+on a specific call, or for phones with `codecs=None`.
 
 ### 4. Load the profile and run scenarios
 
@@ -193,8 +203,9 @@ For ad-hoc additions without touching the profile file:
 mcp__pjsua__add_phone(phone_id="alice",
                       domain="sip.example.com",
                       username="1099", password="x",
-                      codecs=["PCMA"])
-# → /recordings/alice/ starts receiving WAVs on every call.
+                      codecs=["PCMA", "telephone-event"])
+# → phone alice's INVITEs list only PCMA + telephone-event in SDP,
+#   and RTP for this phone uses PCMA.
 mcp__pjsua__drop_phone(phone_id="alice")
 ```
 
@@ -332,8 +343,8 @@ timeout_ms: 20000
 
 ### Codec selection & mid-call change
 
-Endpoint priority from YAML profile (`defaults.codecs: [PCMA]`); mid-call
-re-INVITE via the `reinvite-codec-change` pattern:
+Per-phone codec list goes through the SDP rewriter; mid-call re-INVITE
+via the `reinvite-codec-change` pattern still uses global priorities:
 
 ```yaml
 patterns:
