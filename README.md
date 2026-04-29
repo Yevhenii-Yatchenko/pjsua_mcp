@@ -385,15 +385,17 @@ real SIP timers) with a YAML flow that runs in one asyncio loop.
 ### Three tools in a typical workflow
 
 ```python
-get_scenario_template()                      # grab the YAML skeleton + event/action reference
-validate_scenario(scenario=<dict-or-path>)   # static dry-run (no pjsua touched)
-run_scenario(scenario=<dict-or-path>)        # execute and return the timeline
+get_scenario_template()                # YAML skeleton + event/action reference
+validate_scenario(scenario=<dict>)     # static dry-run (no pjsua touched)
+run_scenario(scenario=<dict>)          # execute and return the timeline
 ```
 
+All three tools accept a scenario only as a Python dict — file paths are
+not supported (the agent runs outside the container, so paths don't translate).
+
 Scenarios are authored as **inline `hooks:`** — `when: <event>` + `then: [<actions>]`.
-See `scenarios/examples/` and the `pjsua-scenarios` skill for the canonical
-shape, the coordinator-hook idiom, and worked examples (blind transfer,
-attended transfer).
+See the `pjsua-scenarios` skill for the canonical shape, the coordinator-hook
+idiom, and worked examples (blind transfer, attended transfer).
 
 ### Event taxonomy
 
@@ -434,22 +436,13 @@ stop_on:
 wrong event prefix, malformed hooks) return `status="error"` in <100 ms —
 no wall-clock burned on the timeout.
 
-### Bundled example scenarios (`scenarios/examples/`)
+### Worked examples
 
-- `hello-world.yaml` — A→B, auto-answer, DTMF, hangup
-- `blind-transfer.yaml` — UA-in-middle REFER
-- `attended-transfer.yaml` — hold + consult + REFER/Replaces
-- `conference.yaml` — 2 outbound calls + local audio bridge
-- `ivr-navigation.yaml` — multi-step DTMF menu walk
-- `sequence-calls.yaml` — serial short calls
-- `sip-14744-minimal.yaml` — placeholder reproducer for ticket SIP-14744
+Examples live in the `pjsua-scenarios` skill (shipped alongside the MCP):
 
-### More docs
-
-- `docs/scenarios-guide.md` — concept, inline hooks, `stop_on` filters, when NOT to use scenarios
-- `scenarios/patterns/SCHEMA.md` — formal pattern file format + Jinja context
-- `docs/agent-handoff.md` — runbook for a test-running agent
-- `docs/agent-test-plan.md` — 11-scenario matrix covering every MCP tool
+- `.claude/skills/pjsua-scenarios/SKILL.md` — anatomy, idioms, simple-call template
+- `.claude/skills/pjsua-scenarios/examples/blind-transfer.md` — REFER + sequencing
+- `.claude/skills/pjsua-scenarios/examples/attended-transfer.md` — coordinator hook + REFER/Replaces
 
 ## Call Info & RTP Statistics
 
@@ -670,7 +663,7 @@ The `tools_changed=True` capability is opt-in in the MCP protocol; the server en
 docker compose run --rm --entrypoint pytest pjsua-mcp tests/ -m "not integration" -v
 ```
 
-Covers SipEngine lifecycle, PhoneRegistry CRUD + two-account isolation, CallManager lookups, PcapManager, SipLogWriter, plus the full **scenario engine** suite: EventBus pub/sub + threading, PatternRegistry schema validation against all 14 shipped patterns, HookRuntime match semantics, every wired action via MockCallManager, TimelineRecorder offsets, pre-flight validator covering every `scenarios/examples/` YAML. Fast (~7 s, ~210 tests), no network.
+Covers SipEngine lifecycle, PhoneRegistry CRUD + two-account isolation, CallManager lookups, PcapManager, SipLogWriter, plus the full **scenario engine** suite: EventBus pub/sub + threading, HookRuntime match semantics, every wired action via MockCallManager, TimelineRecorder offsets, pre-flight validator covering every action/event prefix. Fast (~7 s, ~125 tests), no network.
 
 ### Integration tests (self-contained)
 
@@ -678,7 +671,7 @@ Covers SipEngine lifecycle, PhoneRegistry CRUD + two-account isolation, CallMana
 docker compose -f docker-compose.test.yml run --build --rm test-runner
 ```
 
-Runs one MCP server subprocess per test class + an Asterisk PBX container on an isolated Docker network (ext 6001/6002/6003). Exercises registration, outbound/inbound calls, blind + attended transfer, conference, codec negotiation, SIP MESSAGE, reject, history, YAML profile loading (replace vs merge), dynamic tool add/remove, cross-phone attended-transfer rejection, per-phone recording layout with paired pcap and `.meta.json` sidecar. Also includes the scenario-engine integration stub (`tests/scenarios/`) that runs `hello-world.yaml` end-to-end against Asterisk.
+Runs one MCP server subprocess per test class + an Asterisk PBX container on an isolated Docker network (ext 6001/6002/6003). Exercises registration, outbound/inbound calls, blind + attended transfer, conference, codec negotiation, SIP MESSAGE, reject, history, YAML profile loading (replace vs merge), dynamic tool add/remove, cross-phone attended-transfer rejection, per-phone recording layout with paired pcap and `.meta.json` sidecar.
 
 The full suite runs in ~2 minutes (~90 tests).
 
@@ -762,43 +755,11 @@ pjsua_mcp/
 │   ├── pcap_manager.py              # tcpdump subprocess management
 │   └── scenario_engine/             # Event-driven scenario runtime
 │       ├── event_bus.py             # Thread-safe pub/sub; wildcard subscribe; wait_for
-│       ├── pattern_loader.py        # Jinja + JSONSchema; PatternRegistry over scenarios/patterns/
 │       ├── hook_runtime.py          # Arm hooks, match events, dispatch actions
 │       ├── action_executor.py       # 19 actions → CallManager / PhoneRegistry / SipEngine
 │       ├── orchestrator.py          # ScenarioRunner — arms hooks, runs initial_actions, awaits stop_on
 │       ├── timeline.py              # Chronological event+action recorder with ms offsets
-│       ├── validator.py             # Pre-flight static checker (typos, unknown patterns/actions/events)
-│       └── filters.py               # Custom Jinja filters (sip_user, sip_host, ms_to_sec, …)
-├── scenarios/
-│   ├── patterns/                    # 14 atomic reusable patterns + SCHEMA.md
-│   │   ├── SCHEMA.md                # Pattern format spec (two-doc YAML with Jinja body)
-│   │   ├── auto-answer.yaml
-│   │   ├── blind-transfer.yaml
-│   │   ├── collect-recordings.yaml
-│   │   ├── fail-fast-on-error.yaml
-│   │   ├── hangup-after-duration.yaml
-│   │   ├── hold-and-resume.yaml
-│   │   ├── make-call-and-wait-confirmed.yaml
-│   │   ├── play-audio-on-confirmed.yaml
-│   │   ├── reinvite-codec-change.yaml
-│   │   ├── reject-on-incoming.yaml
-│   │   ├── respond-to-dtmf.yaml
-│   │   ├── send-dtmf-on-confirmed.yaml
-│   │   ├── wait-for-callback.yaml
-│   │   └── wait-for-registration.yaml
-│   └── examples/                    # 7 ready-to-run scenario YAMLs
-│       ├── hello-world.yaml
-│       ├── blind-transfer.yaml
-│       ├── attended-transfer.yaml
-│       ├── conference.yaml
-│       ├── ivr-navigation.yaml
-│       ├── sequence-calls.yaml
-│       └── sip-14744-minimal.yaml
-├── docs/
-│   ├── scenarios-guide.md           # Concept, inline hooks, stop_on filters
-│   ├── agent-handoff.md             # Runbook for test-running agent
-│   ├── agent-test-plan.md           # 11-scenario matrix across every MCP tool
-│   └── superpowers/                 # Specs + plans from brainstorming sessions
+│       └── validator.py             # Pre-flight static checker (typos, unknown actions/events)
 ├── config/
 │   ├── phones.example.yaml          # YAML profile template (tracked)
 │   └── .gitignore                   # ignores phones.yaml (real credentials stay out of git)
@@ -813,16 +774,13 @@ pjsua_mcp/
 │   ├── test_call_manager.py
 │   ├── test_pcap_manager.py
 │   ├── test_integration.py             # end-to-end against Asterisk
-│   ├── scenario_engine/                # 118 unit + symbolic tests for the engine
+│   ├── scenario_engine/                # ~70 unit tests for the engine
 │   │   ├── test_event_bus.py
-│   │   ├── test_pattern_loader.py
 │   │   ├── test_hook_runtime.py
 │   │   ├── test_orchestrator.py
 │   │   ├── test_timeline.py
 │   │   ├── test_validator.py
 │   │   └── test_actions_direct.py
-│   ├── scenarios/                      # Integration test — scenario engine vs Asterisk
-│   │   └── test_hello_world_integration.py
 │   └── asterisk/
 │       ├── Dockerfile
 │       ├── pjsip.conf

@@ -10,7 +10,6 @@ from typing import Any
 
 from src.scenario_engine.action_executor import normalize_action
 from src.scenario_engine.orchestrator import Scenario
-from src.scenario_engine.pattern_loader import PatternError, PatternRegistry
 
 KNOWN_EVENT_PREFIXES: tuple[str, ...] = (
     "reg.", "call.state.", "dtmf.", "im.", "scenario.", "user.", "timer.",
@@ -53,16 +52,12 @@ def _check_action_spec(spec: Any) -> tuple[str, str | None]:
     return (name, None)
 
 
-def validate_scenario(
-    scenario: dict[str, Any] | Scenario,
-    pattern_registry: PatternRegistry,
-) -> dict[str, Any]:
+def validate_scenario(scenario: dict[str, Any] | Scenario) -> dict[str, Any]:
     """Static check of a scenario. Returns a report:
 
         {
           status: "ok" | "error",
           issues: [{kind, ..., msg}, ...],
-          patterns_used: [name, ...],
           scenario_name: str,
         }
     """
@@ -75,28 +70,11 @@ def validate_scenario(
             return {
                 "status": "error",
                 "issues": [{"kind": "parse", "msg": str(e)}],
-                "patterns_used": [],
                 "scenario_name": "<parse-failed>",
             }
 
     issues: list[dict[str, Any]] = []
-    patterns_used: list[str] = []
 
-    # 1. Pattern refs
-    for i, pref in enumerate(scn.patterns):
-        use = pref.get("use")
-        if not use:
-            issues.append({"kind": "pattern_ref", "index": i, "msg": "missing `use:` key"})
-            continue
-        bare = str(use).split("@", 1)[0]
-        args = {k: v for k, v in pref.items() if k != "use"}
-        try:
-            pattern_registry.instantiate(bare, args)
-            patterns_used.append(bare)
-        except PatternError as e:
-            issues.append({"kind": "pattern_ref", "index": i, "use": use, "msg": str(e)})
-
-    # 2. Inline hooks (when + then)
     def _check_hook(h: dict[str, Any], source: str, idx: int) -> None:
         when = h.get("when")
         if not when:
@@ -116,14 +94,12 @@ def validate_scenario(
     for i, h in enumerate(scn.hooks):
         _check_hook(h, "scenario.hooks", i)
 
-    # 3. stop_on
     for i, s in enumerate(scn.stop_on):
         ev = s.get("event")
         if ev is not None and not _is_known_event(str(ev)):
             issues.append({"kind": "stop_on", "index": i,
                            "msg": f"unknown event type: {ev!r}"})
 
-    # 4. initial_actions
     for i, spec in enumerate(scn.initial_actions):
         _, err = _check_action_spec(spec)
         if err:
@@ -132,6 +108,5 @@ def validate_scenario(
     return {
         "status": "ok" if not issues else "error",
         "issues": issues,
-        "patterns_used": patterns_used,
         "scenario_name": scn.name,
     }

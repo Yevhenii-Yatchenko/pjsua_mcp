@@ -9,12 +9,8 @@ from __future__ import annotations
 import asyncio
 import time
 
-import pytest
-
 from src.scenario_engine.event_bus import Event, EventBus
 from src.scenario_engine.orchestrator import Scenario, ScenarioRunner
-from src.scenario_engine.pattern_loader import PatternRegistry
-from tests.scenario_engine.test_pattern_loader import PATTERNS_DIR
 
 
 class MockCallManager:
@@ -29,7 +25,6 @@ class MockCallManager:
         cid = self._next_call_id
         self._next_call_id += 1
         self.calls.append(("make_call", {"dest_uri": dest_uri, "phone_id": phone_id, "call_id": cid}))
-        # Synthesise state transitions asynchronously from a different "thread"
         self.bus.emit(Event(type="call.state.calling", phone_id=phone_id, call_id=cid))
         self.bus.emit(Event(type="call.state.confirmed", phone_id=phone_id, call_id=cid))
         return {"phone_id": phone_id, "call_id": cid, "state": "CONFIRMED"}
@@ -48,9 +43,6 @@ class MockCallManager:
         self.bus.emit(Event(type="call.state.disconnected", phone_id=phone_id, call_id=call_id, data={"last_status": status_code}))
 
     def send_dtmf(self, call_id, digits, phone_id=None):
-        # No emit here — symmetric with the real CallManager.send_dtmf,
-        # which also doesn't emit. ActionExecutor._a_send_dtmf is the one
-        # that fires `dtmf.out` after the dial returns.
         self.calls.append(("send_dtmf", {"phone_id": phone_id, "call_id": call_id, "digits": digits}))
 
     def hold(self, call_id, phone_id=None):
@@ -114,8 +106,6 @@ class MockEngine:
         return [{"codec": c, "priority": 250 - i} for i, c in enumerate(codecs)]
 
     def register_current_thread(self) -> None:
-        # Idempotent in production (gated by libIsThreadRegistered).
-        # Tests just count to verify the helper actually runs.
         self.thread_registrations += 1
 
 
@@ -124,19 +114,25 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_auto_answer_pattern_wires_up() -> None:
-    """Symbolic: auto-answer hooks into call.state.incoming and dispatches `answer`."""
+def _spin_runner(call_mgr, registry, engine, bus, loop) -> ScenarioRunner:
+    """Build a ScenarioRunner from already-made parts."""
+    return ScenarioRunner(
+        bus=bus,
+        call_manager=call_mgr,
+        registry=registry,
+        loop=loop,
+        engine=engine,
+    )
+
+
+def test_inline_auto_answer_hook_dispatches_answer() -> None:
+    """Inline hook on call.state.incoming dispatches `answer`."""
 
     async def inner() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        reg = PatternRegistry(PATTERNS_DIR)
-        reg.scan()
-
-        runner = ScenarioRunner(
-            bus=bus, pattern_registry=reg, call_manager=cm, registry=None, loop=loop
-        )
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         async def emit_incoming_soon() -> None:
             await asyncio.sleep(0.1)
@@ -145,7 +141,12 @@ def test_auto_answer_pattern_wires_up() -> None:
         scenario = Scenario(
             name="test-auto-answer",
             phones=["b"],
-            patterns=[{"use": "auto-answer", "phone_id": "b", "delay_ms": 0}],
+            hooks=[{
+                "when": "call.state.incoming",
+                "on_phone": "b",
+                "once": True,
+                "then": ["answer"],
+            }],
             stop_on=[{"phone_id": "b", "event": "call.state.confirmed"}],
             timeout_ms=3000,
         )
@@ -161,17 +162,12 @@ def test_auto_answer_pattern_wires_up() -> None:
     _run(inner())
 
 
-def test_send_dtmf_on_confirmed_fires_after_delay() -> None:
+def test_inline_send_dtmf_after_confirmed_with_delay() -> None:
     async def inner() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        reg = PatternRegistry(PATTERNS_DIR)
-        reg.scan()
-
-        runner = ScenarioRunner(
-            bus=bus, pattern_registry=reg, call_manager=cm, registry=None, loop=loop
-        )
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         async def emit_confirmed_soon() -> None:
             await asyncio.sleep(0.05)
@@ -180,7 +176,12 @@ def test_send_dtmf_on_confirmed_fires_after_delay() -> None:
         scenario = Scenario(
             name="test-dtmf",
             phones=["a"],
-            patterns=[{"use": "send-dtmf-on-confirmed", "phone_id": "a", "digits": "1234", "initial_delay_ms": 50}],
+            hooks=[{
+                "when": "call.state.confirmed",
+                "on_phone": "a",
+                "once": True,
+                "then": [{"wait": "50ms"}, {"send_dtmf": "1234"}],
+            }],
             stop_on=[{"phone_id": "a", "event": "dtmf.out"}],
             timeout_ms=2000,
         )
@@ -201,16 +202,10 @@ def test_timeout_when_no_stop_condition_matches() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        reg = PatternRegistry(PATTERNS_DIR)
-        reg.scan()
-
-        runner = ScenarioRunner(
-            bus=bus, pattern_registry=reg, call_manager=cm, registry=None, loop=loop
-        )
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
         scenario = Scenario(
             name="test-timeout",
             phones=["a"],
-            patterns=[{"use": "auto-answer", "phone_id": "a"}],
             stop_on=[{"phone_id": "a", "event": "user.never_fires"}],
             timeout_ms=200,
         )
@@ -223,28 +218,20 @@ def test_timeout_when_no_stop_condition_matches() -> None:
     _run(inner())
 
 
-def test_make_call_initial_action_from_pattern() -> None:
-    """make-call-and-wait-confirmed has an initial_action — verify it runs."""
+def test_make_call_initial_action() -> None:
+    """initial_actions can place an outbound call."""
 
     async def inner() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        reg = PatternRegistry(PATTERNS_DIR)
-        reg.scan()
-
-        runner = ScenarioRunner(
-            bus=bus, pattern_registry=reg, call_manager=cm, registry=None, loop=loop
-        )
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
         scenario = Scenario(
             name="test-make-call",
             phones=["a"],
-            patterns=[{
-                "use": "make-call-and-wait-confirmed",
-                "phone_id": "a",
-                "dest_uri": "sip:1002@asterisk",
-                "timeout_ms": 1000,
-            }],
+            initial_actions=[
+                {"action": "make_call", "phone_id": "a", "dest_uri": "sip:1002@asterisk"},
+            ],
             stop_on=[{"phone_id": "a", "event": "call.state.confirmed"}],
             timeout_ms=3000,
         )
@@ -258,30 +245,6 @@ def test_make_call_initial_action_from_pattern() -> None:
     _run(inner())
 
 
-def test_unknown_pattern_returns_error_without_crashing() -> None:
-    async def inner() -> None:
-        loop = asyncio.get_running_loop()
-        bus = EventBus(loop=loop)
-        cm = MockCallManager(bus)
-        reg = PatternRegistry(PATTERNS_DIR)
-        reg.scan()
-
-        runner = ScenarioRunner(
-            bus=bus, pattern_registry=reg, call_manager=cm, registry=None, loop=loop
-        )
-        scenario = Scenario(
-            name="test-bad-pattern",
-            patterns=[{"use": "does-not-exist", "phone_id": "a"}],
-            stop_on=[{"phone_id": "a", "event": "call.state.confirmed"}],
-            timeout_ms=100,
-        )
-        result = await runner.run(scenario)
-        assert result.status == "error"
-        assert any("does-not-exist" in str(e) for e in result.errors)
-
-    _run(inner())
-
-
 def test_auto_validation_rejects_scenario_before_running() -> None:
     """Auto-validation fails fast — no wait until timeout."""
 
@@ -289,16 +252,14 @@ def test_auto_validation_rejects_scenario_before_running() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
-        # Bad action name in initial_actions — validator should trip
         scenario = Scenario(
             name="bad-action-fast-fail",
             phones=["a"],
-            patterns=[],
             initial_actions=[{"frobnicate": "xyz"}],
             stop_on=[{"phone_id": "a", "event": "user.done"}],
-            timeout_ms=5000,   # intentionally long: if validation works, we stop <100ms
+            timeout_ms=5000,
         )
         t0 = time.monotonic()
         result = await runner.run(scenario)
@@ -306,7 +267,6 @@ def test_auto_validation_rejects_scenario_before_running() -> None:
         assert result.status == "error"
         assert result.reason == "pre-flight validation failed"
         assert elapsed < 0.30, f"validation should fail fast; got {elapsed}s"
-        # And the MockCallManager should never have been touched.
         assert cm.calls == []
 
     _run(inner())
@@ -319,42 +279,19 @@ def test_skip_validation_bypasses_preflight() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="skip-validation",
             phones=["a"],
-            patterns=[],
             initial_actions=[{"frobnicate": "xyz"}],
             stop_on=[{"phone_id": "a", "event": "user.never_fires"}],
             timeout_ms=200,
         )
         result = await runner.run(scenario, skip_validation=True)
-        # Without validation, the bogus action errors at runtime, and the
-        # scenario then hits its timeout (because initial_actions raised
-        # and stop_on never fires).
         assert result.status in ("timeout", "error")
 
     _run(inner())
-
-
-# ---------------- new-action dispatch tests ----------------
-# These exercise attended_transfer, conference, play_audio, stop_audio,
-# send_message, set_codecs — the actions added beyond the initial MVP.
-
-def _spin_runner(patterns_root, call_mgr, registry, engine, bus, loop):
-    """Helper — build a ScenarioRunner from already-made parts."""
-    from src.scenario_engine.orchestrator import ScenarioRunner
-    reg = PatternRegistry(patterns_root)
-    reg.scan()
-    return ScenarioRunner(
-        bus=bus,
-        pattern_registry=reg,
-        call_manager=call_mgr,
-        registry=registry,
-        loop=loop,
-        engine=engine,
-    )
 
 
 def test_attended_transfer_action_dispatches_to_call_manager() -> None:
@@ -362,12 +299,11 @@ def test_attended_transfer_action_dispatches_to_call_manager() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="attended-xfer-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "attended_transfer", "phone_id": "a", "call_id": 1, "dest_call_id": 2}
             ],
@@ -375,12 +311,11 @@ def test_attended_transfer_action_dispatches_to_call_manager() -> None:
             timeout_ms=200,
         )
         result = await runner.run(scenario)
-        # Expect timeout (no user.done ever fires) — but the action must have run.
         xfer = [c for c in cm.calls if c[0] == "attended_transfer"]
         assert xfer, f"attended_transfer not invoked; got: {cm.calls}"
         assert xfer[0][1]["call_id"] == 1
         assert xfer[0][1]["dest_call_id"] == 2
-        assert result.status == "timeout"  # Sanity check the frame
+        assert result.status == "timeout"
 
     _run(inner())
 
@@ -390,7 +325,7 @@ def test_conference_action() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="conf-smoke",
@@ -414,7 +349,7 @@ def test_play_audio_and_stop_audio() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="audio-smoke",
@@ -443,7 +378,7 @@ def test_send_message_action() -> None:
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
         reg_mock = MockRegistry()
-        runner = _spin_runner(PATTERNS_DIR, cm, reg_mock, MockEngine(), bus, loop)
+        runner = _spin_runner(cm, reg_mock, MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="msg-smoke",
@@ -465,13 +400,13 @@ def test_send_message_action() -> None:
 
 
 def test_scenario_level_inline_hook_fires() -> None:
-    """Scenario can define hooks inline, without a pattern wrapper."""
+    """Scenario can define hooks inline without a pattern wrapper."""
 
     async def inner() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         async def emit_confirmed_soon() -> None:
             await asyncio.sleep(0.05)
@@ -480,7 +415,6 @@ def test_scenario_level_inline_hook_fires() -> None:
         scenario = Scenario(
             name="inline-hook-smoke",
             phones=["a"],
-            patterns=[],
             hooks=[
                 {
                     "when": "call.state.confirmed",
@@ -509,20 +443,17 @@ def test_stop_on_match_filters_by_call_id() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         async def emit_wrong_then_right() -> None:
             await asyncio.sleep(0.05)
-            # Wrong call_id first — should NOT trigger stop
             bus.emit(Event(type="call.state.disconnected", phone_id="a", call_id=1))
             await asyncio.sleep(0.05)
-            # Right call_id — triggers stop
             bus.emit(Event(type="call.state.disconnected", phone_id="a", call_id=2))
 
         scenario = Scenario(
             name="stop-on-match",
             phones=["a"],
-            patterns=[],
             stop_on=[{"phone_id": "a", "call_id": 2, "event": "call.state.disconnected"}],
             timeout_ms=2000,
         )
@@ -532,7 +463,6 @@ def test_stop_on_match_filters_by_call_id() -> None:
         await task
         elapsed = time.monotonic() - t0
         assert result.status == "ok"
-        # Stop should happen ~0.1s (2nd event), not 0.05s (1st) and not on timeout.
         assert 0.08 < elapsed < 0.30, f"unexpected elapsed: {elapsed}"
 
     _run(inner())
@@ -545,17 +475,15 @@ def test_stop_on_match_predicate_last_status() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         async def emit_ok_then_busy() -> None:
             await asyncio.sleep(0.03)
-            # Normal disconnect (status 200) — should NOT stop
             bus.emit(Event(
                 type="call.state.disconnected", phone_id="a", call_id=1,
                 data={"last_status": 200},
             ))
             await asyncio.sleep(0.03)
-            # Busy disconnect (status 486) — stop
             bus.emit(Event(
                 type="call.state.disconnected", phone_id="a", call_id=2,
                 data={"last_status": 486},
@@ -564,7 +492,6 @@ def test_stop_on_match_predicate_last_status() -> None:
         scenario = Scenario(
             name="stop-on-bad-status",
             phones=["a"],
-            patterns=[],
             stop_on=[{
                 "phone_id": "a",
                 "event": "call.state.disconnected",
@@ -588,7 +515,6 @@ def test_conference_auto_fills_call_ids() -> None:
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
 
-        # Pretend phone a has two active calls already
         def fake_active(phone_id=None):
             return [
                 {"call_id": 10, "state": "CONFIRMED", "phone_id": "a"},
@@ -596,11 +522,10 @@ def test_conference_auto_fills_call_ids() -> None:
             ]
         cm.get_active_calls = fake_active  # type: ignore[assignment]
 
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
         scenario = Scenario(
             name="conf-auto",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "conference", "phone_id": "a", "call_ids": "auto"},
             ],
@@ -627,19 +552,16 @@ def test_synthetic_reg_success_emitted_for_preregistered_phone() -> None:
             "a": {"is_registered": True, "status_code": 200, "reason": "OK", "expires": 600},
             "b": {"is_registered": False},
         })
-        runner = _spin_runner(PATTERNS_DIR, cm, reg, MockEngine(), bus, loop)
+        runner = _spin_runner(cm, reg, MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="synth-reg-replay",
             phones=["a", "b"],
-            patterns=[],
             stop_on=[{"phone_id": "a", "event": "reg.success"}],
             timeout_ms=500,
         )
         result = await runner.run(scenario)
-        # Should stop because synthetic reg.success arrived for `a`.
         assert result.status == "ok", f"reason={result.reason}"
-        # Verify the synthetic event landed in the timeline marked as such.
         reg_events = [
             e for e in result.timeline
             if e["kind"] == "event" and e["type"] == "reg.success"
@@ -647,7 +569,6 @@ def test_synthetic_reg_success_emitted_for_preregistered_phone() -> None:
         assert reg_events, f"no reg.success in timeline: {result.timeline}"
         assert reg_events[0]["phone_id"] == "a"
         assert reg_events[0]["data"].get("synthetic") is True
-        # `b` was not registered → no synthetic emit for it.
         assert all(e["phone_id"] != "b" for e in reg_events)
 
     _run(inner())
@@ -662,12 +583,11 @@ def test_scenario_started_fires_after_hooks_are_armed() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="coordinator-hook-smoke",
             phones=["a"],
-            patterns=[],
             hooks=[
                 {
                     "when": "scenario.started",
@@ -682,7 +602,6 @@ def test_scenario_started_fires_after_hooks_are_armed() -> None:
         )
         result = await runner.run(scenario)
         assert result.status == "ok", f"reason={result.reason}"
-        # Stop must have come from the coordinator's emit, not from timeout.
         assert any(
             e["type"] == "user.coordinator_ran" for e in result.timeline
         ), "coordinator hook never fired its emit"
@@ -697,17 +616,12 @@ def test_synthetic_reg_replay_skipped_when_registry_is_none() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        from src.scenario_engine.orchestrator import ScenarioRunner
-        from src.scenario_engine.pattern_loader import PatternRegistry
-        pr = PatternRegistry(PATTERNS_DIR); pr.scan()
         runner = ScenarioRunner(
-            bus=bus, pattern_registry=pr, call_manager=cm,
-            registry=None, loop=loop,
+            bus=bus, call_manager=cm, registry=None, loop=loop,
         )
         scenario = Scenario(
             name="no-registry",
             phones=["a"],
-            patterns=[],
             stop_on=[{"phone_id": "a", "event": "user.never_fires"}],
             timeout_ms=100,
         )
@@ -723,7 +637,7 @@ def test_set_codecs_action_with_and_without_engine() -> None:
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
         eng = MockEngine()
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), eng, bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), eng, bus, loop)
 
         scenario = Scenario(
             name="codecs-smoke",
@@ -741,7 +655,7 @@ def test_set_codecs_action_with_and_without_engine() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), None, bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), None, bus, loop)
 
         scenario = Scenario(
             name="codecs-no-engine",
@@ -753,7 +667,6 @@ def test_set_codecs_action_with_and_without_engine() -> None:
             timeout_ms=100,
         )
         result = await runner.run(scenario)
-        # set_codecs without engine should record an error but not crash the run.
         assert any("set_codecs" in str(e) or "SipEngine" in str(e) for e in result.errors)
 
     _run(with_engine())

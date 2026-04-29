@@ -28,7 +28,6 @@ from .pcap_manager import PcapManager
 from .phone_tool_factory import register_phone_tools, unregister_phone_tools
 from .scenario_engine.event_bus import EventBus, set_default_bus
 from .scenario_engine.orchestrator import run_scenario as run_scenario_impl
-from .scenario_engine.pattern_loader import PatternRegistry
 
 # All Python logging goes to stderr — stdout is the MCP channel
 logging.basicConfig(
@@ -43,11 +42,7 @@ registry: PhoneRegistry | None = None
 call_mgr: CallManager | None = None
 pcap_mgr: PcapManager | None = None
 event_bus: EventBus | None = None
-pattern_registry: PatternRegistry | None = None
 _poll_task: asyncio.Task | None = None
-
-# Pattern library directory — under the repo root (or /app in the container).
-_PATTERNS_DIR = Path(__file__).resolve().parent.parent / "scenarios" / "patterns"
 
 # Tracks dynamically-registered per-phone tool names so drop_phone can remove them.
 _phone_tools: dict[str, list[str]] = {}
@@ -130,7 +125,7 @@ async def _poll_pjsip_events(eng: SipEngine) -> None:
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     """Manage PJSUA2 lifecycle alongside MCP server."""
-    global engine, registry, call_mgr, pcap_mgr, _poll_task, event_bus, pattern_registry
+    global engine, registry, call_mgr, pcap_mgr, _poll_task, event_bus
     log.info("PJSUA MCP server starting")
     engine = SipEngine()
     registry = PhoneRegistry(engine)
@@ -140,21 +135,9 @@ async def lifespan(server: FastMCP):
     call_mgr = CallManager(engine, registry, pcap_mgr=pcap_mgr)
 
     # Scenario engine plumbing — bus is the default for pjsua callbacks to
-    # emit events (reg.*, call.state.*, dtmf.*). PatternRegistry is kept for
-    # scenarios that still reference legacy `patterns:` blocks; new scenarios
-    # should use inline hooks. The registry is no longer exposed via MCP.
+    # emit events (reg.*, call.state.*, dtmf.*).
     event_bus = EventBus(loop=asyncio.get_running_loop())
     set_default_bus(event_bus)
-    pattern_registry = PatternRegistry(_PATTERNS_DIR)
-    try:
-        pattern_registry.scan()
-        log.info("Pattern registry: %d pattern(s) loaded from %s",
-                 len(pattern_registry.names()), _PATTERNS_DIR)
-        if pattern_registry.errors():
-            for path, err in pattern_registry.errors().items():
-                log.warning("Pattern load error %s: %s", path, err)
-    except Exception:
-        log.exception("Pattern registry scan failed")
 
     # Start engine up-front so add_phone works immediately.
     engine.initialize()
@@ -966,44 +949,24 @@ async def list_recordings(
 # Scenario engine tools — validate_scenario / get_scenario_template / run_scenario
 # ---------------------------------------------------------------------------
 @mcp.tool()
-async def validate_scenario(scenario: dict[str, Any] | str) -> dict[str, Any]:
-    """Dry-run check for a scenario — catch typos / unknown patterns / bad events
+async def validate_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
+    """Dry-run check for a scenario — catch typos / bad events / unknown actions
     BEFORE actually running. Returns `{status: "ok" | "error", issues: [...]}`.
 
     Does NOT touch pjsua / Asterisk. Purely static checks:
-      - pattern refs resolve against the library
-      - each pattern instantiates with the given params (schema + Jinja render)
       - `hooks[*].when` uses a known event-type prefix
       - `stop_on[*].event` is a known type
       - no `action:` name that's not in the executor's dispatch table
     """
-    from .scenario_engine.orchestrator import Scenario
     from .scenario_engine.validator import validate_scenario as _validate
 
-    if pattern_registry is None:
+    if not isinstance(scenario, dict):
         return {
             "status": "error",
-            "issues": [{"kind": "engine", "msg": "pattern registry not initialised"}],
+            "issues": [{"kind": "arg",
+                        "msg": f"scenario must be a dict, got {type(scenario).__name__}"}],
         }
-
-    try:
-        if isinstance(scenario, str):
-            path = Path(scenario)
-            if not path.is_absolute():
-                path = _PATTERNS_DIR.parent / "examples" / scenario
-            scn: Scenario | dict[str, Any] = Scenario.from_yaml_file(path)
-        elif isinstance(scenario, dict):
-            scn = scenario
-        else:
-            return {
-                "status": "error",
-                "issues": [{"kind": "arg",
-                            "msg": f"unsupported scenario type: {type(scenario).__name__}"}],
-            }
-    except Exception as e:
-        return {"status": "error", "issues": [{"kind": "parse", "msg": str(e)}]}
-
-    return _validate(scn, pattern_registry)
+    return _validate(scenario)
 
 
 @mcp.tool()
@@ -1016,27 +979,31 @@ name: my-scenario
 description: >
   Brief description of what this flow tests and what "pass" looks like.
 phones: [a, b]                          # must be provisioned BEFORE run_scenario
-patterns:
-  - {use: wait-for-registration, phone_id: a}
-  - {use: wait-for-registration, phone_id: b}
-  - {use: auto-answer, phone_id: b, delay_ms: 200}
-  - {use: make-call-and-wait-confirmed, phone_id: a, dest_uri: "sip:6002@asterisk"}
-  - {use: hangup-after-duration, phone_id: a, duration_ms: 5000}
-initial_actions: []                     # usually empty — patterns drive this
-hooks:                                  # inline — for one-off flows
-  # - when: call.state.confirmed
-  #   on_phone: a
-  #   once: true
-  #   then:
-  #     - wait: 1000ms
-  #     - hold
-  #     - wait: 2000ms
-  #     - unhold
-stop_on:
+
+initial_actions:                        # fired once at scenario start
+  - {action: make_call, phone_id: a, dest_uri: "sip:6002@asterisk"}
+
+hooks:                                  # event-driven reactions
+  - when: call.state.incoming
+    on_phone: b
+    once: true                          # remove this hook after first match
+    then:
+      - wait: 200ms
+      - answer
+
+  - when: call.state.confirmed
+    on_phone: a
+    once: true
+    then:
+      - wait: 3000ms
+      - hangup
+
+stop_on:                                # any matching event ends the scenario
   - {phone_id: a, event: call.state.disconnected}
 # stop_on filter options:
 #   - {phone_id: a, event: ..., call_id: 2}                        # specific call
 #   - {event: call.state.disconnected, match: {last_status: "4xx"}}  # predicate
+
 timeout_ms: 15000
 """
     return {
@@ -1055,61 +1022,43 @@ timeout_ms: 15000
         },
         "actions": {
             "call_control": [
-                "answer", "hangup", "reject", "hold", "unhold",
+                "answer", "hangup", "hangup_all", "reject", "hold", "unhold",
                 "send_dtmf", "blind_transfer", "attended_transfer",
                 "conference", "make_call",
             ],
             "media": ["play_audio", "stop_audio", "send_message", "set_codecs"],
             "flow_control": ["wait", "wait_until", "emit", "checkpoint", "log"],
         },
-        "docs": [
-            "docs/scenarios-guide.md",
-            "scenarios/patterns/SCHEMA.md",
-            "docs/agent-handoff.md",
-        ],
     }
 
 
 @mcp.tool()
 async def run_scenario(
-    scenario: dict[str, Any] | str,
+    scenario: dict[str, Any],
     timeout_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Run a scenario (dict or path to YAML file).
+    """Run a scenario (must be a dict — full inline scenario specification).
 
-    Returns a Timeline dict with `status`, `elapsed_ms`, `timeline`, `errors`,
-    and `patterns_used`. The call blocks until the scenario either matches a
-    `stop_on` condition or hits `timeout_ms` (defaults to scenario YAML value
-    or 60_000 if neither provided).
+    Returns a Timeline dict with `status`, `elapsed_ms`, `timeline`, `errors`.
+    The call blocks until the scenario either matches a `stop_on` condition
+    or hits `timeout_ms` (defaults to scenario value or 60_000 if neither
+    provided).
     """
-    if (
-        event_bus is None
-        or pattern_registry is None
-        or call_mgr is None
-        or registry is None
-    ):
+    if event_bus is None or call_mgr is None or registry is None:
         return {"status": "error", "error": "scenario engine not initialised"}
-    # Accept str as YAML file path
-    scn_input: Any = scenario
-    if isinstance(scenario, str):
-        try:
-            path = Path(scenario)
-            if not path.is_absolute():
-                # Resolve relative to the scenarios/examples/ directory.
-                examples = _PATTERNS_DIR.parent / "examples"
-                path = examples / scenario
-            scn_input = path
-        except Exception as e:
-            return {"status": "error", "error": f"bad scenario path: {e}"}
-    # Override timeout if provided
-    if isinstance(scn_input, dict) and timeout_ms is not None:
-        scn_input = {**scn_input, "timeout_ms": int(timeout_ms)}
+    if not isinstance(scenario, dict):
+        return {
+            "status": "error",
+            "error": f"scenario must be a dict, got {type(scenario).__name__}",
+        }
+    scn_input: dict[str, Any] = scenario
+    if timeout_ms is not None:
+        scn_input = {**scenario, "timeout_ms": int(timeout_ms)}
     try:
         loop = asyncio.get_running_loop()
         result = await run_scenario_impl(
             scn_input,
             bus=event_bus,
-            pattern_registry=pattern_registry,
             call_manager=call_mgr,
             registry=registry,
             loop=loop,

@@ -12,15 +12,13 @@ import asyncio
 import time
 
 from src.scenario_engine.event_bus import Event, EventBus
-from src.scenario_engine.orchestrator import Scenario, ScenarioRunner
-from src.scenario_engine.pattern_loader import PatternRegistry
+from src.scenario_engine.orchestrator import Scenario
 
 from tests.scenario_engine.test_orchestrator import (
     MockCallManager,
     MockEngine,
     MockRegistry,
     _spin_runner,
-    PATTERNS_DIR,
 )
 
 
@@ -33,12 +31,11 @@ def test_hangup_dispatches_to_call_manager() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="hangup-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[{"action": "hangup", "phone_id": "a", "call_id": 5}],
             stop_on=[{"phone_id": "a", "event": "user.done"}],
             timeout_ms=100,
@@ -55,12 +52,11 @@ def test_reject_dispatches_with_status_code() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="reject-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "reject", "phone_id": "a", "call_id": 3, "code": 603},
             ],
@@ -79,12 +75,11 @@ def test_hold_and_unhold_dispatch() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="hold-unhold-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "hold", "phone_id": "a", "call_id": 1},
                 {"action": "unhold", "phone_id": "a", "call_id": 1},
@@ -105,12 +100,11 @@ def test_blind_transfer_dispatch() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="blind-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "blind_transfer", "phone_id": "a", "call_id": 2,
                  "to": "sip:6003@asterisk"},
@@ -132,12 +126,11 @@ def test_wait_duration_parses_and_sleeps() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="wait-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[{"wait": "150ms"}, {"action": "hangup", "phone_id": "a", "call_id": 1}],
             stop_on=[{"phone_id": "a", "event": "user.done"}],
             timeout_ms=500,
@@ -158,7 +151,7 @@ def test_wait_until_blocks_on_event() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         async def emit_target_later() -> None:
             await asyncio.sleep(0.1)
@@ -167,7 +160,6 @@ def test_wait_until_blocks_on_event() -> None:
         scenario = Scenario(
             name="wait-until-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "wait_until", "event": "user.my_signal", "timeout_ms": 2000},
                 {"action": "hangup", "phone_id": "a", "call_id": 9},
@@ -191,12 +183,11 @@ def test_emit_action_pushes_user_event() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="emit-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "emit", "name": "checkpoint_reached"},
             ],
@@ -220,12 +211,11 @@ def test_hangup_all_dispatches() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="hangup-all-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[{"action": "hangup_all", "phone_id": "a"}],
             stop_on=[{"phone_id": "a", "event": "user.done"}],
             timeout_ms=100,
@@ -244,12 +234,11 @@ def test_hangup_all_without_phone_id_is_global() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="hangup-all-global",
             phones=["a"],
-            patterns=[],
             initial_actions=[{"action": "hangup_all"}],
             stop_on=[{"phone_id": "a", "event": "user.done"}],
             timeout_ms=100,
@@ -269,12 +258,11 @@ def test_send_dtmf_action_emits_dtmf_out_event() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="dtmf-out-emission",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "send_dtmf", "phone_id": "a", "call_id": 7, "digits": "42"},
             ],
@@ -302,12 +290,11 @@ def test_checkpoint_and_log_land_in_timeline() -> None:
         loop = asyncio.get_running_loop()
         bus = EventBus(loop=loop)
         cm = MockCallManager(bus)
-        runner = _spin_runner(PATTERNS_DIR, cm, MockRegistry(), MockEngine(), bus, loop)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
 
         scenario = Scenario(
             name="meta-smoke",
             phones=["a"],
-            patterns=[],
             initial_actions=[
                 {"action": "checkpoint", "label": "start"},
                 {"action": "log", "message": "hello"},
