@@ -48,63 +48,6 @@ _poll_task: asyncio.Task | None = None
 _phone_tools: dict[str, list[str]] = {}
 
 DEFAULT_PROFILE_PATH = "/config/phones.yaml"
-EXAMPLE_PROFILE_PATH = "/config/phones.example.yaml"
-
-# Authoritative template returned by `get_phone_profile_example`. Kept here
-# (not in a separate file) so the MCP tool is self-contained — callers don't
-# need filesystem access to the repo to discover the schema.
-PHONE_PROFILE_TEMPLATE = """\
-# Phone profile for load_phones.
-#
-# Save this file on the host at ./config/phones.yaml (the docker-compose
-# bind mounts ./config to /config inside the container), fill in the
-# credentials for your SIP stand, then invoke the MCP tool:
-#
-#   mcp__pjsua__load_phones()                               # /config/phones.yaml
-#   mcp__pjsua__load_phones(path="/config/other.yaml")      # another profile
-#
-# Both recording and auto-capture default to OFF. Opt in per phone:
-#   - `recording_enabled: true` → /recordings/<phone_id>/call_<id>_<ts>.wav
-#     plus a .meta.json sidecar (codec, duration, remote URI, direction,
-#     and — if capture is also on — the paired pcap path).
-#   - `capture_enabled: true`   → /captures/<phone_id>/call_<id>_<ts>.pcap
-#     from a dedicated tcpdump subprocess that spans the whole call.
-# When both are on, the WAV and pcap share a basename so they line up
-# on disk without any timestamp matching.
-
-# Keys under `defaults` are merged into every phone entry.
-# Phone-level keys win over defaults.
-defaults:
-  domain: sip.example.com
-  password: change_me
-  codecs: [PCMA]
-  transport: udp
-  auto_answer: false
-  register: true
-  srtp: false
-  # recording_enabled: false   # default — set true to record every call
-                               # to /recordings/<phone_id>/*.wav
-  # capture_enabled: false     # default — set true to auto-capture pcaps
-                               # for every phone (tcpdump per call)
-
-phones:
-  - phone_id: a
-    username: "1001"
-    recording_enabled: true    # per-phone override — 'a' records
-    capture_enabled: true      # per-phone override — 'a' also pcap-captures
-
-  - phone_id: b
-    username: "1002"
-    auto_answer: true
-
-  - phone_id: c
-    username: "1003"
-    auto_answer: true
-    # recording_enabled: true   # per-phone override wins over defaults
-    # Per-phone override:
-    # password: "c_specific_pw"
-    # realm: "example.realm"
-"""
 
 
 async def _poll_pjsip_events(eng: SipEngine) -> None:
@@ -192,7 +135,7 @@ def _validate_phone_id(phone_id: str) -> None:
     # Guard against phone_id producing a collision with static tool names.
     static_tool_names = {
         "add_phone", "drop_phone", "list_phones", "get_phone", "update_phone",
-        "load_phones", "get_phone_profile_example",
+        "load_phones",
         "get_codecs", "set_codecs", "get_sip_log",
         "start_capture", "stop_capture", "get_pcap", "list_recordings",
     }
@@ -511,9 +454,9 @@ def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(
-            f"Profile not found: {path}. Call get_phone_profile_example() "
-            f"for a template, save it to ./config/phones.yaml on the host "
-            f"(mounted read-only to /config in the container), then retry."
+            f"Profile not found: {path}. See config/phones.example.yaml in "
+            f"the repo for the template — copy it to ./config/phones.yaml on "
+            f"the host (mounted read-only to /config in the container) and retry."
         )
 
     with file_path.open("r", encoding="utf-8") as f:
@@ -567,38 +510,6 @@ def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
         raise ValueError(f"{path}: duplicate phone_id(s): {dups}")
 
     return resolved
-
-
-@mcp.tool()
-async def get_phone_profile_example() -> dict[str, Any]:
-    """Return a YAML template for `load_phones`.
-
-    Use this when you don't know the phone-profile format — the returned
-    `template` field is a ready-to-edit YAML. Save it as ./config/phones.yaml
-    on the host, fill in your SIP credentials, then call `load_phones`.
-
-    Returns a dict with:
-      - template: YAML string (copy to phones.yaml and edit)
-      - save_to: Where to put the file (host path + container path)
-      - next_step: The MCP tool to call after saving
-      - example_file_in_container: Canonical path of the example on disk
-        (accessible via the ./config bind mount)
-    """
-    return {
-        "template": PHONE_PROFILE_TEMPLATE,
-        "save_to": {
-            "host_path": "./config/phones.yaml (in the pjsua_mcp repo)",
-            "container_path": DEFAULT_PROFILE_PATH,
-        },
-        "next_step": f"mcp__pjsua__load_phones(path='{DEFAULT_PROFILE_PATH}')",
-        "example_file_in_container": EXAMPLE_PROFILE_PATH,
-        "notes": [
-            "phones.yaml is gitignored; phones.example.yaml is the tracked template.",
-            "/config is mounted read-only — edit the file on the host, not in the container.",
-            "load_phones defaults to replace mode (drops existing phones + calls).",
-            "Pass merge=True to keep phones not listed in the profile.",
-        ],
-    }
 
 
 @mcp.tool()
@@ -946,7 +857,7 @@ async def list_recordings(
 
 
 # ---------------------------------------------------------------------------
-# Scenario engine tools — validate_scenario / get_scenario_template / run_scenario
+# Scenario engine tools — validate_scenario / run_scenario
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def validate_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
@@ -967,69 +878,6 @@ async def validate_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                         "msg": f"scenario must be a dict, got {type(scenario).__name__}"}],
         }
     return _validate(scenario)
-
-
-@mcp.tool()
-async def get_scenario_template() -> dict[str, Any]:
-    """Return a ready-to-edit scenario YAML skeleton + quick reference of
-    available events, actions, and stop_on filter shapes. Call this first
-    when writing a scenario from scratch."""
-    template = """\
-name: my-scenario
-description: >
-  Brief description of what this flow tests and what "pass" looks like.
-phones: [a, b]                          # must be provisioned BEFORE run_scenario
-
-initial_actions:                        # fired once at scenario start
-  - {action: make_call, phone_id: a, dest_uri: "sip:6002@asterisk"}
-
-hooks:                                  # event-driven reactions
-  - when: call.state.incoming
-    on_phone: b
-    once: true                          # remove this hook after first match
-    then:
-      - wait: 200ms
-      - answer
-
-  - when: call.state.confirmed
-    on_phone: a
-    once: true
-    then:
-      - wait: 3000ms
-      - hangup
-
-stop_on:                                # any matching event ends the scenario
-  - {phone_id: a, event: call.state.disconnected}
-# stop_on filter options:
-#   - {phone_id: a, event: ..., call_id: 2}                        # specific call
-#   - {event: call.state.disconnected, match: {last_status: "4xx"}}  # predicate
-
-timeout_ms: 15000
-"""
-    return {
-        "status": "ok",
-        "template": template,
-        "events": {
-            "reg": ["reg.started", "reg.success", "reg.failed", "reg.unregistered"],
-            "call_state": [
-                "call.state.calling", "call.state.incoming", "call.state.early",
-                "call.state.connecting", "call.state.confirmed", "call.state.disconnected",
-            ],
-            "dtmf": ["dtmf.in", "dtmf.out"],
-            "im": ["im.received"],
-            "scenario": ["scenario.started", "scenario.stopped"],
-            "user_emitted": ["user.<any-name-from-emit-action>"],
-        },
-        "actions": {
-            "call_control": [
-                "answer", "hangup", "hangup_all", "reject", "hold", "unhold",
-                "send_dtmf", "blind_transfer", "attended_transfer",
-                "conference", "make_call",
-            ],
-            "media": ["play_audio", "stop_audio", "send_message", "set_codecs"],
-            "flow_control": ["wait", "wait_until", "emit", "checkpoint", "log"],
-        },
-    }
 
 
 @mcp.tool()

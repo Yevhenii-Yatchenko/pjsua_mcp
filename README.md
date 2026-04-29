@@ -27,8 +27,8 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 │  │    │                            (maps 19 actions       │   │
 │  │    │                             to CallManager etc.)  │   │
 │  │    │                                                   │   │
-│  │ Orchestrator ──► run_scenario / validate_scenario /    │   │
-│  │                  get_scenario_template                 │   │
+│  │ Orchestrator ──► run_scenario / validate_scenario      │   │
+│  │                                                          │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                       ▼                                      │
 │  ┌────────────┐  ┌───────────────┐  ┌─────────────────────┐  │
@@ -66,7 +66,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 
 ## MCP Tools
 
-### Static (17 — always present)
+### Static (15 — always present)
 
 #### Phone CRUD
 | Tool | Description |
@@ -77,7 +77,6 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 | `get_phone` | Full info for one phone — credentials (sans password), reg state, active calls, `recording_enabled` |
 | `update_phone` | Mutate runtime settings — `auto_answer` / `recording_enabled` / `capture_enabled` (instant), `codecs`, or credentials (forces reregister) |
 | `load_phones` | Bulk-add every phone listed in a YAML profile. Atomic replace by default (`merge=True` for upsert) |
-| `get_phone_profile_example` | Return a ready-to-edit YAML template, host/container paths, and next-step hints |
 
 #### Global diagnostics
 | Tool | Description |
@@ -93,9 +92,8 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 #### Scenario engine
 | Tool | Description |
 |------|-------------|
-| `get_scenario_template` | Ready-to-edit scenario YAML skeleton + structured reference of every event type and action |
 | `validate_scenario` | Static dry-run — catches unknown actions, unknown event types, malformed hooks — without touching pjsua |
-| `run_scenario` | Execute a scenario (dict or YAML path), auto-validates first, returns full timeline + status + errors |
+| `run_scenario` | Execute a scenario dict, auto-validates first, returns full timeline + status + errors |
 
 ### Per-phone dynamic (22 per active phone)
 
@@ -122,7 +120,7 @@ Registered when `add_phone` (or `load_phones`) brings a phone online; unregister
 | `a_register` / `a_unregister` | Fresh REGISTER cycle / de-REGISTER (symmetric pair) |
 | `a_get_registration_status` | Quick reg state for phone a |
 
-Total surface with N phones: 17 + 22·N.
+Total surface with N phones: 15 + 22·N.
 
 ## Quick Start
 
@@ -151,16 +149,6 @@ Add to your MCP client config (e.g. `.mcp.json`):
 ### 3. Describe your phones (YAML profile)
 
 The server ships with no SIP credentials — you describe your phones in a YAML profile that stays on your host.
-
-**(a) From MCP** — any AI client can ask for the template directly:
-
-```
-mcp__pjsua__get_phone_profile_example()
-```
-
-Returns the template YAML, `save_to` hint, and `next_step` tool name.
-
-**(b) From the repo:**
 
 ```bash
 cp config/phones.example.yaml config/phones.yaml
@@ -382,20 +370,20 @@ deterministically. The engine replaces "call tool, wait 2 s, call next
 tool" loops (which burn wall-clock on LLM-turn latency and race against
 real SIP timers) with a YAML flow that runs in one asyncio loop.
 
-### Three tools in a typical workflow
+### Two tools in a typical workflow
 
 ```python
-get_scenario_template()                # YAML skeleton + event/action reference
 validate_scenario(scenario=<dict>)     # static dry-run (no pjsua touched)
 run_scenario(scenario=<dict>)          # execute and return the timeline
 ```
 
-All three tools accept a scenario only as a Python dict — file paths are
-not supported (the agent runs outside the container, so paths don't translate).
+Both tools accept a scenario only as a Python dict — file paths are not
+supported (the agent runs outside the container, so paths don't translate).
 
 Scenarios are authored as **inline `hooks:`** — `when: <event>` + `then: [<actions>]`.
-See the `pjsua-scenarios` skill for the canonical shape, the coordinator-hook
-idiom, and worked examples (blind transfer, attended transfer).
+**The canonical reference** for anatomy, idioms, full action surface, and
+worked examples (blind transfer, attended transfer) lives in the
+`pjsua-scenarios` skill that ships with this MCP.
 
 ### Event taxonomy
 

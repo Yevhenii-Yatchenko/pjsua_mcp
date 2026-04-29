@@ -7,8 +7,8 @@
 #   mcp__pjsua__load_phones()                               # /config/phones.yaml
 #   mcp__pjsua__load_phones(path="/config/other.yaml")      # another profile
 #
-# This file is the canonical template; get_phone_profile_example() returns
-# the same content over MCP for callers who don't have filesystem access.
+# This file is the canonical template — copy it to ./config/phones.yaml
+# and edit the credentials.
 #
 # Recording AND auto-capture both default to OFF. Opt in per phone:
 #
