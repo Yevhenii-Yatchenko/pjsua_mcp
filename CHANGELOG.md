@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### Added
+- MCP tool `get_call_messages(phone_id, call_id, method, direction,
+  status_code, cseq, last_n)` — structured counterpart to `get_sip_log`.
+  Returns `{messages: [{ts, direction, method, cseq, call_id, from, to,
+  headers, sdp, status_code?}, ...]}` with parsed SDP (codecs, media
+  ports, direction, rtcp port). Built for LLM-driven plan checks
+  ("did alice's INVITE offer PCMU only?") that previously required
+  regex-grepping raw SIP messages. Drops non-SIP log entries (pjlib
+  library logs, `[DISCONNECTED]` dumps) silently.
+- `get_sip_log` accepts new filter kwargs `method`, `direction`,
+  `status_code`, `cseq` — same set as `get_call_messages` so both tools
+  share semantics. `get_sip_log` keeps `filter_text` (substring escape
+  hatch); `get_call_messages` does not (parsed structure makes it
+  unnecessary).
+- `src/sip_logger.py:parse_sdp_body(text)` — line-by-line SDP parser
+  per RFC 4566. Output shape per proposal-03: `{version, origin, media:
+  [{type, port, protocol, payload_types, codecs:[{pt, name, clock_rate,
+  fmtp?}], direction, rtcp_port}]}`. Tolerates CRLF/LF endings, missing
+  optional lines (b=, a=ssrc, a=rtcp), static PT without rtpmap (PT 0/8/9
+  default to PCMU/PCMA/G722 per RFC 3551), multi-section SDP. 14 unit
+  tests in `tests/test_sip_logger.py::TestParseSdpBody`.
+- `src/sip_logger.py:parse_sip_headers(text)` — extracts SIP message
+  headers as `dict[str, str | list[str]]`. Multi-value headers (Via x2,
+  Route, Record-Route) collapse into lists. Canonical case for well-known
+  headers (Call-ID, CSeq, Content-Type, etc.). 11 unit tests in
+  `tests/test_sip_logger.py::TestParseSipHeaders`.
+- `src/sip_logger.py:structurize_message(entry)` — composes
+  `parse_sip_metadata + parse_sip_headers + parse_sdp_body` plus a small
+  timestamp regex into the proposal-03 message shape. Returns None for
+  non-SIP entries. 9 unit tests in
+  `tests/test_sip_logger.py::TestStructurizeMessage`. Integration tests
+  in `TestCallFlow` (5 new) cover `get_call_messages` against live
+  Asterisk: parsed SDP codec list, call_id filter narrowing, status_code
+  filter, non-SIP entry exclusion, unknown call_id warning.
+
+### Fixed
+- `parse_sip_metadata` now extracts `from_uri`/`to_uri` from both name-addr
+  (`From: <sip:user@host>;tag=X`) and addr-spec (`From: sip:user@host;
+  tag=X`) forms — previously only the bracketed form was recognized,
+  leaving the field None for some proxy-routed messages. Two unit tests
+  added covering bare-URI and display-name shapes.
+
 ### Changed (BREAKING for fragile substring consumers)
 - `get_sip_log(phone_id=...)` now resolves message ownership structurally
   instead of substring-matching `sip:<username>@`. Messages are attributed

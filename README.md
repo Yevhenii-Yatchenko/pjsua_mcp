@@ -81,7 +81,8 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 #### Global diagnostics
 | Tool | Description |
 |------|-------------|
-| `get_sip_log` | Retrieve pjsip log entries. `phone_id=...` resolves message ownership structurally (SIP Call-ID match, transport-port match, or REGISTER username); `call_id=...` narrows further to one SIP dialog |
+| `get_sip_log` | Retrieve pjsip log entries (raw text). `phone_id` ownership filter (Call-ID/transport-port/REGISTER); `call_id`/`method`/`direction`/`status_code`/`cseq` narrow further; `filter_text` substring escape hatch |
+| `get_call_messages` | Structured SIP messages — parsed headers + parsed SDP. Same filter set as `get_sip_log` minus `filter_text`. Built for programmatic plan checks |
 | `list_recordings` | Walk `/recordings/` (and legacy flat files) for every WAV; filter by `phone_id` / `call_id` |
 | `analyze_capture` | Parse `/captures/<phone_id>/call_<call_id>_*.pcap` into structured RTP/RTCP flow counts. Surfaces `phone_rtp_codecs_seen` + `non_phone_codecs_on_phone_port` (compared against the phone's `codecs` config) so the caller can verify per-phone SDP filter conformance without ad-hoc pcap parsing in bash |
 
@@ -553,11 +554,13 @@ Every SIP message the PJSUA2 stack processes is captured by a custom `LogWriter`
 ```
 get_sip_log()                                        # everything (all phones)
 get_sip_log(last_n=20)
-get_sip_log(filter_text="REGISTER")
-get_sip_log(filter_text="401")
+get_sip_log(filter_text="401")                       # raw substring escape hatch
 get_sip_log(phone_id="a")                            # ownership-resolved (Call-ID + transport port + REGISTER username)
 get_sip_log(phone_id="a", call_id=0)                 # narrow to one SIP dialog
-get_sip_log(phone_id="a", filter_text="INVITE")      # composable
+get_sip_log(phone_id="a", method="INVITE")           # structured method filter
+get_sip_log(phone_id="a", direction="TX")            # outgoing only
+get_sip_log(phone_id="a", status_code=200)           # 200 OK responses only
+get_sip_log(phone_id="a", method="INVITE", direction="TX")  # composable
 ```
 
 Phone filtering uses structural ownership rather than substring match,
@@ -571,6 +574,55 @@ Each entry contains:
 - `level` — pjsip log level (1=error … 5=trace)
 - `msg` — full log line, including SIP message dumps
 - `thread` — originating pjlib thread name
+
+### Structured messages (`get_call_messages`)
+
+When you need parsed SDP / headers (codec lists, media ports, RTCP port,
+direction) instead of raw text, use `get_call_messages`. Same filter set
+as `get_sip_log` minus `filter_text`:
+
+```
+get_call_messages(phone_id="a", call_id=0, method="INVITE", direction="TX")
+```
+
+Returns one entry per SIP message:
+
+```json
+{
+  "phone_id": "a",
+  "messages": [
+    {
+      "ts": "16:05:25.556",
+      "direction": "TX",
+      "method": "INVITE",
+      "cseq": 8398,
+      "call_id": "5d0cbc47-...",
+      "from": "sip:6001@asterisk",
+      "to": "sip:6002@asterisk",
+      "headers": {"Call-ID": "...", "CSeq": "8398 INVITE", "Content-Type": "application/sdp"},
+      "sdp": {
+        "version": 0,
+        "origin": {"username": "-", "ip": "192.168.1.40"},
+        "media": [{
+          "type": "audio", "port": 4000, "protocol": "RTP/AVP",
+          "payload_types": [0, 120],
+          "codecs": [
+            {"pt": 0, "name": "PCMU", "clock_rate": 8000},
+            {"pt": 120, "name": "telephone-event", "clock_rate": 8000, "fmtp": "0-16"}
+          ],
+          "direction": "sendrecv", "rtcp_port": 4001
+        }]
+      }
+    }
+  ],
+  "total_count": 1
+}
+```
+
+Responses also include `status_code`. SIP messages without an
+`application/sdp` body have `sdp: null`. pjlib library log lines and
+pjsua call-dump summaries (`[DISCONNECTED]`) are dropped silently —
+they have no SIP envelope to structurize.
 
 ## Packet Capture
 

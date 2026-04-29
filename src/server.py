@@ -23,7 +23,11 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.lowlevel import NotificationOptions
 
 from .sip_engine import SipEngine
-from .sip_logger import PhoneMeta, filter_entries_by_owner
+from .sip_logger import (
+    PhoneMeta,
+    filter_entries_by_owner,
+    structurize_message,
+)
 from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 from .call_manager import CallManager
 from .pcap_manager import PcapManager
@@ -698,34 +702,30 @@ async def get_sip_log(
     filter_text: str | None = None,
     phone_id: str | None = None,
     call_id: int | None = None,
+    method: str | None = None,
+    direction: str | None = None,
+    status_code: int | None = None,
+    cseq: int | None = None,
 ) -> dict[str, Any]:
-    """Retrieve pjsua SIP log entries.
-
-    `phone_id` — filter to entries owned by that phone. Ownership is
-      resolved structurally: SIP Call-ID matches a tracked call, or the
-      message's Via line carries the phone's local transport port, or
-      it's a REGISTER from the phone's username. Replaces the previous
-      naive substring filter (which produced cross-leg false positives
-      — e.g. bob's `From: <sip:alice@>` looked like alice's traffic).
-
-    `call_id` — pjsua-internal call id (int). Restricts to the SIP
-      dialog of that call (matched on Call-ID header). Combinable with
-      `phone_id`.
-
-    `filter_text` — substring filter applied before the ownership pass.
-
-    `last_n` — return only the last N entries after filtering.
-
-    When ownership cannot be resolved structurally for some entries but a
-    substring of the phone's username appears in them, those are still
-    kept and the response includes a `warning` field flagging the count.
+    """RAW pjsua SIP log entries. Filters: phone_id (ownership), call_id,
+    method, direction, status_code, cseq, filter_text (substring), last_n.
+    For parsed SDP/headers use `get_call_messages`.
     """
     assert engine is not None and registry is not None and call_mgr is not None
     try:
         entries = engine.get_log_entries(last_n=None, filter_text=filter_text)
         warning: str | None = None
 
-        if phone_id is not None or call_id is not None:
+        any_structural_filter = (
+            phone_id is not None
+            or call_id is not None
+            or method is not None
+            or direction is not None
+            or status_code is not None
+            or cseq is not None
+        )
+
+        if any_structural_filter:
             target_sip_call_id: str | None = None
             if call_id is not None:
                 target_sip_call_id = _resolve_sip_call_id(phone_id, call_id)
@@ -746,6 +746,10 @@ async def get_sip_log(
                 phones=phones_meta,
                 target_phone=phone_id,
                 target_sip_call_id=target_sip_call_id,
+                method=method,
+                direction=direction,
+                status_code=status_code,
+                cseq=cseq,
             )
             if fallback_count > 0:
                 warning = (
@@ -766,6 +770,93 @@ async def get_sip_log(
         return result
     except Exception as e:
         log.exception("get_sip_log failed")
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+async def get_call_messages(
+    phone_id: str | None = None,
+    call_id: int | None = None,
+    method: str | None = None,
+    direction: str | None = None,
+    status_code: int | None = None,
+    cseq: int | None = None,
+    last_n: int | None = None,
+) -> dict[str, Any]:
+    """STRUCTURED SIP messages — parsed headers + parsed SDP per message.
+    Built for programmatic checks (codec lists, RTP ports, header values).
+    Filters: phone_id, call_id, method, direction, status_code, cseq,
+    last_n (same set as `get_sip_log` minus `filter_text`). Drops non-SIP
+    log entries silently.
+    """
+    assert engine is not None and registry is not None and call_mgr is not None
+    try:
+        entries = engine.get_log_entries(last_n=None, filter_text=None)
+        warning: str | None = None
+
+        any_filter = (
+            phone_id is not None
+            or call_id is not None
+            or method is not None
+            or direction is not None
+            or status_code is not None
+            or cseq is not None
+        )
+
+        if any_filter:
+            target_sip_call_id: str | None = None
+            if call_id is not None:
+                target_sip_call_id = _resolve_sip_call_id(phone_id, call_id)
+                if target_sip_call_id is None:
+                    return {
+                        "phone_id": phone_id,
+                        "messages": [],
+                        "total_count": 0,
+                        "warning": (
+                            f"call_id={call_id} unknown to tracker — "
+                            "either it never existed or its mapping was "
+                            "purged. No messages returned."
+                        ),
+                    }
+
+            phones_meta = _build_phones_meta()
+            entries, fallback_count = filter_entries_by_owner(
+                entries,
+                phones=phones_meta,
+                target_phone=phone_id,
+                target_sip_call_id=target_sip_call_id,
+                method=method,
+                direction=direction,
+                status_code=status_code,
+                cseq=cseq,
+            )
+            if fallback_count > 0:
+                warning = (
+                    f"fallback to substring match for {fallback_count} "
+                    "entries (no structural ownership signal)"
+                )
+
+        # Structurize. Entries that aren't SIP messages return None and
+        # are dropped — pjlib library log lines, [DISCONNECTED] dumps, etc.
+        messages: list[dict[str, Any]] = []
+        for e in entries:
+            structured = structurize_message(e)
+            if structured is not None:
+                messages.append(structured)
+
+        if last_n is not None:
+            messages = messages[-last_n:]
+
+        result: dict[str, Any] = {
+            "phone_id": phone_id,
+            "messages": messages,
+            "total_count": len(messages),
+        }
+        if warning:
+            result["warning"] = warning
+        return result
+    except Exception as e:
+        log.exception("get_call_messages failed")
         return {"status": "error", "error": str(e)}
 
 
@@ -812,13 +903,9 @@ async def list_recordings(
     phone_id: str | None = None,
     call_id: int | None = None,
 ) -> dict[str, Any]:
-    """List every WAV under /recordings/, optionally filtered by phone/call.
-
-    Recording is always-on — every call lands in
-    `/recordings/<phone_id>/call_<call_id>_<ts>.wav` along with a
-    `.meta.json` sidecar. This tool also surfaces pre-refactor flat files
-    (`call_<phone_id>_<call_id>_<ts>.wav` directly under `/recordings/`)
-    so historical data stays visible.
+    """List WAV recordings under /recordings/, optional phone/call filter.
+    Recording is OFF by default — enable via `recording_enabled=True` on
+    `add_phone` or `update_phone`.
     """
     try:
         if not _RECORDINGS_ROOT.exists():

@@ -1266,6 +1266,95 @@ class TestCallFlow:
             f"call_id filter let in entries from multiple SIP dialogs: {sip_call_ids}"
         )
 
+    def test_sip_log_method_filter(self):
+        """method='INVITE' returns only INVITE-method entries (request +
+        responses to INVITE via CSeq), not REGISTER or BYE."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        log = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a", "method": "INVITE",
+        }))
+        assert log["total_count"] > 0
+        for e in log["entries"]:
+            msg = e["msg"]
+            # Each kept entry must reference INVITE in either the envelope
+            # ("TX/RX ... INVITE/cseq=") or via CSeq for responses.
+            has_invite_envelope = "msg INVITE/cseq=" in msg or "/INVITE/cseq=" in msg
+            has_cseq_invite = "CSeq:" in msg and "INVITE" in msg
+            assert has_invite_envelope or has_cseq_invite, (
+                f"entry passes method=INVITE filter without INVITE marker: {msg[:200]}"
+            )
+
+    def test_sip_log_direction_filter_tx_only(self):
+        """direction='TX' returns only outgoing messages."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        log = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a", "direction": "TX",
+        }))
+        assert log["total_count"] > 0
+        for e in log["entries"]:
+            # pjlib prefixes the envelope with `...TX 480 bytes` (no leading
+            # space — the dots come from module-name truncation), so look
+            # for "TX " in the first chunk of the msg before the SIP body.
+            envelope = e["msg"].split("\n", 1)[0]
+            assert "TX " in envelope, (
+                f"entry passes direction=TX filter but envelope is not TX: {envelope[:120]}"
+            )
+
+    def test_sip_log_status_code_filter(self):
+        """status_code=200 returns only 200-OK responses."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        log = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a", "status_code": 200,
+        }))
+        assert log["total_count"] > 0
+        for e in log["entries"]:
+            # Each kept entry must be a SIP response with status 200.
+            assert "Response msg 200/" in e["msg"] or "SIP/2.0 200" in e["msg"], (
+                f"entry passes status_code=200 but is not a 200 response: {e['msg'][:120]}"
+            )
+
+    def test_sip_log_method_and_direction_combined(self):
+        """method=INVITE + direction=TX narrows to outgoing INVITEs only."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        log = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a", "method": "INVITE", "direction": "TX",
+        }))
+        assert log["total_count"] >= 1, "alice's TX INVITE missing"
+        for e in log["entries"]:
+            assert "TX" in e["msg"][:80] and "INVITE" in e["msg"][:200]
+
     def test_sip_log_call_id_unknown_returns_warning(self):
         """When pjsua_call_id has no entry in the tracker, return empty
         with an explanatory `warning`, not an error."""
@@ -1276,6 +1365,120 @@ class TestCallFlow:
         assert log_unknown["total_count"] == 0
         assert "warning" in log_unknown
         assert "9999" in log_unknown["warning"]
+
+    def test_get_call_messages_invite_with_parsed_sdp(self):
+        """get_call_messages returns alice's TX INVITE as a structured
+        record with parsed SDP — codec list directly readable."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        msgs_resp = _parse_tool_result(self.client.call_tool("get_call_messages", {
+            "phone_id": "a",
+            "method": "INVITE",
+            "direction": "TX",
+        }))
+        assert msgs_resp["total_count"] >= 1, "alice's TX INVITE missing"
+        invite = msgs_resp["messages"][0]
+        assert invite["direction"] == "TX"
+        assert invite["method"] == "INVITE"
+        assert invite["cseq"] is not None
+        assert invite["call_id"]  # SIP Call-ID populated
+        assert invite["from"] and SIP_USER_A in invite["from"]
+        assert invite["to"] and SIP_USER_B in invite["to"]
+        # SDP parsed
+        assert invite["sdp"] is not None
+        assert len(invite["sdp"]["media"]) >= 1
+        media = invite["sdp"]["media"][0]
+        assert media["type"] == "audio"
+        codec_names = {c["name"] for c in media["codecs"]}
+        # Default phone codecs (no override) — must contain at least one
+        # known audio codec. Specific codec depends on Asterisk negotiation.
+        assert codec_names & {"PCMU", "PCMA", "G722"}, (
+            f"no recognized codec in alice's INVITE SDP: {codec_names}"
+        )
+
+    def test_get_call_messages_call_id_filter(self):
+        """call_id narrows to one SIP dialog — same Call-ID across all
+        kept messages."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        msgs_resp = _parse_tool_result(self.client.call_tool("get_call_messages", {
+            "phone_id": "a",
+            "call_id": a_call_id,
+        }))
+        assert msgs_resp["total_count"] >= 2, (
+            "alice's call should have at least INVITE + 200 OK"
+        )
+        # All kept messages must share one Call-ID — verified by uniqueness
+        sip_call_ids = {m["call_id"] for m in msgs_resp["messages"] if m["call_id"]}
+        assert len(sip_call_ids) == 1, (
+            f"call_id filter let messages from {len(sip_call_ids)} "
+            f"dialogs through: {sip_call_ids}"
+        )
+
+    def test_get_call_messages_status_code_filter(self):
+        """status_code=200 returns only 200-OK responses — direction RX
+        for alice's outgoing INVITE confirmation."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        msgs_resp = _parse_tool_result(self.client.call_tool("get_call_messages", {
+            "phone_id": "a",
+            "status_code": 200,
+        }))
+        assert msgs_resp["total_count"] >= 1
+        for m in msgs_resp["messages"]:
+            assert m["status_code"] == 200
+
+    def test_get_call_messages_drops_non_sip_entries(self):
+        """pjlib library log lines and [DISCONNECTED] dumps don't have a
+        SIP envelope — get_call_messages drops them silently. So the
+        message count for alice's filtered query is small and clean."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        msgs_resp = _parse_tool_result(self.client.call_tool("get_call_messages", {
+            "phone_id": "a",
+        }))
+        for m in msgs_resp["messages"]:
+            # Every kept message is a real SIP message — has direction
+            # and either a method or a status_code.
+            assert m["direction"] in ("TX", "RX")
+            assert m["method"] is not None or m.get("status_code") is not None
+
+    def test_get_call_messages_unknown_call_id_warning(self):
+        msgs_resp = _parse_tool_result(self.client.call_tool("get_call_messages", {
+            "phone_id": "a",
+            "call_id": 9999,
+        }))
+        assert msgs_resp["total_count"] == 0
+        assert "warning" in msgs_resp
+        assert "9999" in msgs_resp["warning"]
 
     def test_call_info_contacts(self):
         result = _parse_tool_result(self.client.call_tool("a_make_call", {
