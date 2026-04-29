@@ -21,6 +21,27 @@
   `remote_rtp_port`, snapshotted in `onCallMediaState` while media is
   ACTIVE (post-disconnect read of `getMedTransportInfo` is unreliable).
 
+### Fixed
+- `unhold(call_id)` was setting `prm.flag = PJSUA_CALL_UNHOLD` —
+  a no-op, since `flag` lives in `prm.opt.flag` on the C++ struct
+  (`pjsua_call_setting.flag`). The Python attribute was created on
+  the SWIG proxy and silently ignored, so `pjsua_call_reinvite()`
+  reused the cached hold-state SDP: the unhold re-INVITE went out
+  with the same `o=` version and `a=sendonly`, the registrar
+  ignored it as "no renegotiation" per RFC 3264, and media stayed
+  one-way at the SDP layer despite local pjsua state reporting
+  sendrecv. Fixed by writing to the correct C++ struct field
+  (`prm.opt.flag = pj.PJSUA_CALL_UNHOLD`) AND populating
+  `prm.opt.audioCount = 1` — `pj.CallOpParam()` defaults to
+  audioCount=0/useDefaults=False, which would otherwise make pjsua
+  emit an `m=audio 0` "rejected media" SDP with no rtpmap. Two
+  regression tests added: a unit test (`TestUnholdSetsCallSettingFlag`
+  — captures `prm.opt.flag` and `prm.opt.audioCount` on a fake call)
+  and an integration test
+  (`TestCodecs::test_unhold_flips_sdp_direction_and_bumps_version`
+  — verifies the on-the-wire SDP version bumps and `a=sendonly` is
+  dropped between hold and unhold INVITEs).
+
 ### Removed (BREAKING)
 - MCP tools `get_codecs` and `set_codecs`. Replaced by per-phone API:
   - To set per-phone codecs on creation: `add_phone(codecs=[...])`.

@@ -1620,6 +1620,78 @@ class TestCodecs:
 
         self.client.call_tool("a_hangup", {"call_id": call_id})
 
+    def test_unhold_flips_sdp_direction_and_bumps_version(self):
+        """Regression for bug-pjsua-mcp-unhold-flag.md: unhold's re-INVITE
+        must carry `a=sendrecv` (NOT `a=sendonly`) AND bump the SDP `o=`
+        version. Without `prm.opt.flag = PJSUA_CALL_UNHOLD`, pjsua reuses
+        the cached hold-state SDP and the wire keeps both unchanged.
+        """
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                   codecs=["PCMU", "telephone-event"])
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                   auto_answer=True)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
+
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        time.sleep(2)  # CONFIRMED — initial INVITE+200 done
+
+        # Snapshot the SDPs we authored before any hold/unhold reinvites.
+        pre = [s for s in _extract_sdp_offers(self.client, "a") if "s=pjmedia" in s]
+
+        self.client.call_tool("a_hold", {"call_id": call_id})
+        time.sleep(1)
+        self.client.call_tool("a_unhold", {"call_id": call_id})
+        time.sleep(1)
+
+        post = [s for s in _extract_sdp_offers(self.client, "a") if "s=pjmedia" in s]
+        # We expect at least two new outgoing SDPs after hold/unhold:
+        # one for the hold re-INVITE and one for the unhold re-INVITE.
+        assert len(post) >= len(pre) + 2, (
+            f"expected ≥2 new outgoing SDPs after hold/unhold; "
+            f"pre={len(pre)} post={len(post)}"
+        )
+        hold_sdp = post[-2]
+        unhold_sdp = post[-1]
+
+        def _o_version(sdp: str) -> str | None:
+            for line in sdp.splitlines():
+                if line.startswith("o="):
+                    parts = line.split()
+                    # o=<user> <sess-id> <sess-version> IN IP4 <ip>
+                    return parts[2] if len(parts) >= 3 else None
+            return None
+
+        # The bug shows up here: hold and unhold re-INVITEs would carry
+        # the SAME version, signalling "no renegotiation" per RFC 3264.
+        h_ver = _o_version(hold_sdp)
+        u_ver = _o_version(unhold_sdp)
+        assert h_ver is not None and u_ver is not None, (
+            f"could not parse o= version from SDPs:\nHOLD:\n{hold_sdp}\n"
+            f"UNHOLD:\n{unhold_sdp}"
+        )
+        assert int(u_ver) > int(h_ver), (
+            f"unhold re-INVITE did NOT bump SDP version "
+            f"(hold={h_ver}, unhold={u_ver}). pjsua reused the cached "
+            f"hold-state SDP — `prm.opt.flag = PJSUA_CALL_UNHOLD` is "
+            f"missing or set on the wrong attribute."
+        )
+
+        # Direction must flip back. `a=sendonly` only appears on hold;
+        # the unhold re-INVITE should drop it (or replace with sendrecv).
+        assert "a=sendonly" in hold_sdp, (
+            f"hold SDP missing a=sendonly — fixture broken: {hold_sdp}"
+        )
+        assert "a=sendonly" not in unhold_sdp, (
+            f"unhold re-INVITE still carries a=sendonly — call stays "
+            f"held at the SDP layer:\n{unhold_sdp}"
+        )
+
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+
     def test_update_phone_codecs_applies_to_next_call(self):
         """update_phone(codecs=...) changes what the NEXT outgoing
         INVITE offers."""

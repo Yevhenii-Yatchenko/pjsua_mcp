@@ -984,8 +984,20 @@ class CallManager:
         pid = self._resolve_phone(phone_id)
         self._ensure_call_belongs_to(pid, call_id)
         call = self._get_call_by_id(call_id)
+        # `pj.CallOpParam()` keeps useDefaults=False, so Call::reinvite on
+        # the C++ side copies our `prm.opt` into the call setting verbatim.
+        # By default `opt` has audioCount=0/flag=0 — pjsua then emits an
+        # `m=audio 0` "rejected media" SDP without the UNHOLD bit. Both
+        # fields must be set explicitly:
+        #   * `opt.audioCount = 1` keeps the audio stream alive in the
+        #     re-INVITE (otherwise pjsua marks media as disabled);
+        #   * `opt.flag = PJSUA_CALL_UNHOLD` is what flips SDP direction
+        #     back to sendrecv and bumps the `o=` version.
+        # Setting `prm.flag = ...` directly (without `opt.`) only writes a
+        # stray Python proxy attribute that the C++ side never reads.
         prm = pj.CallOpParam()
-        prm.flag = pj.PJSUA_CALL_UNHOLD
+        prm.opt.audioCount = 1
+        prm.opt.flag = pj.PJSUA_CALL_UNHOLD
         call.reinvite(prm)
 
     def set_codecs_for_phone(
