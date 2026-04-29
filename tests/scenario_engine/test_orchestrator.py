@@ -888,3 +888,107 @@ def test_scenario_stopped_event_carries_status_and_reason() -> None:
         assert "timeout" in captured[0].data.get("reason", "").lower()
 
     _run(inner())
+
+
+# ============================================================================
+# Block 4 Group B — artifact collection (proposal-04)
+# ============================================================================
+
+
+def test_run_attaches_artifacts_for_files_created_during_run(tmp_path) -> None:
+    """ScenarioRunner sweeps recording/capture roots after stop and adds the
+    result to ScenarioResult.artifacts."""
+    import os
+
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        rec_root = tmp_path / "recordings"
+        cap_root = tmp_path / "captures"
+        rec_root.mkdir()
+        cap_root.mkdir()
+
+        # Pre-existing (must be ignored — older mtime than started_at).
+        old_wav = rec_root / "a" / "old.wav"
+        old_wav.parent.mkdir()
+        old_wav.write_bytes(b"")
+        os.utime(old_wav, (1.0, 1.0))
+
+        runner = ScenarioRunner(
+            bus=bus,
+            call_manager=cm,
+            registry=MockRegistry(),
+            loop=loop,
+            engine=MockEngine(),
+            recordings_root=rec_root,
+            captures_root=cap_root,
+            host_recordings_root="/host/rec",
+            host_captures_root="/host/cap",
+        )
+
+        async def emit_done_then_drop_files() -> None:
+            await asyncio.sleep(0.05)
+            # File freshly created during scenario — must be picked.
+            new_wav = rec_root / "a" / "call_0_now.wav"
+            new_wav.write_bytes(b"")
+            new_pcap = cap_root / "a" / "call_0_now.pcap"
+            new_pcap.parent.mkdir(parents=True, exist_ok=True)
+            new_pcap.write_bytes(b"")
+            await asyncio.sleep(0.02)
+            bus.emit(Event(type="user.done"))
+
+        scenario = Scenario(
+            name="artifacts-smoke",
+            phones=["a", "b"],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=2000,
+        )
+        task = asyncio.create_task(emit_done_then_drop_files())
+        result = await runner.run(scenario)
+        await task
+        assert result.status == "ok"
+
+        d = result.to_dict()
+        assert "artifacts" in d
+        a = d["artifacts"]["a"]
+        assert a is not None
+        assert a["recording"].endswith("/a/call_0_now.wav")
+        assert a["pcap"].endswith("/a/call_0_now.pcap")
+        assert a["host_recording"] == "/host/rec/a/call_0_now.wav"
+        assert a["host_pcap"] == "/host/cap/a/call_0_now.pcap"
+        # `b` was in phones but produced nothing → null.
+        assert d["artifacts"]["b"] is None
+
+    _run(inner())
+
+
+def test_run_artifacts_default_empty_when_roots_unset() -> None:
+    """When recordings/captures roots are not passed (older callers), the
+    result still has an `artifacts` key — empty dict, never missing."""
+
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = ScenarioRunner(
+            bus=bus, call_manager=cm, registry=MockRegistry(), loop=loop,
+        )
+        scenario = Scenario(
+            name="no-roots",
+            phones=["a"],
+            stop_on=[{"event": "user.done"}],
+            timeout_ms=500,
+        )
+
+        async def emit_done() -> None:
+            await asyncio.sleep(0.02)
+            bus.emit(Event(type="user.done"))
+
+        task = asyncio.create_task(emit_done())
+        result = await runner.run(scenario)
+        await task
+        d = result.to_dict()
+        assert d.get("artifacts") == {}
+
+    _run(inner())

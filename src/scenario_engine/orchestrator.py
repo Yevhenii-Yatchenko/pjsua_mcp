@@ -13,11 +13,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from src.scenario_engine.action_executor import ActionExecutor
+from src.scenario_engine.artifacts import collect_artifacts
 from src.scenario_engine.event_bus import Event, EventBus
 from src.scenario_engine.hook_runtime import Hook, HookRuntime, _event_matches_predicates
 from src.scenario_engine.timeline import Timeline, TimelineRecorder
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from src.account_manager import PhoneRegistry
     from src.call_manager import CallManager
     from src.sip_engine import SipEngine
@@ -57,6 +60,7 @@ class ScenarioResult:
     elapsed_ms: float
     timeline: list[dict[str, Any]]
     errors: list[dict[str, Any]] = field(default_factory=list)
+    artifacts: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +69,7 @@ class ScenarioResult:
             "elapsed_ms": round(self.elapsed_ms, 2),
             "timeline": list(self.timeline),
             "errors": list(self.errors),
+            "artifacts": dict(self.artifacts),
         }
 
 
@@ -78,12 +83,20 @@ class ScenarioRunner:
         registry: "PhoneRegistry",
         loop: asyncio.AbstractEventLoop,
         engine: "SipEngine | None" = None,
+        recordings_root: "Path | None" = None,
+        captures_root: "Path | None" = None,
+        host_recordings_root: str | None = None,
+        host_captures_root: str | None = None,
     ) -> None:
         self._bus = bus
         self._cm = call_manager
         self._registry = registry
         self._loop = loop
         self._engine = engine
+        self._recordings_root = recordings_root
+        self._captures_root = captures_root
+        self._host_recordings_root = host_recordings_root
+        self._host_captures_root = host_captures_root
 
     async def run(
         self,
@@ -91,6 +104,7 @@ class ScenarioRunner:
         skip_validation: bool = False,
     ) -> ScenarioResult:
         t_start = time.monotonic()
+        started_at_wall = time.time()
         errors: list[dict[str, Any]] = []
 
         # ---- Pre-flight static validation ----
@@ -262,12 +276,32 @@ class ScenarioRunner:
         recorder.stop()
 
         elapsed_ms = (time.monotonic() - t_start) * 1000
+
+        artifacts: dict[str, Any] = {}
+        if (
+            self._recordings_root is not None
+            and self._captures_root is not None
+            and scenario.phones
+        ):
+            try:
+                artifacts = collect_artifacts(
+                    phones=list(scenario.phones),
+                    started_at=started_at_wall,
+                    recordings_root=self._recordings_root,
+                    captures_root=self._captures_root,
+                    host_recordings_root=self._host_recordings_root,
+                    host_captures_root=self._host_captures_root,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"stage": "artifacts", "error": repr(exc)})
+
         return ScenarioResult(
             status=status,
             reason=reason,
             elapsed_ms=elapsed_ms,
             timeline=timeline.to_list(),
             errors=errors,
+            artifacts=artifacts,
         )
 
 
@@ -280,12 +314,20 @@ async def run_scenario(
     loop: asyncio.AbstractEventLoop | None = None,
     engine: "SipEngine | None" = None,
     skip_validation: bool = False,
+    recordings_root: "Path | None" = None,
+    captures_root: "Path | None" = None,
+    host_recordings_root: str | None = None,
+    host_captures_root: str | None = None,
 ) -> ScenarioResult:
     """Top-level helper: accepts a dict or Scenario and runs it.
 
     By default the scenario is statically validated first; on any validation
     error, the run returns `status="error"` immediately without touching
     pjsua. Pass `skip_validation=True` to bypass (used by engine tests only).
+
+    `recordings_root` / `captures_root` (and their `host_*` counterparts)
+    enable the post-run artifact sweep. When unset, `result.artifacts` is
+    `{}` — no I/O is performed.
     """
     if loop is None:
         loop = asyncio.get_running_loop()
@@ -299,5 +341,9 @@ async def run_scenario(
         registry=registry,
         loop=loop,
         engine=engine,
+        recordings_root=recordings_root,
+        captures_root=captures_root,
+        host_recordings_root=host_recordings_root,
+        host_captures_root=host_captures_root,
     )
     return await runner.run(scn, skip_validation=skip_validation)

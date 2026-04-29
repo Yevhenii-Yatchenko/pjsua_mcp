@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.scenario_engine.artifacts import collect_artifacts
 from src.scenario_engine.event_bus import Event, EventBus, Subscription
 from src.scenario_engine.hook_runtime import Hook, HookRuntime
 from src.scenario_engine.orchestrator import Scenario, ScenarioResult, run_scenario
@@ -20,6 +21,7 @@ __all__ = [
     "Timeline",
     "TimelineEntry",
     "TimelineRecorder",
+    "collect_artifacts",
     "run_scenario",
     "validate_scenario",
 ]
