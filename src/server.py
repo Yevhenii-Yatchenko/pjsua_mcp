@@ -145,7 +145,7 @@ def _validate_phone_id(phone_id: str) -> None:
     static_tool_names = {
         "add_phone", "drop_phone", "list_phones", "get_phone", "update_phone",
         "load_phones",
-        "get_codecs", "set_codecs", "get_sip_log",
+        "get_sip_log",
         "start_capture", "stop_capture", "get_pcap", "list_recordings",
     }
     for action in RESERVED_ACTIONS:
@@ -623,44 +623,6 @@ async def load_phones(
         "added": results,
         "errors": errors,
     }
-
-
-# ---------------------------------------------------------------------------
-# Codecs (global, endpoint-wide)
-# ---------------------------------------------------------------------------
-@mcp.tool()
-async def get_codecs() -> dict[str, Any]:
-    """List all endpoint codecs with their current priorities."""
-    assert engine is not None
-    try:
-        return {"codecs": engine.get_codecs()}
-    except Exception as e:
-        log.exception("get_codecs failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def set_codecs(
-    codecs: list[str],
-    phone_id: str | None = None,
-    call_id: int | None = None,
-) -> dict[str, Any]:
-    """Set endpoint-wide codec priorities (affects all phones).
-
-    If `phone_id` + `call_id` are both provided, also send a re-INVITE on
-    that call to renegotiate media using the new codec set.
-    """
-    assert engine is not None and call_mgr is not None
-    try:
-        if phone_id is not None and call_id is not None:
-            info = call_mgr.reinvite_with_codecs(codecs, phone_id=phone_id, call_id=call_id)
-        else:
-            enabled = engine.set_codecs(codecs)
-            info = {"codecs": enabled, "reinvite": False}
-        return {"status": "ok", **info}
-    except Exception as e:
-        log.exception("set_codecs failed")
-        return {"status": "error", "error": str(e)}
 
 
 # ---------------------------------------------------------------------------

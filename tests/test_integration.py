@@ -1494,65 +1494,6 @@ class TestCodecs:
             self.client = client
             yield
 
-    def test_endpoint_codecs_pin_call_codec(self):
-        """`set_codecs` is endpoint-wide — pinning PCMU before the call
-        forces the SDP to advertise it as the preferred codec."""
-        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
-        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
-        _wait_phone_registered(self.client, "a")
-        _wait_phone_registered(self.client, "b")
-
-        # Pin PCMU globally — there is no per-phone codec list.
-        self.client.call_tool("set_codecs", {"codecs": ["PCMU"]})
-
-        result = _parse_tool_result(self.client.call_tool("a_make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        }))
-        call_id = result["call_id"]
-        _wait_and_answer(self.client, "b")
-        time.sleep(1)
-
-        info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
-        assert "PCMU" in info.get("codec", "")
-        self.client.call_tool("a_hangup", {"call_id": call_id})
-
-    def test_get_codecs(self):
-        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
-        _wait_phone_registered(self.client, "a")
-        result = _parse_tool_result(self.client.call_tool("get_codecs"))
-        assert "codecs" in result
-        assert len(result["codecs"]) > 0
-        codec_names = [c["codec"] for c in result["codecs"]]
-        assert any("PCMU" in c for c in codec_names)
-
-    def test_set_codecs_midcall(self):
-        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
-        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
-        _wait_phone_registered(self.client, "a")
-        _wait_phone_registered(self.client, "b")
-        # Start with PCMU preferred, then re-INVITE to PCMA mid-call.
-        self.client.call_tool("set_codecs", {"codecs": ["PCMU", "PCMA"]})
-
-        result = _parse_tool_result(self.client.call_tool("a_make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        }))
-        call_id = result["call_id"]
-        _wait_and_answer(self.client, "b")
-        time.sleep(1)
-
-        result = _parse_tool_result(self.client.call_tool("set_codecs", {
-            "codecs": ["PCMA"],
-            "phone_id": "a",
-            "call_id": call_id,
-        }))
-        assert result["status"] == "ok"
-        assert result["reinvite"] is True
-        time.sleep(2)
-
-        info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
-        assert "PCMA" in info.get("codec", "")
-        self.client.call_tool("a_hangup", {"call_id": call_id})
-
     # ---- per-phone SDP-rewrite tests --------------------------------
 
     def test_per_phone_outbound_offer_pcma(self):

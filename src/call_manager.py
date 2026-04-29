@@ -889,24 +889,6 @@ class CallManager:
                 dparam.method = pj.PJSUA_DTMF_METHOD_SIP_INFO
                 call.sendDtmf(dparam)
 
-    def reinvite_with_codecs(
-        self,
-        codecs: list[str],
-        phone_id: str | None = None,
-        call_id: int | None = None,
-    ) -> dict[str, Any]:
-        """Change codecs on an active call via re-INVITE.
-
-        Codec priorities are endpoint-wide; this sets them then re-INVITEs
-        the target call.
-        """
-        pid = self._resolve_phone(phone_id)
-        enabled = self._engine.set_codecs(codecs)
-        call = self._get_call(phone_id=pid, call_id=call_id)
-        prm = pj.CallOpParam()
-        call.reinvite(prm)
-        return {"phone_id": pid, "codecs": enabled, "reinvite": True}
-
     def play_audio(
         self,
         file_path: str,

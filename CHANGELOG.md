@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Removed (BREAKING)
+- MCP tools `get_codecs` and `set_codecs`. Replaced by per-phone API:
+  - To set per-phone codecs on creation: `add_phone(codecs=[...])`.
+  - To change at runtime: `update_phone(phone_id=..., codecs=[...])`.
+  - Endpoint-wide pin no longer needed — startup pins the audio codec
+    superset; per-phone SDP filter governs.
+- Internal `CallManager.reinvite_with_codecs` (was the back-end for
+  `set_codecs(phone_id=, call_id=)`).
+
 ### Added
 - **Per-phone codec preferences via SDP rewrite.** Set
   `codecs: [PCMA, ...]` on `add_phone` / `update_phone` / YAML defaults

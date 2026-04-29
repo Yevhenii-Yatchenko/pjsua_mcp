@@ -66,7 +66,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 
 ## MCP Tools
 
-### Static (15 — always present)
+### Static (13 — always present)
 
 #### Phone CRUD
 | Tool | Description |
@@ -81,8 +81,6 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 #### Global diagnostics
 | Tool | Description |
 |------|-------------|
-| `get_codecs` | List endpoint codec priorities |
-| `set_codecs` | Set endpoint codec priorities (affects all phones). With `phone_id` + `call_id` — re-INVITE one call |
 | `get_sip_log` | Retrieve pjsip log entries. `phone_id=...` filters by that phone's `sip:<user>@` URI substring |
 | `start_capture` | Start tcpdump. Without `phone_id` — host-wide; with `phone_id` — BPF filter on that phone's UDP port |
 | `stop_capture` | Stop the running capture |
@@ -120,7 +118,7 @@ Registered when `add_phone` (or `load_phones`) brings a phone online; unregister
 | `a_register` / `a_unregister` | Fresh REGISTER cycle / de-REGISTER (symmetric pair) |
 | `a_get_registration_status` | Quick reg state for phone a |
 
-Total surface with N phones: 15 + 22·N.
+Total surface with N phones: 13 + 22·N.
 
 ## Quick Start
 
@@ -180,9 +178,8 @@ answer this phone produces lists ONLY these codecs. RTP send/receive
 naturally follows because pjsua's media activation picks codecs from
 {SDP-advertised} ∩ {endpoint-enabled} (the endpoint pins a fixed
 superset at startup). DTMF (`telephone-event`) is auto-preserved by
-the rewriter even when not explicitly listed. Endpoint-wide
-`set_codecs` is rarely needed — use it only for mid-call re-INVITEs
-on a specific call, or for phones with `codecs=None`.
+the rewriter even when not explicitly listed. Phones without a
+`codecs` list fall back to whatever the endpoint superset offers.
 
 ### 4. Load the profile and run scenarios
 
