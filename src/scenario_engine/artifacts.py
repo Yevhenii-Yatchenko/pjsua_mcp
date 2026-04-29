@@ -5,6 +5,12 @@ After a scenario stops, sweep `<recordings_root>/<phone_id>/*.wav` and
 (mtime ≥ scenario.started_at). Each phone reports the latest-by-mtime
 recording and pcap (or null when nothing matches).
 
+All path strings in the result are translated to **host-side** absolute
+paths (when `host_recordings_root` / `host_captures_root` are provided)
+so out-of-container MCP clients can read them via Read/Bash directly.
+When the host roots are unset, container paths are returned unchanged
+as a graceful fallback.
+
 Pure helper — no pjsua / asyncio dependency. Tested in
 `tests/scenario_engine/test_artifacts.py`.
 """
@@ -36,22 +42,37 @@ def _latest_after(directory: Path, suffix: str, started_at: float) -> Path | Non
     return best
 
 
-def _host_join(
-    host_root: str | None,
+def external_path(
+    container_path: str | Path | None,
     container_root: Path,
-    container_path: Path,
+    host_root: str | None,
 ) -> str | None:
-    """Translate a container-side absolute path to its host-side equivalent.
+    """Re-anchor a container path under `host_root` for MCP output.
 
-    `container_path` lives under `container_root`; we strip the prefix and
-    re-anchor at `host_root`. None when `host_root` is unset.
+    The MCP server runs inside a Docker container; its clients (Claude
+    Code, plugin host) usually run OUTSIDE. Container paths like
+    `/recordings/alice/x.wav` cannot be opened from the host, so every
+    file path in an MCP response should be translated through this
+    helper.
+
+    * `container_path is None` → returns None (path-not-set passes through).
+    * `host_root is None`     → returns the container path unchanged
+      (graceful fallback so the MCP still works without env wiring; the
+      result just won't be openable from outside the container).
+    * `container_path` not under `container_root` → also returns the
+      container path unchanged (caller bug — better to surface the raw
+      path than mangle it).
+    * Otherwise: `<host_root>/<container_path - container_root>`.
     """
+    if container_path is None:
+        return None
+    p = container_path if isinstance(container_path, Path) else Path(container_path)
     if host_root is None:
-        return None
+        return str(p)
     try:
-        rel = container_path.relative_to(container_root)
+        rel = p.relative_to(container_root)
     except ValueError:
-        return None
+        return str(p)
     return str(Path(host_root) / rel)
 
 
@@ -71,9 +92,11 @@ def collect_artifacts(
 
     Each phone in `phones` maps to either:
       * `None` — phone produced no recordings or pcaps during this run, or
-      * `dict` with keys: recording, recording_meta, pcap,
-        host_recording, host_recording_meta, host_pcap.
-        Any individual field may be None when its file did not appear.
+      * `dict` with keys: `recording`, `recording_meta`, `pcap`. Path
+        values are host-side strings (when host roots are set) or fall
+        back to container paths. Any field may be None if its file did
+        not appear (recording_enabled vs capture_enabled are independent
+        knobs).
 
     `started_at` is wall-clock epoch seconds (`time.time()`) — must match
     the timebase of `os.stat().st_mtime`. Do not use `time.monotonic()`.
@@ -97,17 +120,8 @@ def collect_artifacts(
                 rec_meta = candidate
 
         result[phone_id] = {
-            "recording": str(rec) if rec is not None else None,
-            "recording_meta": str(rec_meta) if rec_meta is not None else None,
-            "pcap": str(pcap) if pcap is not None else None,
-            "host_recording": _host_join(
-                host_recordings_root, recordings_root, rec
-            ) if rec is not None else None,
-            "host_recording_meta": _host_join(
-                host_recordings_root, recordings_root, rec_meta
-            ) if rec_meta is not None else None,
-            "host_pcap": _host_join(
-                host_captures_root, captures_root, pcap
-            ) if pcap is not None else None,
+            "recording": external_path(rec, recordings_root, host_recordings_root),
+            "recording_meta": external_path(rec_meta, recordings_root, host_recordings_root),
+            "pcap": external_path(pcap, captures_root, host_captures_root),
         }
     return result

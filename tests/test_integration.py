@@ -47,19 +47,29 @@ skip_no_domain = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 class McpClient:
-    """Manages a pjsua-mcp subprocess and speaks JSON-RPC over stdin/stdout."""
+    """Manages a pjsua-mcp subprocess and speaks JSON-RPC over stdin/stdout.
 
-    def __init__(self) -> None:
+    `extra_env` (optional) merges into the subprocess environment — used
+    to set PJSUA_MCP_HOST_RECORDINGS_DIR / _CAPTURES_DIR for tests that
+    verify host-side path mapping.
+    """
+
+    def __init__(self, extra_env: dict[str, str] | None = None) -> None:
         self._proc: subprocess.Popen | None = None
         self._msg_id = 0
+        self._extra_env = extra_env
 
     def start(self) -> None:
+        env = os.environ.copy()
+        if self._extra_env:
+            env.update(self._extra_env)
         self._proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "src.server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            env=env,
         )
 
     def stop(self) -> None:
@@ -329,6 +339,130 @@ class TestDynamicTools:
 
         info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
         assert info["codecs"] == ["PCMU", "telephone-event"]
+
+
+class TestHostPathMapping:
+    """Path strings returned by every recording/capture-aware tool are
+    host-anchored when PJSUA_MCP_HOST_RECORDINGS_DIR / _CAPTURES_DIR are
+    set in the env, otherwise they fall back to container paths.
+
+    These tests don't need live SIP — they synthesise files directly
+    under /recordings/ and /captures/ and verify the path *string* the
+    MCP returns. The MCP server itself runs inside the container, so
+    we assert the field equals "<HOST_ROOT>/<phone_id>/<file>".
+    """
+
+    HOST_REC = "/host/data/recordings"
+    HOST_CAP = "/host/data/captures"
+
+    @pytest.fixture(autouse=True)
+    def mcp(self, tmp_path):
+        from pathlib import Path
+        if not Path("/recordings").exists():
+            pytest.skip("/recordings not mounted in this test environment")
+        with McpClient(extra_env={
+            "PJSUA_MCP_HOST_RECORDINGS_DIR": self.HOST_REC,
+            "PJSUA_MCP_HOST_CAPTURES_DIR": self.HOST_CAP,
+        }) as client:
+            client.send_initialize()
+            self.client = client
+            yield
+
+    def test_list_recordings_returns_host_paths(self):
+        from pathlib import Path
+        phone_dir = Path("/recordings/hostmap")
+        phone_dir.mkdir(parents=True, exist_ok=True)
+        wav = phone_dir / "call_5_20260101_120000.wav"
+        wav.write_bytes(b"fake")
+        meta = wav.with_suffix(".meta.json")
+        meta.write_text('{"phone_id": "hostmap", "call_id": 5}')
+
+        try:
+            result = _parse_tool_result(self.client.call_tool(
+                "list_recordings", {"phone_id": "hostmap"},
+            ))
+            entry = next(
+                r for r in result["recordings"] if r["filename"] == wav.name
+            )
+            assert entry["file_path"] == f"{self.HOST_REC}/hostmap/{wav.name}", (
+                f"file_path not host-anchored: {entry['file_path']}"
+            )
+            assert entry["meta_path"] == f"{self.HOST_REC}/hostmap/{meta.name}", (
+                f"meta_path not host-anchored: {entry['meta_path']}"
+            )
+            # No host_* siblings — single field per artifact.
+            assert "host_file_path" not in entry
+            assert "host_meta_path" not in entry
+        finally:
+            wav.unlink(missing_ok=True)
+            meta.unlink(missing_ok=True)
+            try:
+                phone_dir.rmdir()
+            except OSError:
+                pass
+
+    def test_analyze_capture_returns_host_path(self):
+        """A real pcap is hard to fabricate, but the `path` field is set
+        from `_resolve_pcap_path` regardless of pcap validity, so we can
+        check host-anchoring even with a fake-but-present file."""
+        from pathlib import Path
+        # Add a minimal phone (register=False — no live registrar needed).
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "hp",
+            "domain": "127.0.0.1",
+            "username": "u",
+            "password": "p",
+            "register": False,
+        }))
+        pcap_dir = Path("/captures/hp")
+        pcap_dir.mkdir(parents=True, exist_ok=True)
+        pcap = pcap_dir / "call_99_fake.pcap"
+        pcap.write_bytes(b"")  # empty — analyze_pcap will set error, but path is still populated
+
+        try:
+            result = _parse_tool_result(self.client.call_tool(
+                "analyze_capture", {"phone_id": "hp", "call_id": 99},
+            ))
+            assert result["path"] == f"{self.HOST_CAP}/hp/{pcap.name}", (
+                f"path not host-anchored: {result['path']}"
+            )
+            assert "host_path" not in result
+        finally:
+            pcap.unlink(missing_ok=True)
+            try:
+                pcap_dir.rmdir()
+            except OSError:
+                pass
+
+    def test_no_host_root_falls_back_to_container_path(self):
+        """Same MCP, but launched WITHOUT host-root env: file_path is
+        the container path. Single field, just unmapped."""
+        from pathlib import Path
+        if not Path("/recordings").exists():
+            pytest.skip("/recordings not mounted in this test environment")
+        phone_dir = Path("/recordings/fallback")
+        phone_dir.mkdir(parents=True, exist_ok=True)
+        wav = phone_dir / "call_1_20260101.wav"
+        wav.write_bytes(b"fake")
+
+        try:
+            with McpClient() as plain:
+                plain.send_initialize()
+                result = _parse_tool_result(plain.call_tool(
+                    "list_recordings", {"phone_id": "fallback"},
+                ))
+                entry = next(
+                    r for r in result["recordings"] if r["filename"] == wav.name
+                )
+                assert entry["file_path"] == str(wav), (
+                    f"unset env should yield container path, got {entry['file_path']}"
+                )
+        finally:
+            wav.unlink(missing_ok=True)
+            try:
+                phone_dir.rmdir()
+            except OSError:
+                pass
 
 
 class TestRecordingLayout:
@@ -2330,10 +2464,15 @@ class TestRunScenarioArtifacts:
         b = result["artifacts"]["b"]
         assert a is not None, f"alice has no artifacts; got {result['artifacts']}"
         assert b is not None, f"bob has no artifacts; got {result['artifacts']}"
+        # No env vars are set in the test runner → paths fall back to
+        # container paths (still readable from inside the container).
         assert Path(a["recording"]).is_file(), (
             f"recording for alice is not a real file: {a['recording']}"
         )
         assert a["recording"].endswith(".wav")
+        # No host_* sibling fields any more — single path slot per artifact.
+        assert "host_recording" not in a
+        assert "host_pcap" not in a
         # capture_enabled=True on alice → pcap should be set.
         # Tolerant — tcpdump may have failed to bind in the test container,
         # in which case pcap can be missing. Don't hard-fail.
@@ -2364,6 +2503,66 @@ class TestRunScenarioArtifacts:
             f"run-2 reported run-1's recording — mtime filter not isolating: "
             f"first={first_rec_a} second={second_rec_a}"
         )
+
+    @skip_no_domain
+    def test_host_root_env_anchors_artifact_paths(self):
+        """When PJSUA_MCP_HOST_RECORDINGS_DIR / _CAPTURES_DIR are set, the
+        artifact path strings come back rooted at those host paths instead
+        of /recordings or /captures."""
+        # Spawn a SECOND MCP subprocess with env set — separate from the
+        # default fixture client. (We can't change env on the running one.)
+        import json as _json
+        host_rec = "/host/test/recordings"
+        host_cap = "/host/test/captures"
+        with McpClient(extra_env={
+            "PJSUA_MCP_HOST_RECORDINGS_DIR": host_rec,
+            "PJSUA_MCP_HOST_CAPTURES_DIR": host_cap,
+        }) as env_client:
+            env_client.send_initialize()
+            _add_phone(
+                env_client, "a", SIP_USER_A, SIP_PASS_A,
+                recording_enabled=True, capture_enabled=True,
+            )
+            _add_phone(
+                env_client, "b", SIP_USER_B, SIP_PASS_B,
+                auto_answer=True,
+                recording_enabled=True, capture_enabled=True,
+            )
+            _wait_phone_registered(env_client, "a")
+            _wait_phone_registered(env_client, "b")
+
+            scenario = {
+                "name": "host-roots",
+                "phones": ["a", "b"],
+                "initial_actions": [
+                    {"action": "make_call", "phone_id": "a",
+                     "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}"},
+                ],
+                "hooks": [
+                    {
+                        "when": "call.state.confirmed",
+                        "on_phone": "a",
+                        "once": True,
+                        "then": [{"wait": "800ms"}, {"action": "hangup", "phone_id": "a"}],
+                    },
+                ],
+                "stop_on": [{"phone_id": "a", "event": "call.state.disconnected"}],
+                "timeout_ms": 8000,
+            }
+            result = _parse_tool_result(
+                env_client.call_tool("run_scenario", {"scenario": scenario})
+            )
+            assert result["status"] == "ok", f"scenario failed: {result}"
+            a = result["artifacts"]["a"]
+            assert a is not None
+            # Path STARTS with the host root, NOT with /recordings or /captures.
+            assert a["recording"].startswith(host_rec + "/a/"), (
+                f"recording not host-anchored: {a['recording']}"
+            )
+            if a["pcap"] is not None:
+                assert a["pcap"].startswith(host_cap + "/a/"), (
+                    f"pcap not host-anchored: {a['pcap']}"
+                )
 
     @skip_no_domain
     def test_phone_not_in_call_returns_null(self):

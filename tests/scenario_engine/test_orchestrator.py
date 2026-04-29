@@ -953,10 +953,12 @@ def test_run_attaches_artifacts_for_files_created_during_run(tmp_path) -> None:
         assert "artifacts" in d
         a = d["artifacts"]["a"]
         assert a is not None
-        assert a["recording"].endswith("/a/call_0_now.wav")
-        assert a["pcap"].endswith("/a/call_0_now.pcap")
-        assert a["host_recording"] == "/host/rec/a/call_0_now.wav"
-        assert a["host_pcap"] == "/host/cap/a/call_0_now.pcap"
+        # Host roots given → paths are host-anchored, NOT the temp-dir
+        # container roots. Single field per artifact, no host_* siblings.
+        assert a["recording"] == "/host/rec/a/call_0_now.wav"
+        assert a["pcap"] == "/host/cap/a/call_0_now.pcap"
+        assert "host_recording" not in a
+        assert "host_pcap" not in a
         # `b` was in phones but produced nothing → null.
         assert d["artifacts"]["b"] is None
 

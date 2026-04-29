@@ -14,11 +14,14 @@ from typing import TYPE_CHECKING, Any
 
 from .call_manager import CallManager
 from .account_manager import PhoneRegistry
+from .scenario_engine.artifacts import external_path
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
 log = logging.getLogger(__name__)
+
+_RECORDINGS_ROOT = Path("/recordings")
 
 
 def _error_response(action: str, phone_id: str, exc: Exception) -> dict[str, Any]:
@@ -26,13 +29,36 @@ def _error_response(action: str, phone_id: str, exc: Exception) -> dict[str, Any
     return {"status": "error", "error": str(exc), "phone_id": phone_id}
 
 
+def _externalize_recording_file(
+    info: dict[str, Any], host_recordings_root: str | None,
+) -> dict[str, Any]:
+    """Mutate `info` so its `recording_file` (if any) is a client-readable
+    path. Returns the same dict for chaining."""
+    rec = info.get("recording_file")
+    if rec:
+        info["recording_file"] = external_path(
+            rec, _RECORDINGS_ROOT, host_recordings_root,
+        )
+    return info
+
+
 def register_phone_tools(
     mcp: "FastMCP",
     phone_id: str,
     call_mgr: CallManager,
     registry: PhoneRegistry,
+    host_recordings_root: str | None = None,
 ) -> list[str]:
-    """Register the per-phone tool set and return the list of registered names."""
+    """Register the per-phone tool set and return the list of registered names.
+
+    `host_recordings_root` (when given) re-anchors every `recording_file`
+    / `meta_path` field surfaced by these tools (`get_recording`,
+    `get_call_info`, `get_active_calls`, `get_call_history`, plus the
+    `make_call` / `answer_call` / `*_transfer` info responses) so
+    out-of-container clients can Read the WAV/sidecar without resolving
+    the bind mount themselves. When None, container paths come back
+    unchanged — still works in-container.
+    """
     names: list[str] = []
 
     def _add(fn: Any, action: str, description: str) -> None:
@@ -49,6 +75,7 @@ def register_phone_tools(
     ) -> dict[str, Any]:
         try:
             info = call_mgr.make_call(dest_uri, phone_id=phone_id, headers=headers)
+            _externalize_recording_file(info, host_recordings_root)
             return {"status": "ok", **info}
         except Exception as e:
             return _error_response("make_call", phone_id, e)
@@ -61,6 +88,7 @@ def register_phone_tools(
     ) -> dict[str, Any]:
         try:
             info = call_mgr.answer_call(phone_id=phone_id, call_id=call_id, status_code=status_code)
+            _externalize_recording_file(info, host_recordings_root)
             return {"status": "ok", **info}
         except Exception as e:
             return _error_response("answer_call", phone_id, e)
@@ -73,6 +101,7 @@ def register_phone_tools(
     ) -> dict[str, Any]:
         try:
             info = call_mgr.reject_call(phone_id=phone_id, call_id=call_id, status_code=status_code)
+            _externalize_recording_file(info, host_recordings_root)
             return {"status": "ok", **info}
         except Exception as e:
             return _error_response("reject_call", phone_id, e)
@@ -90,7 +119,8 @@ def register_phone_tools(
 
     async def get_call_info(call_id: int | None = None) -> dict[str, Any]:
         try:
-            return call_mgr.get_call_info(phone_id=phone_id, call_id=call_id)
+            info = call_mgr.get_call_info(phone_id=phone_id, call_id=call_id)
+            return _externalize_recording_file(info, host_recordings_root)
         except Exception as e:
             return _error_response("get_call_info", phone_id, e)
 
@@ -102,6 +132,8 @@ def register_phone_tools(
     async def list_calls() -> dict[str, Any]:
         try:
             calls = call_mgr.list_calls(phone_id=phone_id)
+            for c in calls:
+                _externalize_recording_file(c, host_recordings_root)
             return {"phone_id": phone_id, "calls": calls, "total_count": len(calls)}
         except Exception as e:
             return _error_response("list_calls", phone_id, e)
@@ -111,6 +143,8 @@ def register_phone_tools(
     async def get_active_calls() -> dict[str, Any]:
         try:
             calls = call_mgr.get_active_calls(phone_id=phone_id)
+            for c in calls:
+                _externalize_recording_file(c, host_recordings_root)
             return {"phone_id": phone_id, "calls": calls, "active_count": len(calls)}
         except Exception as e:
             return _error_response("get_active_calls", phone_id, e)
@@ -120,6 +154,8 @@ def register_phone_tools(
     async def get_call_history(last_n: int | None = None) -> dict[str, Any]:
         try:
             history = call_mgr.get_call_history(phone_id=phone_id, last_n=last_n)
+            for h in history:
+                _externalize_recording_file(h, host_recordings_root)
             return {"phone_id": phone_id, "history": history, "total_count": len(history)}
         except Exception as e:
             return _error_response("get_call_history", phone_id, e)
@@ -162,6 +198,7 @@ def register_phone_tools(
     ) -> dict[str, Any]:
         try:
             info = call_mgr.blind_transfer(dest_uri, phone_id=phone_id, call_id=call_id)
+            _externalize_recording_file(info, host_recordings_root)
             return {"status": "ok", **info}
         except Exception as e:
             return _error_response("blind_transfer", phone_id, e)
@@ -176,6 +213,7 @@ def register_phone_tools(
             info = call_mgr.attended_transfer(
                 phone_id=phone_id, call_id=call_id, dest_call_id=dest_call_id,
             )
+            _externalize_recording_file(info, host_recordings_root)
             return {"status": "ok", **info}
         except Exception as e:
             return _error_response("attended_transfer", phone_id, e)
@@ -247,10 +285,14 @@ def register_phone_tools(
             return {
                 "phone_id": phone_id,
                 "recording_enabled": rec_enabled,
-                "recording_file": rec_file,
+                "recording_file": external_path(
+                    path, _RECORDINGS_ROOT, host_recordings_root,
+                ),
                 "filename": path.name,
                 "file_size": path.stat().st_size,
-                "meta_path": str(meta_path) if meta_path.exists() else None,
+                "meta_path": external_path(
+                    meta_path, _RECORDINGS_ROOT, host_recordings_root,
+                ) if meta_path.exists() else None,
             }
         except Exception as e:
             return _error_response("get_recording", phone_id, e)

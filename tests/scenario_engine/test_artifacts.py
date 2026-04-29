@@ -1,4 +1,4 @@
-"""Unit tests for src.scenario_engine.artifacts.collect_artifacts."""
+"""Unit tests for src.scenario_engine.artifacts.{collect_artifacts, external_path}."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-from src.scenario_engine.artifacts import collect_artifacts
+from src.scenario_engine.artifacts import collect_artifacts, external_path
 
 
 def _touch(path: Path, mtime: float | None = None, content: bytes = b"") -> Path:
@@ -16,6 +16,59 @@ def _touch(path: Path, mtime: float | None = None, content: bytes = b"") -> Path
         os.utime(path, (mtime, mtime))
     return path
 
+
+# ---------------------------------------------------------------------------
+# external_path()
+# ---------------------------------------------------------------------------
+
+def test_external_path_none_input_passes_through():
+    assert external_path(None, Path("/recordings"), "/host/data") is None
+    assert external_path(None, Path("/recordings"), None) is None
+
+
+def test_external_path_host_root_unset_returns_container_path():
+    """Graceful fallback: env not wired → MCP still returns a usable string,
+    just one that's only readable from inside the container."""
+    out = external_path(
+        Path("/recordings/alice/call_0.wav"),
+        Path("/recordings"),
+        None,
+    )
+    assert out == "/recordings/alice/call_0.wav"
+
+
+def test_external_path_strips_root_and_anchors_host():
+    out = external_path(
+        Path("/recordings/alice/call_0.wav"),
+        Path("/recordings"),
+        "/host/data/recordings",
+    )
+    assert out == "/host/data/recordings/alice/call_0.wav"
+
+
+def test_external_path_accepts_string_input():
+    out = external_path(
+        "/captures/bob/call_42.pcap",
+        Path("/captures"),
+        "/host/data/captures",
+    )
+    assert out == "/host/data/captures/bob/call_42.pcap"
+
+
+def test_external_path_punts_when_container_path_outside_root():
+    """Caller bug — path not under container_root. Surface the raw path
+    instead of mangling it to a nonsense host path."""
+    out = external_path(
+        Path("/captures/alice/x.pcap"),
+        Path("/recordings"),  # wrong root
+        "/host/data",
+    )
+    assert out == "/captures/alice/x.pcap"
+
+
+# ---------------------------------------------------------------------------
+# collect_artifacts()
+# ---------------------------------------------------------------------------
 
 def test_returns_empty_dict_for_no_phones(tmp_path):
     rec = tmp_path / "recordings"
@@ -70,6 +123,7 @@ def test_picks_recording_with_mtime_at_or_after_started_at(tmp_path):
         recordings_root=rec,
         captures_root=cap,
     )
+    # No host_root → container paths returned unchanged.
     assert out["alice"]["recording"] == str(fresh)
     assert out["alice"]["recording_meta"] == str(fresh_meta)
     assert out["alice"]["pcap"] is None
@@ -167,7 +221,9 @@ def test_phone_without_directory_is_null(tmp_path):
     assert out["bob"] is not None
 
 
-def test_host_paths_set_when_host_roots_provided(tmp_path):
+def test_paths_are_host_anchored_when_host_roots_provided(tmp_path):
+    """Host roots set → result paths are absolute host-side strings; no
+    container path leaks into the response."""
     rec = tmp_path / "recordings"
     cap = tmp_path / "captures"
     started = 1700000000.0
@@ -184,29 +240,12 @@ def test_host_paths_set_when_host_roots_provided(tmp_path):
         host_captures_root="/host/data/captures",
     )
     a = out["alice"]
-    assert a["host_recording"] == "/host/data/recordings/alice/call_0.wav"
-    assert a["host_recording_meta"] == "/host/data/recordings/alice/call_0.meta.json"
-    assert a["host_pcap"] == "/host/data/captures/alice/call_0.pcap"
-
-
-def test_host_paths_null_when_host_roots_absent(tmp_path):
-    rec = tmp_path / "recordings"
-    cap = tmp_path / "captures"
-    started = 1700000000.0
-    _touch(rec / "alice" / "call_0.wav", mtime=started + 5)
-    cap.mkdir(parents=True, exist_ok=True)
-
-    out = collect_artifacts(
-        phones=["alice"],
-        started_at=started,
-        recordings_root=rec,
-        captures_root=cap,
-    )
-    a = out["alice"]
-    assert a["recording"] is not None
-    assert a["host_recording"] is None
-    assert a["host_recording_meta"] is None
-    assert a["host_pcap"] is None
+    assert a["recording"] == "/host/data/recordings/alice/call_0.wav"
+    assert a["recording_meta"] == "/host/data/recordings/alice/call_0.meta.json"
+    assert a["pcap"] == "/host/data/captures/alice/call_0.pcap"
+    # No host_* sibling fields — container/host path lives in one slot.
+    assert "host_recording" not in a
+    assert "host_pcap" not in a
 
 
 def test_old_only_files_yield_null(tmp_path):

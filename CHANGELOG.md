@@ -6,34 +6,54 @@
 - `run_scenario` result now includes an `artifacts: {phone_id: {...}}` dict
   populated post-stop. Each phone in `scenario.phones` maps to either
   `null` (no recording/pcap created during this run) or a dict with
-  `recording`, `recording_meta`, `pcap` (container paths) and
-  `host_recording`, `host_recording_meta`, `host_pcap` (host-side paths
-  when `PJSUA_MCP_HOST_RECORDINGS_DIR` / `PJSUA_MCP_HOST_CAPTURES_DIR`
-  are set in the env, otherwise `null`). Files are filtered by
+  `recording`, `recording_meta`, `pcap`. Files are filtered by
   `mtime ≥ scenario.started_at` so a run never picks up a previous
   run's artifacts; latest-mtime wins per phone. Backward-compatible —
   existing fields (`status`, `elapsed_ms`, `timeline`, `errors`,
   `reason`) unchanged.
-- `src/scenario_engine/artifacts.py:collect_artifacts(...)` — pure
-  helper backing the above. 12 unit tests in
-  `tests/scenario_engine/test_artifacts.py` cover mtime filter,
-  latest-wins, pair-with-meta-sidecar, host path mapping, missing-
-  directory tolerance, recording-disabled-pcap-only edge case.
+- `src/scenario_engine/artifacts.py:collect_artifacts(...)` and
+  `external_path(...)` — pure helpers backing the above. 16 unit tests
+  in `tests/scenario_engine/test_artifacts.py` cover mtime filter,
+  latest-wins, pair-with-meta-sidecar, host-path mapping, container-
+  fallback, missing-directory tolerance, recording-disabled-pcap-only
+  edge case.
 - Integration tests `TestRunScenarioArtifacts` in
   `tests/test_integration.py` covering proposal-04 acceptance criteria
   against live Asterisk: artifacts populated for both legs of a
   roundtrip, two sequential runs report distinct recordings,
-  unengaged phones come back as null.
+  unengaged phones come back as null, env-rooted host paths.
+- Integration tests `TestHostPathMapping` covering the
+  `list_recordings` / `analyze_capture` host-path wiring (no live SIP
+  needed — synthetic files under `/recordings` and `/captures`).
+
+### Changed (for consistency — single host-anchored path field per slot)
+- Every recording / capture path string the MCP returns is now
+  re-anchored to host paths when `PJSUA_MCP_HOST_RECORDINGS_DIR` /
+  `PJSUA_MCP_HOST_CAPTURES_DIR` are set in the env, falling back to the
+  container path when unset. Out-of-container clients (Claude Code,
+  plugin host) can Read/Bash any returned path string directly without
+  resolving the bind mount themselves. Affected fields:
+    - `run_scenario.artifacts.<phone>.recording / recording_meta / pcap`
+    - `list_recordings.recordings[*].file_path / meta_path`
+    - `analyze_capture.path`
+    - `<phone>_get_recording.recording_file / meta_path`
+    - `<phone>_get_call_info.recording_file`
+    - `<phone>_get_active_calls.calls[*].recording_file`
+    - `<phone>_get_call_history.history[*].recording_file`
+    - `<phone>_make_call / answer_call / reject_call / blind_transfer /
+      attended_transfer / list_calls`'s `recording_file` (if set)
+  No more dual-field shape (no `host_recording` next to `recording`):
+  the path slot itself contains the right value. The MCP server still
+  uses container paths internally for I/O — translation happens only
+  at the response boundary.
 
 ### Configuration
 - New env vars `PJSUA_MCP_HOST_RECORDINGS_DIR` and
-  `PJSUA_MCP_HOST_CAPTURES_DIR` (both optional). When set, the host-
-  side absolute paths of the `/recordings` and `/captures` bind targets
-  are surfaced in `run_scenario.artifacts.<phone>.host_*` fields so
-  out-of-container clients (Claude Code, plugin host) can Read/Bash
-  artifacts without resolving the bind mount themselves. Empty / unset
-  → `host_*` fields come back as `null`. `docker-compose.yml` passes
-  both through; `.env.example` documents the wiring.
+  `PJSUA_MCP_HOST_CAPTURES_DIR` (both optional). When set, every
+  recording/capture path the MCP returns is host-anchored (see Changed
+  above). Unset → container paths come back unchanged.
+  `docker-compose.yml` passes both through; `.env.example` documents
+  the wiring.
 
 ### Added
 - MCP tool `get_call_messages(phone_id, call_id, method, direction,

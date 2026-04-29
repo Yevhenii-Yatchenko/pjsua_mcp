@@ -33,6 +33,7 @@ from .call_manager import CallManager
 from .pcap_manager import PcapManager
 from .pcap_analyzer import analyze_pcap
 from .phone_tool_factory import register_phone_tools, unregister_phone_tools
+from .scenario_engine.artifacts import external_path
 from .scenario_engine.event_bus import EventBus, set_default_bus
 from .scenario_engine.orchestrator import run_scenario as run_scenario_impl
 
@@ -202,7 +203,10 @@ def _add_phone_impl(
         capture_enabled=capture_enabled,
     )
 
-    tool_names = register_phone_tools(mcp, phone_id, call_mgr, registry)
+    tool_names = register_phone_tools(
+        mcp, phone_id, call_mgr, registry,
+        host_recordings_root=_HOST_RECORDINGS_ROOT,
+    )
     _phone_tools[phone_id] = tool_names
 
     cfg = registry.get_config(phone_id)
@@ -865,8 +869,10 @@ _CAPTURES_ROOT = Path("/captures")
 
 # Host-side bind targets — set by docker-compose so MCP clients (Claude
 # Code, which runs OUTSIDE the container) can read artifacts via host
-# paths without resolving the mount themselves. Unset → host_* fields
-# in run_scenario.artifacts come back as None.
+# paths without resolving the mount themselves. Every MCP response that
+# includes a recording/capture path runs the path through `external_path`
+# with these roots so the value is host-anchored when set, otherwise
+# falls back to the container path (still useful for in-container tests).
 _HOST_RECORDINGS_ROOT = os.environ.get("PJSUA_MCP_HOST_RECORDINGS_DIR") or None
 _HOST_CAPTURES_ROOT = os.environ.get("PJSUA_MCP_HOST_CAPTURES_DIR") or None
 
@@ -916,7 +922,7 @@ async def list_recordings(
     """
     try:
         if not _RECORDINGS_ROOT.exists():
-            return {"recordings": [], "total_count": 0, "root": str(_RECORDINGS_ROOT)}
+            return {"recordings": [], "total_count": 0}
 
         recordings: list[dict[str, Any]] = []
         for f in _RECORDINGS_ROOT.rglob("*.wav"):
@@ -930,18 +936,19 @@ async def list_recordings(
             meta_path = f.with_suffix(".meta.json")
             recordings.append({
                 "filename": f.name,
-                "file_path": str(f),
+                "file_path": external_path(f, _RECORDINGS_ROOT, _HOST_RECORDINGS_ROOT),
                 "file_size": f.stat().st_size,
                 "phone_id": file_phone,
                 "call_id": file_call,
-                "meta_path": str(meta_path) if meta_path.exists() else None,
+                "meta_path": external_path(
+                    meta_path, _RECORDINGS_ROOT, _HOST_RECORDINGS_ROOT,
+                ) if meta_path.exists() else None,
             })
 
-        recordings.sort(key=lambda r: r["file_path"], reverse=True)
+        recordings.sort(key=lambda r: r["file_path"] or "", reverse=True)
         return {
             "recordings": recordings,
             "total_count": len(recordings),
-            "root": str(_RECORDINGS_ROOT),
         }
     except Exception as e:
         log.exception("list_recordings failed")
@@ -1059,6 +1066,12 @@ async def analyze_capture(
         result["phone_id"] = phone_id
         result["call_id"] = call_id if call_id is not None else (
             meta.get("call_id") if meta else None
+        )
+        # Overwrite analyze_pcap's container-side `path` with the value
+        # the client should use (host-anchored when env wired, container
+        # otherwise).
+        result["path"] = external_path(
+            pcap_path, _CAPTURES_ROOT, _HOST_CAPTURES_ROOT,
         )
         return result
     except Exception as e:

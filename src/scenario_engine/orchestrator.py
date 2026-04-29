@@ -325,8 +325,10 @@ async def run_scenario(
     error, the run returns `status="error"` immediately without touching
     pjsua. Pass `skip_validation=True` to bypass (used by engine tests only).
 
-    `recordings_root` / `captures_root` (and their `host_*` counterparts)
-    enable the post-run artifact sweep. When unset, `result.artifacts` is
+    `recordings_root` / `captures_root` enable the post-run artifact sweep
+    (sets `result.artifacts`). Optional `host_*_root` re-anchor the path
+    strings that go into the response so out-of-container clients can
+    Read them directly. When the roots are unset, `result.artifacts` is
     `{}` — no I/O is performed.
     """
     if loop is None:
