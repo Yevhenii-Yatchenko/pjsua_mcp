@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+- MCP tool `analyze_capture(phone_id, call_id=None)` — parses a phone's
+  pcap into structured RTP/RTCP flow counts, classifies packets per
+  RFC 3550 (V=2, RTCP PT 200..206 → rtcp_flows; everything else with
+  V=2 → rtp_flows), and surfaces a per-phone summary
+  (`phone_rtp_codecs_seen`, `non_phone_codecs_on_phone_port`) when
+  the call's recording sidecar contains `local_rtp_port`. Supports
+  libpcap linktypes 0/1/12/113/276 (DLT_NULL, EN10MB, RAW, LINUX_SLL,
+  LINUX_SLL2). Replaces the inline 70-line `python3 - <<PY` blocks
+  in plan-NN scripts.
+- `src/pcap_analyzer.py` — pure-Python pcap walker built on `dpkt`
+  (already a runtime dep). 19 unit tests in `tests/test_pcap_analyzer.py`
+  cover linktypes, RTP/RTCP separation, marker-bit handling, and
+  per-phone summary computation against synthesised + plan-01 real
+  fixtures (`tests/fixtures/plan_01_alice.pcap`, `plan_01_bob.pcap`).
+- Recording sidecar `.meta.json` now stores `local_rtp_port` and
+  `remote_rtp_port`, snapshotted in `onCallMediaState` while media is
+  ACTIVE (post-disconnect read of `getMedTransportInfo` is unreliable).
+
 ### Removed (BREAKING)
 - MCP tools `get_codecs` and `set_codecs`. Replaced by per-phone API:
   - To set per-phone codecs on creation: `add_phone(codecs=[...])`.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -25,6 +26,7 @@ from .sip_engine import SipEngine
 from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 from .call_manager import CallManager
 from .pcap_manager import PcapManager
+from .pcap_analyzer import analyze_pcap
 from .phone_tool_factory import register_phone_tools, unregister_phone_tools
 from .scenario_engine.event_bus import EventBus, set_default_bus
 from .scenario_engine.orchestrator import run_scenario as run_scenario_impl
@@ -664,6 +666,7 @@ async def get_sip_log(
 
 
 _RECORDINGS_ROOT = Path("/recordings")
+_CAPTURES_ROOT = Path("/captures")
 
 
 def _parse_recording_filename(path: Path) -> tuple[str | None, int | None]:
@@ -745,6 +748,129 @@ async def list_recordings(
     except Exception as e:
         log.exception("list_recordings failed")
         return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Pcap analysis — turn a recorded /captures/<phone>/...pcap into a
+# structured RTP/RTCP flow report.
+# ---------------------------------------------------------------------------
+def _resolve_pcap_path(phone_id: str, call_id: int | None) -> Path | None:
+    """Find the matching pcap under `/captures/<phone_id>/`.
+
+    `call_id=None` → most recent pcap (any name) for the phone.
+    `call_id=N`    → most recent pcap whose stem starts with `call_<N>_`.
+
+    Returns None if no match.
+    """
+    phone_dir = _CAPTURES_ROOT / phone_id
+    if not phone_dir.is_dir():
+        return None
+    if call_id is None:
+        candidates = list(phone_dir.glob("*.pcap"))
+    else:
+        candidates = list(phone_dir.glob(f"call_{call_id}_*.pcap"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _lookup_meta_for_pcap(pcap_path: Path) -> dict[str, Any] | None:
+    """Find the recording meta.json whose `pcap` field equals `pcap_path`.
+
+    Recordings live under `/recordings/<phone_id>/`; the pcap is in
+    `/captures/<phone_id>/`. Their basenames differ (microsecond timestamps
+    are taken at independent moments), so we walk the recordings dir for
+    the same phone and match by the absolute pcap path stored in each
+    sidecar.
+    """
+    target = str(pcap_path)
+    rec_dir = _RECORDINGS_ROOT / pcap_path.parent.name
+    if not rec_dir.is_dir():
+        return None
+    for meta_file in rec_dir.glob("*.meta.json"):
+        try:
+            data = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("pcap") == target:
+            return data
+    return None
+
+
+@mcp.tool()
+async def analyze_capture(
+    phone_id: str,
+    call_id: int | None = None,
+) -> dict[str, Any]:
+    """Parse a phone's pcap file into a structured RTP/RTCP flow report.
+
+    Resolves the pcap under `/captures/<phone_id>/`:
+      * `call_id=None` → most recent pcap (latest by mtime);
+      * `call_id=<N>` → newest pcap whose name starts with `call_<N>_`.
+
+    Returns aggregated `rtp_flows` and `rtcp_flows` (one entry per
+    distinct `(src_port, dst_port, payload_type)` tuple) plus a
+    per-phone summary (`phone_rtp_port`, `phone_rtp_codecs_seen`,
+    `non_phone_codecs_on_phone_port`).
+
+    Per-phone fields are populated when the call's recording sidecar
+    `.meta.json` includes `local_rtp_port` (recorded automatically for
+    new calls — old fixtures lacking the field leave per-phone fields
+    as None/[]). Codec leak detection compares observed codecs against
+    the phone's configured `codecs` list (`add_phone(codecs=...)` /
+    `update_phone(codecs=...)`); a non-empty
+    `non_phone_codecs_on_phone_port` indicates the per-phone SDP filter
+    is leaking.
+
+    Errors are returned as `{error: "..."}` rather than exceptions:
+    missing pcap (`capture_enabled: false` for the call), unknown
+    libpcap linktype, unreadable file. `total_packets`, `rtp_flows`,
+    `rtcp_flows` are still populated where possible.
+    """
+    assert registry is not None
+    try:
+        pcap_path = _resolve_pcap_path(phone_id, call_id)
+        if pcap_path is None:
+            return {
+                "phone_id": phone_id,
+                "call_id": call_id,
+                "path": None,
+                "error": (
+                    f"no capture for phone={phone_id!r} call_id={call_id} — "
+                    "is `capture_enabled` set on the phone?"
+                ),
+                "total_packets": 0,
+                "rtp_flows": [],
+                "rtcp_flows": [],
+                "phone_rtp_port": None,
+                "phone_rtp_codecs_seen": None,
+                "non_phone_codecs_on_phone_port": None,
+            }
+
+        meta = _lookup_meta_for_pcap(pcap_path)
+        local_rtp_port = meta.get("local_rtp_port") if meta else None
+        cfg = registry.get_config(phone_id)
+        expected_codecs = cfg.codecs if cfg else None
+
+        result = analyze_pcap(
+            pcap_path,
+            phone_rtp_port=local_rtp_port,
+            expected_codecs=expected_codecs,
+        )
+        result["phone_id"] = phone_id
+        result["call_id"] = call_id if call_id is not None else (
+            meta.get("call_id") if meta else None
+        )
+        return result
+    except Exception as e:
+        log.exception("analyze_capture failed")
+        return {
+            "status": "error",
+            "error": str(e),
+            "phone_id": phone_id,
+            "call_id": call_id,
+        }
 
 
 # ---------------------------------------------------------------------------

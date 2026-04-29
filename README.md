@@ -66,7 +66,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 
 ## MCP Tools
 
-### Static (10 — always present)
+### Static (11 — always present)
 
 #### Phone CRUD
 | Tool | Description |
@@ -83,8 +83,9 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 |------|-------------|
 | `get_sip_log` | Retrieve pjsip log entries. `phone_id=...` filters by that phone's `sip:<user>@` URI substring |
 | `list_recordings` | Walk `/recordings/` (and legacy flat files) for every WAV; filter by `phone_id` / `call_id` |
+| `analyze_capture` | Parse `/captures/<phone_id>/call_<call_id>_*.pcap` into structured RTP/RTCP flow counts. Surfaces `phone_rtp_codecs_seen` + `non_phone_codecs_on_phone_port` (compared against the phone's `codecs` config) so the caller can verify per-phone SDP filter conformance without ad-hoc pcap parsing in bash |
 
-Per-phone packet capture lives on `update_phone(phone_id=..., capture_enabled=true/false)` — auto-starts a tcpdump on the first audio-active call and stops on the last disconnect. The pcap path lands in the WAV's `.meta.json` sidecar so recording and capture pair up on disk.
+Per-phone packet capture lives on `update_phone(phone_id=..., capture_enabled=true/false)` — auto-starts a tcpdump on the first audio-active call and stops on the last disconnect. The pcap path lands in the WAV's `.meta.json` sidecar (alongside `local_rtp_port` / `remote_rtp_port`, snapshotted while media is ACTIVE) so recording, capture, and `analyze_capture` all pair up on disk.
 
 #### Scenario engine
 | Tool | Description |

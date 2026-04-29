@@ -57,6 +57,11 @@ class SipCall(pj.Call):
         self._player: pj.AudioMediaPlayer | None = None
         self._player_file: str | None = None
         self._aud_med: pj.AudioMedia | None = None  # cached for play/stop
+        # RTP ports captured while media is ACTIVE — getMedTransportInfo
+        # is unreliable post-disconnect (media transport is torn down
+        # before _stop_recording writes the meta sidecar).
+        self._local_rtp_port: int | None = None
+        self._remote_rtp_port: int | None = None
         self.on_disconnected_cb: Any = None
         # Fires exactly once, when onCallMediaState sees audio go ACTIVE for
         # the first time. CallManager wires this to its auto-capture counter
@@ -210,7 +215,34 @@ class SipCall(pj.Call):
                         self._info["codec"] = si.codecName
                 except Exception:
                     pass
+
+                # Snapshot RTP transport endpoints while media is alive —
+                # they are unavailable in onCallState DISCONNECTED.
+                self._snapshot_rtp_ports(i)
         log.info("[%s] Call %d media state updated", self.phone_id, ci.id)
+
+    def _snapshot_rtp_ports(self, med_idx: int) -> None:
+        """Capture (local, remote) RTP UDP ports for analyse_capture's
+        per-phone summary. Best-effort: failures leave the previous
+        snapshot in place so a later media state still wins.
+        """
+        try:
+            mt = self.getMedTransportInfo(med_idx)
+        except Exception:
+            return
+
+        def _port(name: object) -> int | None:
+            try:
+                return int(str(name).rsplit(":", 1)[-1])
+            except (ValueError, AttributeError, IndexError):
+                return None
+
+        local = _port(getattr(mt, "localRtpName", None))
+        remote = _port(getattr(mt, "srcRtpName", None))
+        if local is not None:
+            self._local_rtp_port = local
+        if remote is not None:
+            self._remote_rtp_port = remote
 
     # --- Recording ---
     #
@@ -346,6 +378,9 @@ class SipCall(pj.Call):
                     pcap_path = self._pcap_mgr.current_pcap_path_for(self.phone_id)
                 except Exception:
                     pcap_path = None
+            # Take a final snapshot — onCallMediaState may not have fired
+            # if media never went ACTIVE (e.g., call rejected before 200 OK).
+            self._snapshot_rtp_ports(0)
             meta = {
                 "phone_id": self.phone_id,
                 "call_id": call_id,
@@ -359,11 +394,14 @@ class SipCall(pj.Call):
                 "last_status_text": info.get("last_status_text", ""),
                 "recording": str(rec_path),
                 "pcap": pcap_path,
+                "local_rtp_port": self._local_rtp_port,
+                "remote_rtp_port": self._remote_rtp_port,
             }
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             log.info("[%s] Wrote recording meta: %s", self.phone_id, meta_path)
         except Exception:
             log.exception("Failed to write recording meta for %s", self._recording_file)
+
 
     # --- Audio playback ---
 

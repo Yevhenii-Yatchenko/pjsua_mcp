@@ -1700,3 +1700,218 @@ class TestCodecs:
         )
 
         self.client.call_tool("a_hangup", {"call_id": call_id})
+
+
+# ---------------------------------------------------------------------------
+# analyze_capture tool — static (no SIP) and live (real call) coverage
+# ---------------------------------------------------------------------------
+
+class TestAnalyzeCaptureStatic:
+    """No SIP_DOMAIN needed — drops a known fixture pcap into
+    `/captures/<phone_id>/` and exercises the resolver + the
+    `pcap_analyzer.analyze_pcap` integration (linktype, RTP/RTCP flows,
+    per-phone summary).
+
+    Per-phone fields require a meta.json with `local_rtp_port`. The
+    plan-01 fixtures predate that field, so the static tests fabricate
+    a meta.json alongside the pcap when they need to exercise the
+    summary path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def mcp(self, tmp_path):
+        self.tmp_path = tmp_path
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            self._cleanup_dirs: list[str] = []
+            yield
+            from pathlib import Path
+            import shutil
+            for d in self._cleanup_dirs:
+                shutil.rmtree(Path(d), ignore_errors=True)
+
+    def _drop_pcap(
+        self,
+        phone_id: str,
+        fixture_name: str,
+        call_id: int = 0,
+    ) -> str:
+        """Copy a fixture pcap into `/captures/<phone_id>/` with a name
+        the resolver will accept. Returns the resulting path.
+        """
+        from pathlib import Path
+        import shutil
+
+        src = Path(__file__).parent / "fixtures" / fixture_name
+        assert src.exists(), f"fixture missing: {src}"
+        dst_dir = Path("/captures") / phone_id
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_dirs.append(str(dst_dir))
+        dst = dst_dir / f"call_{call_id}_20260101_000000_000000.pcap"
+        shutil.copy2(src, dst)
+        return str(dst)
+
+    def _drop_meta(
+        self,
+        phone_id: str,
+        pcap_path: str,
+        call_id: int,
+        local_rtp_port: int | None,
+    ) -> None:
+        """Write a recordings sidecar that points at the given pcap."""
+        from pathlib import Path
+
+        rec_dir = Path("/recordings") / phone_id
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_dirs.append(str(rec_dir))
+        rec = rec_dir / f"call_{call_id}_20260101_000000_000000.wav"
+        rec.write_bytes(b"")
+        meta = rec.with_suffix(".meta.json")
+        meta.write_text(json.dumps({
+            "phone_id": phone_id,
+            "call_id": call_id,
+            "pcap": pcap_path,
+            "local_rtp_port": local_rtp_port,
+        }))
+
+    def test_no_pcap_returns_descriptive_error(self):
+        """Phone with no pcap → tool returns `error`, leaves flows empty,
+        does not raise."""
+        out = _parse_tool_result(self.client.call_tool("analyze_capture", {
+            "phone_id": "no_such_phone",
+        }))
+        assert out["error"] is not None
+        assert "no capture" in out["error"]
+        assert out["path"] is None
+        assert out["total_packets"] == 0
+        assert out["rtp_flows"] == []
+
+    def test_pcap_without_meta_still_decodes_flows(self):
+        """A fixture pcap with no recording sidecar still yields flows;
+        per-phone summary fields stay None for lack of local_rtp_port."""
+        self._drop_pcap("anal1", "plan_01_alice.pcap", call_id=0)
+        out = _parse_tool_result(self.client.call_tool("analyze_capture", {
+            "phone_id": "anal1",
+        }))
+        assert out["error"] is None
+        assert out["linktype"] == 276
+        assert out["linktype_name"] == "LINUX_SLL2"
+        assert out["total_packets"] >= 343
+        # No meta.json → no port → no per-phone summary
+        assert out["phone_rtp_port"] is None
+        assert out["phone_rtp_codecs_seen"] is None
+        # rtp + rtcp must be non-empty for the live alice fixture
+        assert any(f["codec"] == "PCMU" for f in out["rtp_flows"])
+        assert len(out["rtcp_flows"]) >= 1
+
+    def test_meta_local_rtp_port_drives_per_phone_summary(self):
+        """Sidecar with local_rtp_port lets analyze_capture report
+        phone_rtp_codecs_seen and (because phone has codecs=[PCMU]) an
+        empty non_phone_codecs_on_phone_port (per acceptance criterion 1)."""
+        # Phone must exist in the registry so cfg.codecs is honoured.
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "anal2",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+            "codecs": ["PCMU", "telephone-event"],
+        }))
+        pcap_path = self._drop_pcap("anal2", "plan_01_alice.pcap", call_id=0)
+        self._drop_meta("anal2", pcap_path, call_id=0, local_rtp_port=4000)
+        out = _parse_tool_result(self.client.call_tool("analyze_capture", {
+            "phone_id": "anal2",
+            "call_id": 0,
+        }))
+        assert out["error"] is None
+        assert out["phone_rtp_port"] == 4000
+        # acceptance criterion 1
+        assert out["phone_rtp_codecs_seen"] == ["PCMU"]
+        assert out["non_phone_codecs_on_phone_port"] == []
+
+    def test_bob_fixture_acceptance_criterion(self):
+        """Acceptance criterion 2: bob's pcap on local_rtp_port=4002 →
+        phone_rtp_codecs_seen=["PCMA"]."""
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "anal3",
+            "domain": "127.0.0.1", "username": "u", "password": "p",
+            "register": False,
+            "codecs": ["PCMA", "telephone-event"],
+        }))
+        pcap_path = self._drop_pcap("anal3", "plan_01_bob.pcap", call_id=1)
+        self._drop_meta("anal3", pcap_path, call_id=1, local_rtp_port=4002)
+        out = _parse_tool_result(self.client.call_tool("analyze_capture", {
+            "phone_id": "anal3",
+            "call_id": 1,
+        }))
+        assert out["error"] is None
+        assert out["phone_rtp_codecs_seen"] == ["PCMA"]
+        assert out["non_phone_codecs_on_phone_port"] == []
+
+    def test_call_id_selects_specific_pcap(self):
+        """When two pcaps for different call_ids share a phone dir, the
+        resolver must pick the one matching the requested call_id."""
+        from pathlib import Path
+        self._drop_pcap("anal4", "plan_01_alice.pcap", call_id=0)
+        self._drop_pcap("anal4", "plan_01_bob.pcap", call_id=1)
+
+        a = _parse_tool_result(self.client.call_tool("analyze_capture", {
+            "phone_id": "anal4", "call_id": 0,
+        }))
+        b = _parse_tool_result(self.client.call_tool("analyze_capture", {
+            "phone_id": "anal4", "call_id": 1,
+        }))
+        assert a["path"].endswith("call_0_20260101_000000_000000.pcap")
+        assert b["path"].endswith("call_1_20260101_000000_000000.pcap")
+        # bob's pcap is bigger
+        assert b["total_packets"] > a["total_packets"]
+
+
+@skip_no_domain
+class TestAnalyzeCaptureLive:
+    """End-to-end exercise: real call, real tcpdump, real meta.json with
+    `local_rtp_port`, real `analyze_capture` invocation."""
+
+    @pytest.fixture(autouse=True)
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                       codecs=["PCMU", "telephone-event"],
+                       capture_enabled=True,
+                       recording_enabled=True)
+            _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                       auto_answer=True)
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
+            yield
+
+    def test_real_call_then_analyze_capture(self):
+        """Make → hang up → analyze_capture surfaces PCMU on phone a's
+        RTP port and zero leaks against expected codecs."""
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        time.sleep(3)  # CONFIRMED + first audio-active → tcpdump opens
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+        time.sleep(2)  # let pcap flush + meta.json land
+
+        out = _parse_tool_result(self.client.call_tool("analyze_capture", {
+            "phone_id": "a", "call_id": call_id,
+        }))
+        if out.get("error") and "no capture" in (out.get("error") or ""):
+            pytest.skip(
+                "tcpdump didn't open a pcap — likely missing NET_RAW in this environment"
+            )
+        assert out["error"] is None
+        # Live capture must have at least the call's RTP packets in it.
+        assert out["total_packets"] >= 1
+        # local_rtp_port should be populated from meta.json
+        assert out["phone_rtp_port"] is not None
+        assert isinstance(out["phone_rtp_port"], int)
+        # phone is configured for PCMU only → no leaks
+        assert out["non_phone_codecs_on_phone_port"] == []
+        # PCMU should be the codec actually flowing
+        if out["phone_rtp_codecs_seen"]:
+            assert "PCMU" in out["phone_rtp_codecs_seen"]
