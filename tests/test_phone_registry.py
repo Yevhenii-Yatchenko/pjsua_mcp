@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 from src.sip_engine import SipEngine
-from src.account_manager import PhoneRegistry, SipAccount, DEFAULT_PHONE_ID
+from src.account_manager import PhoneConfig, PhoneRegistry, SipAccount, DEFAULT_PHONE_ID
 
 
 class TestEmptyRegistry:
@@ -136,3 +138,22 @@ class TestRegistryHooks:
         # Drop nonexistent — hook must NOT fire
         registry.drop_phone("ghost")
         assert fired == []
+
+
+class TestPhoneConfigCodecs:
+    """Per-phone codec preferences restored — `cfg.codecs` is the wishlist
+    used by the SDP rewriter to filter offers/answers for this phone."""
+
+    def test_phone_config_has_codecs_field(self):
+        names = {f.name for f in fields(PhoneConfig)}
+        assert "codecs" in names, (
+            f"PhoneConfig must carry a `codecs` field — got {sorted(names)}"
+        )
+
+    def test_phone_config_codecs_default_is_none(self):
+        cfg = PhoneConfig(domain="x")
+        assert cfg.codecs is None
+
+    def test_phone_config_codecs_round_trip(self):
+        cfg = PhoneConfig(domain="x", codecs=["PCMA", "telephone-event"])
+        assert cfg.codecs == ["PCMA", "telephone-event"]

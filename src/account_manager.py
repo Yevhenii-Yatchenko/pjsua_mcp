@@ -161,7 +161,6 @@ class PhoneRegistry:
         auto_answer: bool = False,
         transport: str = "udp",
         local_port: int = 0,
-        codecs: list[str] | None = None,
         register: bool = True,
         recording_enabled: bool = False,
         capture_enabled: bool = False,
@@ -188,7 +187,6 @@ class PhoneRegistry:
             auto_answer=auto_answer,
             transport=transport,
             local_port=local_port,
-            codecs=codecs,
             recording_enabled=recording_enabled,
             capture_enabled=capture_enabled,
         )
@@ -346,7 +344,6 @@ class PhoneRegistry:
             auto_answer=cfg.auto_answer,
             transport=cfg.transport,
             local_port=cfg.local_port,
-            codecs=cfg.codecs,
             register=True,
             recording_enabled=cfg.recording_enabled,
             capture_enabled=cfg.capture_enabled,
@@ -452,7 +449,6 @@ class PhoneRegistry:
         auto_answer: bool = False,
         transport: str = "udp",
         local_port: int = 0,
-        codecs: list[str] | None = None,
     ) -> None:
         """Legacy: stash credentials for the "default" phone until register() is called."""
         self._legacy_pending = PhoneConfig(
@@ -464,7 +460,6 @@ class PhoneRegistry:
             auto_answer=auto_answer,
             transport=transport,
             local_port=local_port,
-            codecs=codecs,
         )
 
     def register(self) -> None:
@@ -482,7 +477,6 @@ class PhoneRegistry:
             auto_answer=cfg.auto_answer,
             transport=cfg.transport,
             local_port=cfg.local_port,
-            codecs=cfg.codecs,
             register=True,
         )
 
