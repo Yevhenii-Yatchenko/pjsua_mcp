@@ -2268,3 +2268,136 @@ class TestAnalyzeCaptureLive:
         # PCMU should be the codec actually flowing
         if out["phone_rtp_codecs_seen"]:
             assert "PCMU" in out["phone_rtp_codecs_seen"]
+
+
+class TestRunScenarioArtifacts:
+    """proposal-04 acceptance: run_scenario.artifacts isolates the current
+    run's recordings/pcaps using mtime, latest-wins per phone.
+
+    Skipped without SIP_DOMAIN. Two sequential runs verify that the second
+    run reports a *different* recording — not the first run's leftover.
+    """
+
+    @pytest.fixture(autouse=True)
+    def mcp(self):
+        with McpClient() as client:
+            client.send_initialize()
+            self.client = client
+            _add_phone(
+                self.client, "a", SIP_USER_A, SIP_PASS_A,
+                recording_enabled=True, capture_enabled=True,
+            )
+            _add_phone(
+                self.client, "b", SIP_USER_B, SIP_PASS_B,
+                auto_answer=True,
+                recording_enabled=True, capture_enabled=True,
+            )
+            _wait_phone_registered(self.client, "a")
+            _wait_phone_registered(self.client, "b")
+            yield
+
+    def _run_scenario_basic_call(self) -> dict:
+        scenario = {
+            "name": "basic-call-roundtrip",
+            "phones": ["a", "b"],
+            "initial_actions": [
+                {"action": "make_call", "phone_id": "a",
+                 "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}"},
+            ],
+            "hooks": [
+                {
+                    "when": "call.state.confirmed",
+                    "on_phone": "a",
+                    "once": True,
+                    "then": [{"wait": "1500ms"}, {"action": "hangup", "phone_id": "a"}],
+                },
+            ],
+            "stop_on": [{"phone_id": "a", "event": "call.state.disconnected"}],
+            "timeout_ms": 12000,
+        }
+        return _parse_tool_result(
+            self.client.call_tool("run_scenario", {"scenario": scenario})
+        )
+
+    @skip_no_domain
+    def test_artifacts_present_for_both_phones(self):
+        from pathlib import Path
+
+        result = self._run_scenario_basic_call()
+        assert result["status"] == "ok", f"first run failed: {result}"
+        assert "artifacts" in result, "result missing 'artifacts' field"
+        a = result["artifacts"]["a"]
+        b = result["artifacts"]["b"]
+        assert a is not None, f"alice has no artifacts; got {result['artifacts']}"
+        assert b is not None, f"bob has no artifacts; got {result['artifacts']}"
+        assert Path(a["recording"]).is_file(), (
+            f"recording for alice is not a real file: {a['recording']}"
+        )
+        assert a["recording"].endswith(".wav")
+        # capture_enabled=True on alice → pcap should be set.
+        # Tolerant — tcpdump may have failed to bind in the test container,
+        # in which case pcap can be missing. Don't hard-fail.
+        if a["pcap"] is not None:
+            assert a["pcap"].endswith(".pcap")
+        # Sidecar meta.json may not be flushed by the time the scenario
+        # stops, but if present it must be valid JSON.
+        if a["recording_meta"] is not None:
+            json.loads(Path(a["recording_meta"]).read_text())
+
+    @skip_no_domain
+    def test_two_sequential_runs_report_different_recordings(self):
+        """Acceptance #1: artifacts for run-2 must point at run-2's files,
+        not run-1's leftovers."""
+        first = self._run_scenario_basic_call()
+        assert first["status"] == "ok"
+        first_rec_a = first["artifacts"]["a"]["recording"]
+
+        # Brief pause so file mtimes are distinguishable across runs even
+        # on filesystems with low resolution.
+        time.sleep(1.2)
+
+        second = self._run_scenario_basic_call()
+        assert second["status"] == "ok"
+        second_rec_a = second["artifacts"]["a"]["recording"]
+
+        assert first_rec_a != second_rec_a, (
+            f"run-2 reported run-1's recording — mtime filter not isolating: "
+            f"first={first_rec_a} second={second_rec_a}"
+        )
+
+    @skip_no_domain
+    def test_phone_not_in_call_returns_null(self):
+        """Acceptance #3: phone listed in `phones` but with no calls during
+        this run → artifacts[phone] == None."""
+        # Add a third phone but let it idle.
+        _add_phone(
+            self.client, "c", SIP_USER_C, SIP_PASS_C,
+            recording_enabled=True, capture_enabled=True,
+        )
+        _wait_phone_registered(self.client, "c")
+
+        scenario = {
+            "name": "c-idle",
+            "phones": ["a", "b", "c"],   # c listed but not engaged
+            "initial_actions": [
+                {"action": "make_call", "phone_id": "a",
+                 "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}"},
+            ],
+            "hooks": [
+                {
+                    "when": "call.state.confirmed",
+                    "on_phone": "a",
+                    "once": True,
+                    "then": [{"wait": "800ms"}, {"action": "hangup", "phone_id": "a"}],
+                },
+            ],
+            "stop_on": [{"phone_id": "a", "event": "call.state.disconnected"}],
+            "timeout_ms": 8000,
+        }
+        result = _parse_tool_result(
+            self.client.call_tool("run_scenario", {"scenario": scenario})
+        )
+        assert result["status"] == "ok", f"scenario failed: {result}"
+        assert result["artifacts"]["c"] is None, (
+            f"c should be null (idle), got {result['artifacts']['c']}"
+        )
