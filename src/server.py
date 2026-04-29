@@ -146,7 +146,7 @@ def _validate_phone_id(phone_id: str) -> None:
         "add_phone", "drop_phone", "list_phones", "get_phone", "update_phone",
         "load_phones",
         "get_sip_log",
-        "start_capture", "stop_capture", "get_pcap", "list_recordings",
+        "list_recordings",
     }
     for action in RESERVED_ACTIONS:
         if f"{phone_id}_{action}" in static_tool_names:
@@ -660,104 +660,6 @@ async def get_sip_log(
         return {"entries": entries, "total_count": len(entries)}
     except Exception as e:
         log.exception("get_sip_log failed")
-        return {"status": "error", "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Packet capture (global; phone_id resolves to transport port for BPF filter)
-# ---------------------------------------------------------------------------
-@mcp.tool()
-async def start_capture(
-    phone_id: str | None = None,
-    interface: str = "any",
-    port: int | None = None,
-) -> dict[str, Any]:
-    """Start a manual (host-wide or phone-scoped) tcpdump.
-
-    - No `phone_id`: host-wide capture → `/captures/capture_<ts>.pcap`.
-    - With `phone_id`: BPF filters by that phone's UDP transport port and
-      the pcap lands under `/captures/<phone_id>/`.
-    - With `phone_id` + an active call on that phone: pcap filename matches
-      the active recording's basename (e.g. `call_0_<ts>.pcap` next to
-      `/recordings/<phone_id>/call_0_<ts>.wav`), so pcap and wav pair up
-      without cross-referencing timestamps.
-
-    If `phone_id` already has an auto-capture running (the phone's
-    `capture_enabled=true`), this call is refused — disable auto-capture
-    first via `update_phone(phone_id=..., capture_enabled=false)` or stop
-    it via `stop_capture(phone_id=...)`.
-    """
-    assert pcap_mgr is not None and engine is not None and registry is not None
-    try:
-        if phone_id is not None and pcap_mgr.is_phone_capturing(phone_id):
-            return {
-                "status": "error",
-                "error": (
-                    f"Phone {phone_id!r} has auto-capture active "
-                    f"(capture_enabled=true). Disable it via "
-                    f"update_phone(phone_id={phone_id!r}, capture_enabled=False) "
-                    f"or stop via stop_capture(phone_id={phone_id!r}) first."
-                ),
-                "phone_id": phone_id,
-            }
-        active_call_id: int | None = None
-        if phone_id is not None:
-            if port is None:
-                cfg = registry.get_config(phone_id)
-                if cfg is None or cfg.transport_id is None:
-                    return {"status": "error", "error": f"Phone {phone_id!r} has no transport"}
-                port = engine.get_transport_port(cfg.transport_id)
-            if call_mgr is not None:
-                active_call_id = call_mgr.get_active_call_id(phone_id)
-        info = await pcap_mgr.start(
-            interface=interface,
-            port=port,
-            phone_id=phone_id,
-            call_id=active_call_id,
-        )
-        return {
-            "status": "ok",
-            "phone_id": phone_id,
-            "call_id": active_call_id,
-            "port": port,
-            **info,
-        }
-    except Exception as e:
-        log.exception("start_capture failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def stop_capture(phone_id: str | None = None) -> dict[str, Any]:
-    """Stop a packet capture.
-
-    Without `phone_id` — stops the legacy host-wide capture started by
-    `start_capture()`.
-    With `phone_id` — stops the per-phone auto-capture driven by
-    `capture_enabled`. Safe to call either way; returns `status:
-    not_running` for per-phone calls if nothing was active.
-    """
-    assert pcap_mgr is not None
-    try:
-        if phone_id is not None:
-            info = await pcap_mgr.stop_for_phone(phone_id)
-            status = info.pop("status", None) or "ok"
-            return {"status": status, **info}
-        info = await pcap_mgr.stop()
-        return {"status": "ok", **info}
-    except Exception as e:
-        log.exception("stop_capture failed")
-        return {"status": "error", "error": str(e)}
-
-
-@mcp.tool()
-async def get_pcap(filename: str | None = None) -> dict[str, Any]:
-    """Get info about a pcap file (defaults to most recent capture)."""
-    assert pcap_mgr is not None
-    try:
-        return pcap_mgr.get_pcap_info(filename=filename)
-    except Exception as e:
-        log.exception("get_pcap failed")
         return {"status": "error", "error": str(e)}
 
 

@@ -557,9 +557,8 @@ class TestCaptureLayout:
     """Per-phone `capture_enabled` — YAML plumbing + runtime toggle.
 
     Covers the surface that doesn't need real SIP: default=false, YAML
-    defaults + override, runtime update_phone toggle, and graceful
-    collision error from `start_capture` when auto-capture is active.
-    Live auto-start/stop on a real call is covered by TestCaptureLive.
+    defaults + override, and runtime update_phone toggle. Live
+    auto-start/stop on a real call is covered by TestCaptureLive.
     """
 
     @pytest.fixture(autouse=True)
@@ -638,26 +637,6 @@ phones:
             "phone_id": "captog", "capture_enabled": False,
         }))
         assert result["capture_enabled"] is False
-
-    def test_manual_start_capture_ok_when_no_auto_capture(self):
-        """start_capture(phone_id=...) on a phone with capture_enabled=false
-        works — the collision check only fires when an auto-capture is live."""
-        _parse_tool_result(self.client.call_tool("add_phone", {
-            "phone_id": "manual1",
-            "domain": "127.0.0.1", "username": "u", "password": "p",
-            "register": False,
-        }))
-        # capture_enabled defaults to false; auto-capture isn't active yet.
-        result = _parse_tool_result(self.client.call_tool("start_capture", {
-            "phone_id": "manual1",
-        }))
-        # tcpdump may or may not launch depending on caps in this env; we only
-        # assert that the collision check did NOT block us.
-        assert result.get("status") != "error" or "auto-capture active" not in result.get("error", "")
-        # Clean up if we did start something.
-        if result.get("status") == "ok":
-            _parse_tool_result(self.client.call_tool("stop_capture"))
-
 
 # ---------------------------------------------------------------------------
 # Multi-start/stop recording — live call exercise (requires SIP_DOMAIN)
@@ -813,26 +792,6 @@ class TestCaptureLive:
         time.sleep(0.5)
         size2 = pcap_path.stat().st_size if pcap_path.exists() else 0
         assert size1 == size2, "pcap is still being written after hangup"
-
-    def test_manual_start_capture_rejects_if_auto_active(self):
-        """While auto-capture is live for a phone, start_capture(phone_id=...) errors."""
-        r = _parse_tool_result(self.client.call_tool("a_make_call", {
-            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
-        }))
-        call_id = r["call_id"]
-        time.sleep(2.5)  # let auto-capture come up
-
-        # Only run the collision check if auto-capture actually started; the
-        # test harness may lack NET_RAW so tcpdump could exit immediately.
-        if self._list_pcaps("a"):
-            result = _parse_tool_result(self.client.call_tool("start_capture", {
-                "phone_id": "a",
-            }))
-            assert result["status"] == "error"
-            assert "auto-capture" in result["error"].lower()
-
-        self.client.call_tool("a_hangup", {"call_id": call_id})
-        time.sleep(1.5)
 
     def test_toggle_capture_mid_call(self):
         """update_phone(capture_enabled=false) mid-call closes pcap; toggle back opens a new one."""

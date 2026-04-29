@@ -66,7 +66,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 
 ## MCP Tools
 
-### Static (13 — always present)
+### Static (10 — always present)
 
 #### Phone CRUD
 | Tool | Description |
@@ -82,10 +82,9 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 | Tool | Description |
 |------|-------------|
 | `get_sip_log` | Retrieve pjsip log entries. `phone_id=...` filters by that phone's `sip:<user>@` URI substring |
-| `start_capture` | Start tcpdump. Without `phone_id` — host-wide; with `phone_id` — BPF filter on that phone's UDP port |
-| `stop_capture` | Stop the running capture |
-| `get_pcap` | Info about the most recent (or named) pcap file |
 | `list_recordings` | Walk `/recordings/` (and legacy flat files) for every WAV; filter by `phone_id` / `call_id` |
+
+Per-phone packet capture lives on `update_phone(phone_id=..., capture_enabled=true/false)` — auto-starts a tcpdump on the first audio-active call and stops on the last disconnect. The pcap path lands in the WAV's `.meta.json` sidecar so recording and capture pair up on disk.
 
 #### Scenario engine
 | Tool | Description |
@@ -118,7 +117,7 @@ Registered when `add_phone` (or `load_phones`) brings a phone online; unregister
 | `a_register` / `a_unregister` | Fresh REGISTER cycle / de-REGISTER (symmetric pair) |
 | `a_get_registration_status` | Quick reg state for phone a |
 
-Total surface with N phones: 13 + 22·N.
+Total surface with N phones: 10 + 22·N.
 
 ## Quick Start
 
@@ -499,12 +498,10 @@ carries the context the WAV itself lacks:
 }
 ```
 
-`pcap` is populated whenever a capture was running for the phone during
-the call — either a manual `start_capture(phone_id="a")` or (more
-commonly) the per-phone auto-capture driven by `capture_enabled`. In
-both cases the pcap lives under `/captures/<phone_id>/` with the same
-basename as the recording, so audio and signalling pair up without any
-timestamp matching.
+`pcap` is populated whenever per-phone auto-capture
+(`capture_enabled=true`) was running during the call. The pcap lives
+under `/captures/<phone_id>/` with the same basename as the recording,
+so audio and signalling pair up without any timestamp matching.
 
 ### Per-phone toggle: `recording_enabled`
 
@@ -610,22 +607,6 @@ post-hoc — see below.
 In a conference (two active calls on one phone) a **single** pcap is
 kept for the phone, not one per leg. The first call starts it; the last
 disconnect closes it.
-
-### Manual capture
-
-Fire tcpdump on demand without the per-phone flag:
-
-```
-start_capture()                       # host-wide → /captures/capture_<ts>.pcap
-start_capture(phone_id="a")           # BPF: udp port <a's local port>
-stop_capture()                        # stops the manual capture
-stop_capture(phone_id="a")            # stops phone 'a's auto-capture
-get_pcap()                            # file info (most recent)
-```
-
-If `start_capture(phone_id="a")` is called while phone `a` already has
-auto-capture running, the call is refused with an explanatory error —
-disable `capture_enabled` first (or stop the auto-capture explicitly).
 
 ### Splitting SIP and RTP after the fact
 

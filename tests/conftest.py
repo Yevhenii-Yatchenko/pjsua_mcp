@@ -35,8 +35,7 @@ def pjsua_endpoint():
 
 @pytest.fixture()
 def tmp_captures_dir(tmp_path, monkeypatch):
-    """Patch pcap_manager CAPTURES_ROOT/CAPTURES_DIR to a temp directory."""
+    """Patch pcap_manager CAPTURES_ROOT to a temp directory."""
     import src.pcap_manager as pm
     monkeypatch.setattr(pm, "CAPTURES_ROOT", tmp_path)
-    monkeypatch.setattr(pm, "CAPTURES_DIR", tmp_path)
     return tmp_path

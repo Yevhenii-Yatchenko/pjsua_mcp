@@ -10,6 +10,14 @@
     superset; per-phone SDP filter governs.
 - Internal `CallManager.reinvite_with_codecs` (was the back-end for
   `set_codecs(phone_id=, call_id=)`).
+- MCP tools `start_capture`, `stop_capture`, `get_pcap`. Per-phone auto-
+  capture covers the common case via
+  `update_phone(phone_id=..., capture_enabled=true/false)`. The pcap
+  path is exposed in the recording's `.meta.json` sidecar (returned by
+  `<phone>_get_recording(call_id)` and `list_recordings`).
+- Internal `PcapManager.start`, `PcapManager.stop`,
+  `PcapManager.get_pcap_info` (host-wide single-process capture). The
+  per-phone surface (`start_for_phone`, `stop_for_phone`, etc.) remains.
 
 ### Changed
 - `update_phone(codecs=[...])` now sends a re-INVITE on every CONFIRMED
