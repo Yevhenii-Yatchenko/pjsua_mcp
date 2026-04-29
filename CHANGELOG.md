@@ -2,7 +2,42 @@
 
 ## [Unreleased]
 
+### Changed (BREAKING for fragile substring consumers)
+- `get_sip_log(phone_id=...)` now resolves message ownership structurally
+  instead of substring-matching `sip:<username>@`. Messages are attributed
+  to the phone whose tracker holds their SIP Call-ID, whose local
+  transport port appears in a `Via:` line, or whose username is the
+  REGISTER From URI. Cross-leg false positives (bob's RX INVITE with
+  `From: <sip:alice@>`, bob's `[DISCONNECTED]` dump showing alice's URI
+  in `To: <...>`) no longer leak into alice's filtered log. Entries
+  whose owner cannot be resolved structurally fall back to substring
+  match and the response surfaces a `warning` field listing the count.
+- `get_sip_log` accepts a new `call_id: int | None` parameter. With it,
+  the response is restricted to the SIP dialog of the named pjsua-internal
+  call (matched on Call-ID header). Combinable with `phone_id`. Unknown
+  call_id returns `total_count=0` and a `warning`, never an error.
+- `CallManager` now keeps a `(SIP Call-ID → owner)` index populated in
+  `make_call` and `_on_incoming_call` from `pj.CallInfo.callIdString`.
+  Entries persist past disconnect so historical log queries still
+  resolve correctly.
+
 ### Added
+- `src/sip_logger.py:parse_sip_metadata(msg)` — best-effort structured
+  pull from a pjlib log entry: direction (TX/RX), method, cseq,
+  status_code, SIP Call-ID, From/To URIs, Via ports, plus the special
+  `dump_remote_uri` field for pjsua's `[<STATE>] To: <URI>` call dump.
+  Pure function, no pjsua dependency. 12 unit tests in
+  `tests/test_sip_logger.py::TestParseSipMetadata`.
+- `src/sip_logger.py:filter_entries_by_owner(entries, phones, ...)` —
+  pure ownership-based filter that powers the new `get_sip_log`. 10
+  unit tests cover each ownership signal (Call-ID, dump URI, Via port,
+  REGISTER username, fallback substring), URI-format normalization, and
+  the `target_sip_call_id` intersection. 4 unit tests for the
+  `CallManager` Call-ID tracker, plus 3 integration tests in
+  `TestCallFlow` covering the proposal-05 acceptance criteria
+  (no-leak of `[DISCONNECTED]` dump, `call_id` filter narrowing,
+  unknown `call_id` warning).
+
 - MCP tool `analyze_capture(phone_id, call_id=None)` — parses a phone's
   pcap into structured RTP/RTCP flow counts, classifies packets per
   RFC 3550 (V=2, RTCP PT 200..206 → rtcp_flows; everything else with

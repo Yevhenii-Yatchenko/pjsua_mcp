@@ -1,10 +1,16 @@
-"""Unit tests for SipLogWriter / LogEntry."""
+"""Unit tests for SipLogWriter / LogEntry / parse_sip_metadata."""
 
 from __future__ import annotations
 
 from collections import deque
 
-from src.sip_logger import LogEntry, SipLogWriter
+from src.sip_logger import (
+    LogEntry,
+    PhoneMeta,
+    SipLogWriter,
+    filter_entries_by_owner,
+    parse_sip_metadata,
+)
 
 
 def _make_writer(entries: list[LogEntry] | None = None, max_entries: int = 5000) -> SipLogWriter:
@@ -84,3 +90,358 @@ class TestEntryFormat:
         assert entry["level"] == 4
         assert entry["msg"] == "hello"
         assert entry["thread"] == "worker"
+
+
+# ---------------------------------------------------------------------------
+# parse_sip_metadata — best-effort structured pull from a pjlib log entry.
+# Each test mirrors a real pjsua-emitted message so the parser is grounded
+# in actual log shapes rather than imagined ones.
+# ---------------------------------------------------------------------------
+
+TX_INVITE_MSG = """\
+17:33:44.234   pjsua_core.c  TX 1128 bytes Request msg INVITE/cseq=8398 (tdta0xabc) to UDP 192.168.1.202:5060:
+INVITE sip:123002@192.168.1.202 SIP/2.0
+Via: SIP/2.0/UDP 192.168.1.40:36771;rport;branch=z9hG4bK-d-1
+Max-Forwards: 70
+From: "Alice" <sip:123001@192.168.1.202>;tag=alice-tag
+To: <sip:123002@192.168.1.202>
+Contact: <sip:123001@192.168.1.40:36771>
+Call-ID: 5d0cbc47-e4b5-4e7a-b868-5fb3138f367d
+CSeq: 8398 INVITE
+User-Agent: PJSUA v2.14.1
+Content-Type: application/sdp
+Content-Length: 316
+
+v=0
+o=- 3986467525 3986467525 IN IP4 192.168.1.40
+s=pjmedia
+t=0 0
+m=audio 4000 RTP/AVP 0 120
+a=rtpmap:0 PCMU/8000
+a=rtpmap:120 telephone-event/8000
+"""
+
+RX_200_OK_MSG = """\
+17:33:45.555   pjsua_core.c  RX 956 bytes Response msg 200/INVITE/cseq=8398 (rdata0xdef) from UDP 192.168.1.202:5060:
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP 192.168.1.40:36771;rport=36771;received=192.168.1.40;branch=z9hG4bK-d-1
+From: "Alice" <sip:123001@192.168.1.202>;tag=alice-tag
+To: <sip:123002@192.168.1.202>;tag=bob-tag
+Call-ID: 5d0cbc47-e4b5-4e7a-b868-5fb3138f367d
+CSeq: 8398 INVITE
+Contact: <sip:123002@192.168.1.202:5060>
+Content-Type: application/sdp
+Content-Length: 200
+
+v=0
+m=audio 17000 RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+"""
+
+TX_REGISTER_MSG = """\
+17:33:40.111   pjsua_acc.c   TX 612 bytes Request msg REGISTER/cseq=8397 (tdta0x111) to UDP 192.168.1.202:5060:
+REGISTER sip:192.168.1.202 SIP/2.0
+Via: SIP/2.0/UDP 192.168.1.40:36771;rport;branch=z9hG4bK-r-1
+From: <sip:123001@192.168.1.202>;tag=reg-tag
+To: <sip:123001@192.168.1.202>
+Contact: <sip:123001@192.168.1.40:36771>
+Call-ID: f00d-cafe-0001
+CSeq: 8397 REGISTER
+Expires: 300
+Content-Length: 0
+
+"""
+
+DISCONNECT_DUMP_MSG = """\
+17:33:50.888   pjsua_call.c  [DISCONNECTED] To: <sip:123001@192.168.1.202>;tag=dmdb421.o
+\tCall time: 00h:00m:03s, 1st res in 100 ms, conn in 350ms
+\t#0 audio PCMA @8kHz, sendrecv, peer=192.168.1.201:48556
+\t   SRTP status: Not active
+"""
+
+NON_SIP_MSG = (
+    "17:33:42.000   pjsua_app.c   Application started, sticking around\n"
+    "Just a non-SIP info line"
+)
+
+
+class TestParseSipMetadata:
+    def test_tx_invite_extracts_direction_method_cseq(self):
+        md = parse_sip_metadata(TX_INVITE_MSG)
+        assert md.direction == "TX"
+        assert md.method == "INVITE"
+        assert md.cseq == 8398
+
+    def test_tx_invite_extracts_call_id(self):
+        md = parse_sip_metadata(TX_INVITE_MSG)
+        assert md.sip_call_id == "5d0cbc47-e4b5-4e7a-b868-5fb3138f367d"
+
+    def test_tx_invite_extracts_from_to_uris(self):
+        md = parse_sip_metadata(TX_INVITE_MSG)
+        assert md.from_uri == "sip:123001@192.168.1.202"
+        assert md.to_uri == "sip:123002@192.168.1.202"
+
+    def test_tx_invite_extracts_via_ports(self):
+        md = parse_sip_metadata(TX_INVITE_MSG)
+        assert 36771 in md.via_ports
+
+    def test_tx_invite_no_status_code(self):
+        md = parse_sip_metadata(TX_INVITE_MSG)
+        assert md.status_code is None
+
+    def test_rx_response_extracts_status(self):
+        md = parse_sip_metadata(RX_200_OK_MSG)
+        assert md.direction == "RX"
+        assert md.status_code == 200
+
+    def test_rx_response_method_from_cseq(self):
+        """For SIP responses, method comes from the CSeq header — the start
+        line is `SIP/2.0 200 OK`, not `INVITE ...`."""
+        md = parse_sip_metadata(RX_200_OK_MSG)
+        assert md.method == "INVITE"
+        assert md.cseq == 8398
+
+    def test_rx_response_call_id(self):
+        md = parse_sip_metadata(RX_200_OK_MSG)
+        assert md.sip_call_id == "5d0cbc47-e4b5-4e7a-b868-5fb3138f367d"
+
+    def test_register_method(self):
+        md = parse_sip_metadata(TX_REGISTER_MSG)
+        assert md.method == "REGISTER"
+        assert md.from_uri == "sip:123001@192.168.1.202"
+        assert md.sip_call_id == "f00d-cafe-0001"
+        assert 36771 in md.via_ports
+
+    def test_disconnect_dump_extracts_dump_remote_uri(self):
+        md = parse_sip_metadata(DISCONNECT_DUMP_MSG)
+        assert md.dump_remote_uri == "sip:123001@192.168.1.202"
+        # No SIP message envelope → no direction/method
+        assert md.direction is None
+        assert md.method is None
+        assert md.sip_call_id is None
+
+    def test_non_sip_returns_empty_metadata(self):
+        md = parse_sip_metadata(NON_SIP_MSG)
+        assert md.direction is None
+        assert md.method is None
+        assert md.cseq is None
+        assert md.status_code is None
+        assert md.sip_call_id is None
+        assert md.from_uri is None
+        assert md.to_uri is None
+        assert md.via_ports == ()
+        assert md.dump_remote_uri is None
+
+    def test_empty_string(self):
+        md = parse_sip_metadata("")
+        assert md.direction is None
+        assert md.method is None
+        assert md.sip_call_id is None
+
+
+# ---------------------------------------------------------------------------
+# filter_entries_by_owner — pure ownership-based filter that powers
+# get_sip_log(phone_id=..., call_id=...). Tests use a mix of real-shape
+# fixtures and minimal one-liners to cover each ownership signal.
+# ---------------------------------------------------------------------------
+
+# bob's TX 200 OK on his incoming-leg of alice→bob call. Same SIP Call-ID
+# value as alice's INVITE? No — bob's incoming leg has its own Call-ID
+# (the one carried in the RX INVITE that bob received). Plan-01 example:
+# alice's outbound Call-ID = 5d0cbc47-... (set in TX_INVITE_MSG above).
+# bob's incoming-leg Call-ID is the SAME — `From:`/`Call-ID:` are propagated
+# verbatim through the B2BUA only on direct routing. With B2BUA transcoding
+# (plan-01) bob sees a NEW Call-ID. We use distinct values here.
+BOB_INCOMING_INVITE_MSG = """\
+17:33:45.000   pjsua_core.c  RX 1100 bytes Request msg INVITE/cseq=582 (rdata0xb2b) from UDP 192.168.1.202:5060:
+INVITE sip:123002@192.168.1.40 SIP/2.0
+Via: SIP/2.0/UDP 192.168.1.202:5060;branch=z9hG4bK-bob-leg
+Via: SIP/2.0/UDP 192.168.1.40:36772;branch=z9hG4bK-bob
+From: <sip:123001@192.168.1.202>;tag=alice-tag
+To: <sip:123002@192.168.1.202>
+Call-ID: bob-side-call-uuid-9999
+CSeq: 582 INVITE
+Content-Length: 0
+
+"""
+
+BOB_DISCONNECT_DUMP_MSG = """\
+17:33:50.999   pjsua_call.c  [DISCONNECTED] To: <sip:123001@192.168.1.202>;tag=bob-side
+\tCall time: 00h:00m:03s
+\t#0 audio PCMA @8kHz, sendrecv, peer=192.168.1.201:48556
+"""
+
+
+class TestFilterEntriesByOwner:
+    """Ownership-based filter — primary mechanism for get_sip_log(phone_id=...).
+
+    Signals (priority order):
+      1. SIP Call-ID ∈ phone's known set (definitive)
+      2. dump remote URI ∈ phone's known remote URIs (definitive for dumps)
+      3. Via line carries phone's local transport port (REGISTER, ACK, etc.)
+      4. Method=REGISTER and From URI matches phone's username
+      5. Fallback: substring match on `sip:{username}@` (with warning)
+    """
+
+    def _alice(self) -> PhoneMeta:
+        return PhoneMeta(
+            phone_id="alice",
+            username="123001",
+            local_port=36771,
+            sip_call_ids={"5d0cbc47-e4b5-4e7a-b868-5fb3138f367d", "f00d-cafe-0001"},
+            remote_uris={"sip:123002@192.168.1.202"},
+        )
+
+    def _bob(self) -> PhoneMeta:
+        return PhoneMeta(
+            phone_id="bob",
+            username="123002",
+            local_port=36772,
+            sip_call_ids={"bob-side-call-uuid-9999"},
+            remote_uris={"sip:123001@192.168.1.202"},
+        )
+
+    def _phones(self) -> dict[str, PhoneMeta]:
+        return {"alice": self._alice(), "bob": self._bob()}
+
+    def test_no_filter_returns_all(self):
+        entries = [{"msg": "any"}, {"msg": "another"}]
+        kept, fallback = filter_entries_by_owner(entries, phones={}, target_phone=None)
+        assert kept == entries
+        assert fallback == 0
+
+    def test_keeps_alice_invite_by_call_id(self):
+        entries = [{"msg": TX_INVITE_MSG}]
+        kept, fallback = filter_entries_by_owner(
+            entries, phones=self._phones(), target_phone="alice"
+        )
+        assert len(kept) == 1
+        assert fallback == 0
+
+    def test_drops_bob_incoming_invite(self):
+        """Bob's RX INVITE has `From: <sip:123001@>` — naive substring filter
+        would falsely attribute it to alice. Structural check via Call-ID
+        sees it belongs to bob's set, excludes it."""
+        entries = [{"msg": BOB_INCOMING_INVITE_MSG}]
+        kept, fallback = filter_entries_by_owner(
+            entries, phones=self._phones(), target_phone="alice"
+        )
+        assert kept == []
+        assert fallback == 0
+
+    def test_drops_bob_disconnect_dump_with_alice_uri(self):
+        """The CRITICAL false-positive from proposal-05: bob's [DISCONNECTED]
+        dump contains `To: <sip:123001@>` (alice's URI, because she's bob's
+        remote party). Substring filter mistakenly attributes the audio
+        codec ("PCMA") to alice. Structural check via dump_remote_uri ∈
+        bob's remote_uris correctly excludes."""
+        entries = [{"msg": BOB_DISCONNECT_DUMP_MSG}]
+        kept, fallback = filter_entries_by_owner(
+            entries, phones=self._phones(), target_phone="alice"
+        )
+        assert kept == []
+        assert fallback == 0
+
+    def test_keeps_register_by_username_when_call_id_unknown(self):
+        """REGISTER's Call-ID is not in any active call's set, but its
+        From URI carries alice's username — owned by alice."""
+        entries = [{"msg": TX_REGISTER_MSG}]
+        # Drop the Call-ID from alice's set so REGISTER falls through to
+        # username matching; the registration Call-ID is independent of
+        # call dialogs and not always in the index.
+        alice = PhoneMeta(
+            phone_id="alice", username="123001", local_port=36771,
+            sip_call_ids=set(), remote_uris=set(),
+        )
+        kept, fallback = filter_entries_by_owner(
+            entries, phones={"alice": alice}, target_phone="alice"
+        )
+        assert len(kept) == 1
+        assert fallback == 0
+
+    def test_via_port_attribution(self):
+        """A SIP message whose Via line carries alice's local transport
+        port — even when Call-ID is unknown — attributes to alice."""
+        msg = (
+            "17:00:00.000 pjsua_core.c  TX 100 bytes Request msg OPTIONS/cseq=1 to UDP 1.1.1.1:5060:\n"
+            "OPTIONS sip:1.1.1.1 SIP/2.0\n"
+            "Via: SIP/2.0/UDP 192.168.1.40:36771;branch=z9hG4bK-x\n"
+            "Call-ID: never-tracked\n"
+            "CSeq: 1 OPTIONS\n\n"
+        )
+        kept, fallback = filter_entries_by_owner(
+            [{"msg": msg}], phones=self._phones(), target_phone="alice"
+        )
+        assert len(kept) == 1
+        assert fallback == 0
+
+    def test_unknown_owner_falls_back_to_substring(self):
+        """No structural signal but msg substring-matches alice's username.
+        Kept and counted as fallback so caller can warn."""
+        msg = "stray pjsua line referencing sip:123001@somewhere"
+        kept, fallback = filter_entries_by_owner(
+            [{"msg": msg}], phones=self._phones(), target_phone="alice"
+        )
+        assert len(kept) == 1
+        assert fallback == 1
+
+    def test_unknown_owner_no_substring_dropped(self):
+        msg = "totally unrelated log line about something else"
+        kept, fallback = filter_entries_by_owner(
+            [{"msg": msg}], phones=self._phones(), target_phone="alice"
+        )
+        assert kept == []
+        assert fallback == 0
+
+    def test_dump_attribution_normalizes_uri_format(self):
+        """pjsua2's `ci.remoteUri` returns `<sip:user@host>;tag=...` (or with
+        a display name), while the `[DISCONNECTED] To: <X>` dump emits a
+        bare `sip:user@host`. The filter must equate these formats —
+        otherwise bob's dump leaks into alice's log even with a Phone
+        tracker entry. Real failure observed in two-phone integration test."""
+        bob = PhoneMeta(
+            phone_id="bob", username="6002", local_port=5070,
+            sip_call_ids=set(),
+            remote_uris={"<sip:6001@172.20.0.2>;tag=alice-tag"},  # pjsua format
+        )
+        msg = (
+            "  [DISCONNECTED] To: <sip:6001@172.20.0.2>;tag=bob-side\n"
+            "    Call time: 00h:00m:00s\n"
+            "    #0 audio PCMA @8kHz, sendrecv\n"
+        )
+        kept, _ = filter_entries_by_owner(
+            [{"msg": msg}], phones={"bob": bob}, target_phone="bob"
+        )
+        assert len(kept) == 1, "bob's own dump should be attributed to bob"
+
+        # And conversely — alice's filter must drop bob's dump.
+        alice = PhoneMeta(
+            phone_id="alice", username="6001", local_port=5060,
+            sip_call_ids=set(),
+            remote_uris={"<sip:6002@172.20.0.2>"},
+        )
+        kept_alice, _ = filter_entries_by_owner(
+            [{"msg": msg}], phones={"alice": alice, "bob": bob},
+            target_phone="alice",
+        )
+        assert kept_alice == [], (
+            "bob's dump leaked into alice's log — URI normalization bug"
+        )
+
+    def test_call_id_filter_intersects(self):
+        """target_sip_call_id is the SIP Call-ID string of the requested
+        pjsua call — only entries whose Call-ID equals that string are kept,
+        irrespective of phone-level owner."""
+        entries = [
+            {"msg": TX_INVITE_MSG},          # call-id 5d0cbc47-...
+            {"msg": BOB_INCOMING_INVITE_MSG},  # call-id bob-side-...
+            {"msg": TX_REGISTER_MSG},        # call-id f00d-cafe-0001
+        ]
+        kept, fallback = filter_entries_by_owner(
+            entries,
+            phones=self._phones(),
+            target_phone="alice",
+            target_sip_call_id="5d0cbc47-e4b5-4e7a-b868-5fb3138f367d",
+        )
+        assert len(kept) == 1
+        assert "INVITE/cseq=8398" in kept[0]["msg"]

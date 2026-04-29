@@ -81,7 +81,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 #### Global diagnostics
 | Tool | Description |
 |------|-------------|
-| `get_sip_log` | Retrieve pjsip log entries. `phone_id=...` filters by that phone's `sip:<user>@` URI substring |
+| `get_sip_log` | Retrieve pjsip log entries. `phone_id=...` resolves message ownership structurally (SIP Call-ID match, transport-port match, or REGISTER username); `call_id=...` narrows further to one SIP dialog |
 | `list_recordings` | Walk `/recordings/` (and legacy flat files) for every WAV; filter by `phone_id` / `call_id` |
 | `analyze_capture` | Parse `/captures/<phone_id>/call_<call_id>_*.pcap` into structured RTP/RTCP flow counts. Surfaces `phone_rtp_codecs_seen` + `non_phone_codecs_on_phone_port` (compared against the phone's `codecs` config) so the caller can verify per-phone SDP filter conformance without ad-hoc pcap parsing in bash |
 
@@ -555,9 +555,17 @@ get_sip_log()                                        # everything (all phones)
 get_sip_log(last_n=20)
 get_sip_log(filter_text="REGISTER")
 get_sip_log(filter_text="401")
-get_sip_log(phone_id="a")                            # substring filter on `sip:<a's user>@`
+get_sip_log(phone_id="a")                            # ownership-resolved (Call-ID + transport port + REGISTER username)
+get_sip_log(phone_id="a", call_id=0)                 # narrow to one SIP dialog
 get_sip_log(phone_id="a", filter_text="INVITE")      # composable
 ```
+
+Phone filtering uses structural ownership rather than substring match,
+so messages on another phone's leg (e.g. bob's RX INVITE with
+`From: <sip:alice@>`, or bob's `[DISCONNECTED]` dump showing alice's URI
+in `To:`) do **not** leak into alice's filtered log. Entries whose owner
+cannot be resolved structurally fall back to substring match and the
+response surfaces a `warning` field with the count.
 
 Each entry contains:
 - `level` — pjsip log level (1=error … 5=trace)

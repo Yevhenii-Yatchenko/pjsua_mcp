@@ -23,6 +23,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.lowlevel import NotificationOptions
 
 from .sip_engine import SipEngine
+from .sip_logger import PhoneMeta, filter_entries_by_owner
 from .account_manager import PhoneRegistry, DEFAULT_PHONE_ID
 from .call_manager import CallManager
 from .pcap_manager import PcapManager
@@ -636,30 +637,133 @@ async def load_phones(
 
 
 # ---------------------------------------------------------------------------
-# SIP log (global with optional per-phone filter)
+# SIP log (global with optional per-phone / per-call filter)
 # ---------------------------------------------------------------------------
+def _build_phones_meta() -> dict[str, PhoneMeta]:
+    """Aggregate the live per-phone identity bundle used by ownership-based
+    log filtering. Reads PhoneRegistry + SipEngine + CallManager state.
+    """
+    assert registry is not None and engine is not None and call_mgr is not None
+
+    sip_index = call_mgr.get_sip_call_id_index()
+    by_phone: dict[str, dict[str, set[str]]] = {}
+    for sip_id, info in sip_index.items():
+        ph = info.get("phone_id")
+        if not ph:
+            continue
+        slot = by_phone.setdefault(
+            ph, {"sip_call_ids": set(), "remote_uris": set()}
+        )
+        slot["sip_call_ids"].add(sip_id)
+        if info.get("remote_uri"):
+            slot["remote_uris"].add(info["remote_uri"])
+
+    metas: dict[str, PhoneMeta] = {}
+    for ph_id in registry.list_phone_ids():
+        cfg = registry.get_config(ph_id)
+        local_port = (
+            engine.get_transport_port(cfg.transport_id)
+            if cfg and cfg.transport_id is not None
+            else None
+        )
+        slot = by_phone.get(ph_id, {})
+        metas[ph_id] = PhoneMeta(
+            phone_id=ph_id,
+            username=cfg.username if cfg else None,
+            local_port=local_port,
+            sip_call_ids=slot.get("sip_call_ids", set()),
+            remote_uris=slot.get("remote_uris", set()),
+        )
+    return metas
+
+
+def _resolve_sip_call_id(phone_id: str | None, call_id: int) -> str | None:
+    """Look up the SIP Call-ID header value for a pjsua_call_id. None if
+    the tracker has no entry for this call (e.g. call already gone +
+    historical purge)."""
+    assert call_mgr is not None
+    sip_index = call_mgr.get_sip_call_id_index()
+    for sip_id, info in sip_index.items():
+        if info.get("pjsua_call_id") != call_id:
+            continue
+        if phone_id is not None and info.get("phone_id") != phone_id:
+            continue
+        return sip_id
+    return None
+
+
 @mcp.tool()
 async def get_sip_log(
     last_n: int | None = None,
     filter_text: str | None = None,
     phone_id: str | None = None,
+    call_id: int | None = None,
 ) -> dict[str, Any]:
-    """Retrieve pjsua SIP log entries. With `phone_id`, also filter by username substring."""
-    assert engine is not None and registry is not None
-    try:
-        # Combine filter_text with phone-specific username match.
-        extra_filter: str | None = None
-        if phone_id is not None:
-            cfg = registry.get_config(phone_id)
-            if cfg and cfg.username:
-                extra_filter = f"sip:{cfg.username}@"
+    """Retrieve pjsua SIP log entries.
 
+    `phone_id` — filter to entries owned by that phone. Ownership is
+      resolved structurally: SIP Call-ID matches a tracked call, or the
+      message's Via line carries the phone's local transport port, or
+      it's a REGISTER from the phone's username. Replaces the previous
+      naive substring filter (which produced cross-leg false positives
+      — e.g. bob's `From: <sip:alice@>` looked like alice's traffic).
+
+    `call_id` — pjsua-internal call id (int). Restricts to the SIP
+      dialog of that call (matched on Call-ID header). Combinable with
+      `phone_id`.
+
+    `filter_text` — substring filter applied before the ownership pass.
+
+    `last_n` — return only the last N entries after filtering.
+
+    When ownership cannot be resolved structurally for some entries but a
+    substring of the phone's username appears in them, those are still
+    kept and the response includes a `warning` field flagging the count.
+    """
+    assert engine is not None and registry is not None and call_mgr is not None
+    try:
         entries = engine.get_log_entries(last_n=None, filter_text=filter_text)
-        if extra_filter:
-            entries = [e for e in entries if extra_filter in e["msg"]]
+        warning: str | None = None
+
+        if phone_id is not None or call_id is not None:
+            target_sip_call_id: str | None = None
+            if call_id is not None:
+                target_sip_call_id = _resolve_sip_call_id(phone_id, call_id)
+                if target_sip_call_id is None:
+                    return {
+                        "entries": [],
+                        "total_count": 0,
+                        "warning": (
+                            f"call_id={call_id} unknown to tracker — "
+                            "either it never existed or its mapping was "
+                            "purged. No entries returned."
+                        ),
+                    }
+
+            phones_meta = _build_phones_meta()
+            entries, fallback_count = filter_entries_by_owner(
+                entries,
+                phones=phones_meta,
+                target_phone=phone_id,
+                target_sip_call_id=target_sip_call_id,
+            )
+            if fallback_count > 0:
+                warning = (
+                    f"fallback to substring match for {fallback_count} "
+                    "entries (no structural ownership signal — likely "
+                    "historical entries from before tracker init)"
+                )
+
         if last_n is not None:
             entries = entries[-last_n:]
-        return {"entries": entries, "total_count": len(entries)}
+
+        result: dict[str, Any] = {
+            "entries": entries,
+            "total_count": len(entries),
+        }
+        if warning:
+            result["warning"] = warning
+        return result
     except Exception as e:
         log.exception("get_sip_log failed")
         return {"status": "error", "error": str(e)}

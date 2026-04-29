@@ -509,9 +509,39 @@ class CallManager:
         self._auto_capture_pending_start: deque[tuple[str, int | None]] = deque()
         self._auto_capture_pending_stop: deque[str] = deque()
 
+        # Maps SIP Call-ID header → ownership info. Used by get_sip_log to
+        # resolve which phone a logged SIP message belongs to without falling
+        # back to substring-match on phone username (which produces
+        # cross-leg false positives — bob's `From: <sip:alice@>` looks like
+        # alice's message under naive substring filtering).
+        # Entries persist past disconnect so historical filter still works.
+        self._sip_call_id_index: dict[str, dict[str, Any]] = {}
+
         # Wire registry hooks so callbacks attach to every new phone
         registry.on_phone_added = self._on_phone_added
         registry.on_phone_dropped = self._on_phone_dropped
+
+    def _track_sip_call_id(
+        self,
+        sip_call_id: str,
+        phone_id: str,
+        pjsua_call_id: int,
+        remote_uri: str,
+    ) -> None:
+        """Record (sip_call_id → owner) mapping. No-op for empty call_id."""
+        if not sip_call_id:
+            return
+        with self._lock:
+            self._sip_call_id_index[sip_call_id] = {
+                "phone_id": phone_id,
+                "pjsua_call_id": pjsua_call_id,
+                "remote_uri": remote_uri,
+            }
+
+    def get_sip_call_id_index(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of (sip_call_id → owner-info) for log-filter resolution."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._sip_call_id_index.items()}
 
     def get_active_call_id(self, phone_id: str) -> int | None:
         """Return the first active call_id for `phone_id`, or None.
@@ -595,6 +625,21 @@ class CallManager:
             self._incoming_queue.setdefault(phone_id, []).append(call_id)
             if cfg and cfg.auto_answer:
                 self._auto_answer_pending.setdefault(phone_id, []).append(call_id)
+
+        # Capture SIP Call-ID + remote URI right after creation so future
+        # log queries with phone_id="<this>" can resolve ownership
+        # structurally instead of falling back to substring match.
+        try:
+            ci = call.getInfo()
+            self._track_sip_call_id(
+                sip_call_id=getattr(ci, "callIdString", "") or "",
+                phone_id=phone_id,
+                pjsua_call_id=call_id,
+                remote_uri=getattr(ci, "remoteUri", "") or "",
+            )
+        except Exception:
+            log.debug("[%s] could not capture SIP Call-ID for call %d", phone_id, call_id)
+
         log.info("[%s] Incoming call %d queued", phone_id, call_id)
 
     def process_auto_answers(self) -> None:
@@ -772,6 +817,13 @@ class CallManager:
         with self._lock:
             self._calls[call_id] = call
             self._call_phone[call_id] = pid
+
+        self._track_sip_call_id(
+            sip_call_id=getattr(ci, "callIdString", "") or "",
+            phone_id=pid,
+            pjsua_call_id=call_id,
+            remote_uri=getattr(ci, "remoteUri", "") or dest_uri,
+        )
 
         log.info("[%s] Outbound call %d to %s", pid, call_id, dest_uri)
         return {"phone_id": pid, "call_id": call_id, "state": _call_state_name(ci.state)}

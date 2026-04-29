@@ -120,6 +120,58 @@ class TestSdpCreatedCallback:
         assert "PCMU" not in prm.sdp.wholeSdp
 
 
+class TestSipCallIdIndex:
+    """CallManager keeps a `(sip_call_id) → (phone_id, pjsua_call_id, remote_uri)`
+    map so `get_sip_log` can resolve message ownership without substring
+    matching on phone username. Entries persist past disconnect so history
+    queries still work."""
+
+    def test_register_records_mapping(self, call_mgr):
+        call_mgr._track_sip_call_id(
+            sip_call_id="abc-123",
+            phone_id="alice",
+            pjsua_call_id=42,
+            remote_uri="sip:bob@example.com",
+        )
+        idx = call_mgr.get_sip_call_id_index()
+        assert "abc-123" in idx
+        assert idx["abc-123"] == {
+            "phone_id": "alice",
+            "pjsua_call_id": 42,
+            "remote_uri": "sip:bob@example.com",
+        }
+
+    def test_get_index_returns_copy(self, call_mgr):
+        """Mutating the returned dict must not corrupt internal state."""
+        call_mgr._track_sip_call_id(
+            sip_call_id="x", phone_id="a", pjsua_call_id=1, remote_uri="sip:b@c"
+        )
+        idx = call_mgr.get_sip_call_id_index()
+        idx.clear()
+        assert call_mgr.get_sip_call_id_index()  # original still has entries
+
+    def test_register_overwrites_same_call_id(self, call_mgr):
+        """Re-registering the same SIP Call-ID updates the entry — covers the
+        case where a call is replaced (re-INVITE on same dialog → same Call-ID,
+        but maybe new pjsua_call_id) or a stale entry needs refresh."""
+        call_mgr._track_sip_call_id(
+            sip_call_id="dup", phone_id="a", pjsua_call_id=1, remote_uri="sip:r1"
+        )
+        call_mgr._track_sip_call_id(
+            sip_call_id="dup", phone_id="a", pjsua_call_id=1, remote_uri="sip:r2"
+        )
+        idx = call_mgr.get_sip_call_id_index()
+        assert idx["dup"]["remote_uri"] == "sip:r2"
+
+    def test_empty_call_id_ignored(self, call_mgr):
+        """pjsua occasionally surfaces an empty callIdString during early
+        call setup; we skip those so the index stays meaningful."""
+        call_mgr._track_sip_call_id(
+            sip_call_id="", phone_id="a", pjsua_call_id=0, remote_uri=""
+        )
+        assert call_mgr.get_sip_call_id_index() == {}
+
+
 class TestUnholdSetsCallSettingFlag:
     """Regression: `unhold()` must set `prm.opt.flag = PJSUA_CALL_UNHOLD`,
     NOT `prm.flag` (a Python-side attribute that pjsua's C++ side ignores).

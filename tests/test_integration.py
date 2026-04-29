@@ -1199,6 +1199,84 @@ class TestCallFlow:
         log = _parse_tool_result(self.client.call_tool("get_sip_log", {"filter_text": "INVITE"}))
         assert log["total_count"] > 0
 
+    def test_sip_log_phone_filter_excludes_other_leg_dump(self):
+        """Regression for proposal-05: bob's pjsua [DISCONNECTED] dump shows
+        `To: <sip:USER_A@>` (alice's URI is bob's remote party), so a naive
+        substring filter would incorrectly attribute bob's audio codec to
+        alice. Structural ownership filter must drop bob's dump from
+        alice's filtered log.
+        """
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.5)  # let pjsua emit DISCONNECTED dumps on both legs
+
+        log_a = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a",
+        }))
+        # alice's filtered log must not contain bob's [DISCONNECTED] dump.
+        # Bob's dump shows `To: <sip:USER_A@...>` because alice is bob's
+        # remote party — that's exactly the substring naive filter caught.
+        bob_dump_in_alice = [
+            e for e in log_a["entries"]
+            if "[DISCONNECTED]" in e["msg"]
+            and f"<sip:{SIP_USER_A}@" in e["msg"]
+        ]
+        assert not bob_dump_in_alice, (
+            f"bob's DISCONNECTED dump leaked into alice's log: "
+            f"{[e['msg'][:120] for e in bob_dump_in_alice]}"
+        )
+
+    def test_sip_log_call_id_filter(self):
+        """get_sip_log(phone_id='a', call_id=N) restricts to entries whose
+        SIP Call-ID matches the given call. Acceptance criterion #3 of
+        proposal-05.
+        """
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        a_call_id = result["call_id"]
+        _wait_and_answer(self.client, "b")
+        time.sleep(0.5)
+        self.client.call_tool("a_hangup", {"call_id": a_call_id})
+        time.sleep(1.0)
+
+        log_call = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a",
+            "call_id": a_call_id,
+        }))
+        # The dialog should have at least an INVITE and a 200/INVITE.
+        assert log_call["total_count"] > 0
+        # Every kept entry, if it carries a SIP Call-ID, must match the
+        # one for this call. (Some entries — bare pjlib log lines — may
+        # have no Call-ID at all, but the filter rejects entries with a
+        # *different* Call-ID outright.)
+        sip_call_ids = set()
+        for e in log_call["entries"]:
+            for line in e["msg"].splitlines():
+                if line.lower().startswith("call-id:"):
+                    sip_call_ids.add(line.split(":", 1)[1].strip())
+                    break
+        # All collected Call-IDs must be identical (the call's own Call-ID).
+        assert len(sip_call_ids) <= 1, (
+            f"call_id filter let in entries from multiple SIP dialogs: {sip_call_ids}"
+        )
+
+    def test_sip_log_call_id_unknown_returns_warning(self):
+        """When pjsua_call_id has no entry in the tracker, return empty
+        with an explanatory `warning`, not an error."""
+        log_unknown = _parse_tool_result(self.client.call_tool("get_sip_log", {
+            "phone_id": "a",
+            "call_id": 9999,
+        }))
+        assert log_unknown["total_count"] == 0
+        assert "warning" in log_unknown
+        assert "9999" in log_unknown["warning"]
+
     def test_call_info_contacts(self):
         result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
