@@ -24,7 +24,13 @@ def rtp_payload_types_in_pcap(path) -> set[int]:
             return pts
         link_type = reader.datalink()
         for _, buf in reader:
-            ip = _strip_link(buf, link_type)
+            # Per-packet try/except — pcap may contain IPv6 (WS-Discovery
+            # multicast, mDNS) or malformed frames that dpkt.ip.IP can't
+            # decode as IPv4. We only care about IPv4 RTP, so skip.
+            try:
+                ip = _strip_link(buf, link_type)
+            except Exception:
+                continue
             if ip is None:
                 continue
             if not isinstance(ip, dpkt.ip.IP):

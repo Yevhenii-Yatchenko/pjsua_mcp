@@ -950,6 +950,50 @@ class CallManager:
         prm.flag = pj.PJSUA_CALL_UNHOLD
         call.reinvite(prm)
 
+    def set_codecs_for_phone(
+        self,
+        phone_id: str,
+        codecs: list[str] | None,
+    ) -> list[int]:
+        """Update SipCall._codecs for every active call on `phone_id` and
+        re-INVITE the CONFIRMED ones so the live media stream swaps codec.
+
+        Calls in non-CONFIRMED states (CALLING, EARLY) are updated in
+        place without a re-INVITE — their first INVITE/200 OK already
+        encodes the new filter via onCallSdpCreated.
+
+        Calls on hold currently get re-INVITEd with sendrecv (variant A —
+        symmetric with set_recording_enabled). To keep a hold while
+        swapping codec, unhold first or skip update_phone(codecs=...)
+        on this phone until after unhold.
+
+        Returns the list of call_ids that received a re-INVITE.
+        """
+        with self._lock:
+            calls = [
+                (cid, c) for cid, c in self._calls.items()
+                if self._call_phone.get(cid) == phone_id
+            ]
+        new = list(codecs) if codecs else None
+        affected: list[int] = []
+        for cid, call in calls:
+            call._codecs = new
+            try:
+                ci = call.getInfo()
+            except pj.Error:
+                continue
+            if ci.state != pj.PJSIP_INV_STATE_CONFIRMED:
+                continue
+            try:
+                call.reinvite(pj.CallOpParam(True))
+                affected.append(cid)
+            except pj.Error as e:
+                log.warning(
+                    "[%s] codec re-INVITE failed for call %d: %s",
+                    phone_id, cid, e,
+                )
+        return affected
+
     def set_recording_enabled(self, phone_id: str, enabled: bool) -> list[int]:
         """Flip recording on/off for every active call on `phone_id`.
 

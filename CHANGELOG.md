@@ -11,6 +11,20 @@
 - Internal `CallManager.reinvite_with_codecs` (was the back-end for
   `set_codecs(phone_id=, call_id=)`).
 
+### Changed
+- `update_phone(codecs=[...])` now sends a re-INVITE on every CONFIRMED
+  call of the phone so the live media stream swaps codec — symmetric
+  with how `recording_enabled` toggles ongoing calls. Affected call
+  IDs are returned in `codec_reinvited_call_ids`. Held calls get
+  re-INVITEd as sendrecv (effectively unhold) — to preserve hold,
+  unhold first or update codecs after unhold.
+
+### Fixed
+- `tests/_rtp_helpers.rtp_payload_types_in_pcap` now skips per-packet
+  decode errors instead of raising — pcap may contain IPv6
+  (WS-Discovery multicast) or malformed frames the IPv4 decoder
+  doesn't accept.
+
 ### Added
 - **Per-phone codec preferences via SDP rewrite.** Set
   `codecs: [PCMA, ...]` on `add_phone` / `update_phone` / YAML defaults

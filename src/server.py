@@ -379,11 +379,13 @@ async def update_phone(
     """Mutate runtime-parameters of an existing phone.
 
     auto_answer — instantaneous.
-    codecs — instantaneous; updates this phone's SDP-rewrite filter.
-      Affects every NEW outbound INVITE / 200 OK / re-INVITE from this
-      phone. Active calls keep their negotiated codec until a re-INVITE.
-      Use `set_codecs` for endpoint-wide overrides or to re-INVITE a
-      specific active call.
+    codecs — instantaneous; updates this phone's SDP-rewrite filter and
+      sends a re-INVITE on every CONFIRMED call so the live media swaps
+      codec. Non-CONFIRMED calls (CALLING / EARLY) are updated in place;
+      their first SDP exchange already encodes the new filter. Held
+      calls get re-INVITEd as sendrecv (effectively unhold) — to keep
+      a hold, unhold the call first or update codecs after unhold.
+      Affected call IDs are returned in `codec_reinvited_call_ids`.
     recording_enabled — instantaneous; flips recording on/off on every
       currently active call of this phone. off→on starts a new WAV (with
       a new microsecond-unique filename); on→off closes the current WAV
@@ -403,10 +405,14 @@ async def update_phone(
 
         reregister_needed = False
         affected_call_ids: list[int] | None = None
+        codec_reinvited_call_ids: list[int] | None = None
         if auto_answer is not None:
             cfg.auto_answer = auto_answer
         if codecs is not None:
             cfg.codecs = list(codecs)
+            codec_reinvited_call_ids = call_mgr.set_codecs_for_phone(
+                phone_id, cfg.codecs,
+            )
         if recording_enabled is not None:
             cfg.recording_enabled = recording_enabled
             affected_call_ids = call_mgr.set_recording_enabled(phone_id, recording_enabled)
@@ -437,6 +443,8 @@ async def update_phone(
         }
         if affected_call_ids is not None:
             response["affected_call_ids"] = affected_call_ids
+        if codec_reinvited_call_ids is not None:
+            response["codec_reinvited_call_ids"] = codec_reinvited_call_ids
         return response
     except Exception as e:
         log.exception("update_phone failed")

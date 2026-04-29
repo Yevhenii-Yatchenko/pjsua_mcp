@@ -1691,3 +1691,53 @@ class TestCodecs:
         )
 
         self.client.call_tool("a_hangup", {"call_id": ra["call_id"]})
+
+    def test_update_phone_codecs_reinvites_active_call(self):
+        """update_phone(codecs=...) on a phone with an ACTIVE confirmed
+        call must trigger a re-INVITE so the live call swaps codec.
+        Symmetric with how recording_enabled toggles the ongoing call."""
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                   codecs=["PCMA", "telephone-event"])
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                   codecs=["PCMA", "PCMU", "telephone-event"],
+                   auto_answer=True)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
+
+        ra = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = ra["call_id"]
+        time.sleep(2)
+
+        # Sanity: initial offer is PCMA only.
+        pre_offers = [s for s in _extract_sdp_offers(self.client, "a") if "s=pjmedia" in s]
+        assert pre_offers
+        assert "a=rtpmap:8 PCMA" in pre_offers[-1]
+        assert "a=rtpmap:0 PCMU" not in pre_offers[-1]
+
+        # Mutate codecs on the live call.
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a",
+            "codecs": ["PCMU", "telephone-event"],
+        }))
+        assert result["status"] == "ok"
+        assert result["codecs"] == ["PCMU", "telephone-event"]
+        assert call_id in result.get("codec_reinvited_call_ids", []), (
+            f"update_phone did not re-INVITE active call {call_id}: {result}"
+        )
+        time.sleep(2)
+
+        # The latest pjmedia-generated SDP must reflect the new list.
+        post_offers = [s for s in _extract_sdp_offers(self.client, "a") if "s=pjmedia" in s]
+        assert len(post_offers) > len(pre_offers), (
+            f"no new SDP offer after update_phone — {len(post_offers)} vs {len(pre_offers)}"
+        )
+        assert "a=rtpmap:0 PCMU" in post_offers[-1], (
+            f"PCMU missing from re-INVITE offer: {post_offers[-1]}"
+        )
+        assert "a=rtpmap:8 PCMA" not in post_offers[-1], (
+            f"PCMA leaked into re-INVITE offer: {post_offers[-1]}"
+        )
+
+        self.client.call_tool("a_hangup", {"call_id": call_id})
