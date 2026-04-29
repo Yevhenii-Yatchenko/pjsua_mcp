@@ -84,6 +84,15 @@ async def lifespan(server: FastMCP):
 
     # Start engine up-front so add_phone works immediately.
     engine.initialize()
+
+    # Pin every codec the per-phone SDP rewriter might need so media
+    # activation never fails on "filter advertises codec X that endpoint
+    # disabled". From here on, set_codecs() is for TEMPORARY overrides
+    # only (e.g. mid-call re-INVITE in a scenario action). Per-phone
+    # codec preferences are enforced via SipCall.onCallSdpCreated, not
+    # endpoint state.
+    engine.enable_audio_codec_superset()
+
     _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
 
     yield
