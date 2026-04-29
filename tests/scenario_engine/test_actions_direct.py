@@ -313,3 +313,140 @@ def test_checkpoint_and_log_land_in_timeline() -> None:
         assert "end" in labels
 
     _run(inner())
+
+
+def test_wait_until_timeout_aborts_chain_with_action_failed() -> None:
+    """wait_until with a timeout that never fires: chain must abort, the
+    next action MUST NOT run, timeline MUST contain action.failed for
+    wait_until."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        runner = _spin_runner(cm, MockRegistry(), MockEngine(), bus, loop)
+
+        scenario = Scenario(
+            name="wait-until-timeout-smoke",
+            phones=["a"],
+            initial_actions=[
+                {"action": "wait_until", "event": "user.never_fires", "timeout_ms": 100},
+                {"action": "hangup", "phone_id": "a", "call_id": 9},
+            ],
+            stop_on=[{"phone_id": "a", "event": "user.done"}],
+            timeout_ms=2000,
+        )
+        result = await runner.run(scenario)
+        # The hangup must NOT run — wait_until aborted the chain
+        hangups = [c for c in cm.calls if c[0] == "hangup"]
+        assert not hangups, f"hangup ran despite wait_until timeout: {cm.calls}"
+        # Timeline records action.failed for wait_until
+        failed = [
+            e for e in result.timeline
+            if e["kind"] == "meta" and e["type"] == "action.failed"
+            and e.get("data", {}).get("name") == "wait_until"
+        ]
+        assert failed, (
+            "expected action.failed meta entry for wait_until; "
+            f"timeline meta: "
+            f"{[e for e in result.timeline if e['kind'] == 'meta']}"
+        )
+        # Scenario hits its outer timeout — no stop_on match, no error status
+        assert result.status == "timeout"
+
+    _run(inner())
+
+
+def test_set_codecs_in_hook_triggers_reinvite_on_inherited_call() -> None:
+    """Hook on call.state.confirmed dispatching set_codecs without explicit
+    phone_id/call_id null-suppression: must call engine.set_codecs AND
+    cm.unhold (re-INVITE) on the inherited call."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        eng = MockEngine()
+        runner = _spin_runner(cm, MockRegistry(), eng, bus, loop)
+
+        async def emit_confirmed_soon() -> None:
+            await asyncio.sleep(0.05)
+            bus.emit(Event(type="call.state.confirmed", phone_id="a", call_id=42))
+
+        scenario = Scenario(
+            name="set-codecs-reinvite-smoke",
+            phones=["a"],
+            hooks=[{
+                "when": "call.state.confirmed",
+                "on_phone": "a",
+                "once": True,
+                "then": [{"action": "set_codecs", "codecs": ["G722", "PCMA"]}],
+                # Note: no explicit phone_id/call_id; they should be inherited
+                # from hook.on_phone="a" and event.call_id=42 → re-INVITE path.
+            }],
+            stop_on=[{"phone_id": "a", "event": "user.done"}],
+            timeout_ms=1500,
+        )
+        task = asyncio.create_task(emit_confirmed_soon())
+        await runner.run(scenario)
+        await task
+        # 1) Endpoint-wide codec change happened
+        sc = [c for c in eng.calls if c[0] == "set_codecs"]
+        assert sc and sc[0][1]["codecs"] == ["G722", "PCMA"], (
+            f"set_codecs not called or wrong codecs: {eng.calls}"
+        )
+        # 2) re-INVITE happened — CallManager.unhold dispatched with
+        # the inherited call_id and phone_id
+        unholds = [c for c in cm.calls if c[0] == "unhold"]
+        assert unholds, f"re-INVITE (cm.unhold) was not called: {cm.calls}"
+        assert unholds[0][1]["call_id"] == 42
+        assert unholds[0][1]["phone_id"] == "a"
+
+    _run(inner())
+
+
+def test_set_codecs_with_null_phone_and_call_skips_reinvite() -> None:
+    """Hook on call.state.confirmed dispatching set_codecs with explicit
+    phone_id: None, call_id: None: must call engine.set_codecs but
+    NOT cm.unhold (re-INVITE suppressed). Canonical idiom for endpoint-wide
+    codec change inside a hook (see SKILL.md / reference.md)."""
+    async def inner() -> None:
+        loop = asyncio.get_running_loop()
+        bus = EventBus(loop=loop)
+        cm = MockCallManager(bus)
+        eng = MockEngine()
+        runner = _spin_runner(cm, MockRegistry(), eng, bus, loop)
+
+        async def emit_confirmed_soon() -> None:
+            await asyncio.sleep(0.05)
+            bus.emit(Event(type="call.state.confirmed", phone_id="a", call_id=42))
+
+        scenario = Scenario(
+            name="set-codecs-null-suppress-smoke",
+            phones=["a"],
+            hooks=[{
+                "when": "call.state.confirmed",
+                "on_phone": "a",
+                "once": True,
+                "then": [{
+                    "action": "set_codecs",
+                    "codecs": ["PCMU"],
+                    "phone_id": None,
+                    "call_id": None,
+                }],
+            }],
+            stop_on=[{"phone_id": "a", "event": "user.done"}],
+            timeout_ms=1500,
+        )
+        task = asyncio.create_task(emit_confirmed_soon())
+        await runner.run(scenario)
+        await task
+        # 1) Endpoint-wide codec change happened
+        sc = [c for c in eng.calls if c[0] == "set_codecs"]
+        assert sc and sc[0][1]["codecs"] == ["PCMU"]
+        # 2) NO re-INVITE — cm.unhold must NOT have been called
+        unholds = [c for c in cm.calls if c[0] == "unhold"]
+        assert not unholds, (
+            f"re-INVITE happened despite explicit nulls — suppression broken: "
+            f"{cm.calls}"
+        )
+
+    _run(inner())
