@@ -11,6 +11,13 @@ services:
     cap_add:
       - NET_RAW
       - NET_ADMIN
+    environment:
+      # Host-side absolute paths of the bind targets below — let
+      # `run_scenario` return host paths so MCP clients (which run
+      # outside the container) can Read/Bash the artifacts directly.
+      # Empty / unset → host_* fields in artifacts come back as null.
+      - PJSUA_MCP_HOST_RECORDINGS_DIR=${PJSUA_MCP_HOST_RECORDINGS_DIR:-}
+      - PJSUA_MCP_HOST_CAPTURES_DIR=${PJSUA_MCP_HOST_CAPTURES_DIR:-}
     volumes:
       - ./captures:/captures
       - ./recordings:/recordings

@@ -863,6 +863,13 @@ async def get_call_messages(
 _RECORDINGS_ROOT = Path("/recordings")
 _CAPTURES_ROOT = Path("/captures")
 
+# Host-side bind targets — set by docker-compose so MCP clients (Claude
+# Code, which runs OUTSIDE the container) can read artifacts via host
+# paths without resolving the mount themselves. Unset → host_* fields
+# in run_scenario.artifacts come back as None.
+_HOST_RECORDINGS_ROOT = os.environ.get("PJSUA_MCP_HOST_RECORDINGS_DIR") or None
+_HOST_CAPTURES_ROOT = os.environ.get("PJSUA_MCP_HOST_CAPTURES_DIR") or None
+
 
 def _parse_recording_filename(path: Path) -> tuple[str | None, int | None]:
     """Infer (phone_id, call_id) from a recording's path + filename.
@@ -1119,6 +1126,10 @@ async def run_scenario(
             registry=registry,
             loop=loop,
             engine=engine,
+            recordings_root=_RECORDINGS_ROOT,
+            captures_root=_CAPTURES_ROOT,
+            host_recordings_root=_HOST_RECORDINGS_ROOT,
+            host_captures_root=_HOST_CAPTURES_ROOT,
         )
     except Exception as e:
         log.exception("run_scenario failed")
