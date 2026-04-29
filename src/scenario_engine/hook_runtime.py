@@ -79,7 +79,8 @@ def _event_matches_predicates(event: Event, match: dict[str, Any]) -> bool:
     if not match:
         return True
     for key, expected in match.items():
-        # First try event.data, then fall back to top-level attributes.
+        # Fallback to top-level Event attributes (phone_id, call_id, type) when
+        # the predicate key isn't in event.data. Documented in reference.md §4.
         actual = _dotted_get(event.data, key)
         if actual is None:
             actual = getattr(event, key, None)
