@@ -209,7 +209,7 @@ class TestDynamicTools:
         assert "add_phone" in tools
         assert "drop_phone" in tools
         assert "list_phones" in tools
-        assert "load_phone_profile" in tools
+        assert "load_phones" in tools
         # No per-phone tools until add_phone is called
         assert not any(t.startswith("a_") for t in tools)
 
@@ -306,7 +306,7 @@ class TestRecordingLayout:
         info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
         assert "recordings_dir" not in info
 
-    def test_load_phone_profile_warns_and_ignores_legacy_recordings_dir(self):
+    def test_load_phones_warns_and_ignores_legacy_recordings_dir(self):
         """Legacy YAML files with recordings_dir should still load (warn + strip)."""
         profile = self.tmp_path / "legacy.yaml"
         profile.write_text("""
@@ -320,7 +320,7 @@ phones:
   - {phone_id: p2, username: u2, recordings_dir: /recordings/p2}
 """)
         result = _parse_tool_result(self.client.call_tool(
-            "load_phone_profile", {"path": str(profile)}
+            "load_phones", {"path": str(profile)}
         ))
         assert result["status"] == "ok"
         # Both phones loaded; legacy key silently dropped.
@@ -414,7 +414,7 @@ phones:
   - {phone_id: rec_on_override, username: u2, recording_enabled: true}
 """)
         result = _parse_tool_result(self.client.call_tool(
-            "load_phone_profile", {"path": str(profile)}
+            "load_phones", {"path": str(profile)}
         ))
         assert result["status"] == "ok"
 
@@ -468,7 +468,7 @@ phones:
   - {phone_id: legacy1, username: u1}
 """)
         result = _parse_tool_result(self.client.call_tool(
-            "load_phone_profile", {"path": str(profile)}
+            "load_phones", {"path": str(profile)}
         ))
         assert result["status"] == "ok"
 
@@ -524,7 +524,7 @@ phones:
   - {phone_id: cap_off_override, username: u2, capture_enabled: false}
 """)
         result = _parse_tool_result(self.client.call_tool(
-            "load_phone_profile", {"path": str(profile)}
+            "load_phones", {"path": str(profile)}
         ))
         assert result["status"] == "ok"
 
@@ -856,7 +856,7 @@ phones:
   - phone_id: p3
     username: u3
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": path}))
         assert result["status"] == "ok"
         assert len(result["added"]) == 3
         assert not result["errors"]
@@ -867,7 +867,7 @@ phones:
             assert f"{pid}_hangup" in tools
 
     def test_missing_file(self):
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {
+        result = _parse_tool_result(self.client.call_tool("load_phones", {
             "path": "/tmp/does_not_exist.yaml",
         }))
         assert result["status"] == "error"
@@ -883,7 +883,7 @@ phones:
     username: u1
     # password missing from both defaults and phone
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": path}))
         assert result["status"] == "error"
         assert "password" in result["error"].lower()
 
@@ -898,7 +898,7 @@ phones:
     username: u1
     unknown_key: "oops"
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": path}))
         assert result["status"] == "error"
         assert "unknown" in result["error"].lower()
 
@@ -914,7 +914,7 @@ phones:
   - phone_id: p1
     username: u2
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": path}))
         assert result["status"] == "error"
         assert "duplicate" in result["error"].lower()
 
@@ -925,7 +925,7 @@ defaults:
   password: x
 phones: []
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": path}))
         assert result["status"] == "error"
         assert "empty" in result["error"].lower()
 
@@ -942,7 +942,7 @@ phones:
     domain: override.example.com
     auto_answer: true
 """)
-        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        _parse_tool_result(self.client.call_tool("load_phones", {"path": path}))
         info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "p1"}))
         assert info["domain"] == "override.example.com"
         assert info["auto_answer"] is True
@@ -956,7 +956,7 @@ phones:
   - {phone_id: p2, username: u2}
   - {phone_id: p3, username: u3}
 """)
-        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": first}))
+        _parse_tool_result(self.client.call_tool("load_phones", {"path": first}))
         phones = _parse_tool_result(self.client.call_tool("list_phones"))
         assert {p["phone_id"] for p in phones["phones"]} == {"p1", "p2", "p3"}
 
@@ -966,7 +966,7 @@ defaults: {domain: 127.0.0.1, password: x, register: false}
 phones:
   - {phone_id: p4, username: u4}
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": second}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": second}))
         assert result["mode"] == "replace"
         assert set(result["dropped"]) == {"p1", "p2", "p3"}
         assert len(result["added"]) == 1
@@ -987,14 +987,14 @@ phones:
   - {phone_id: p1, username: u1}
   - {phone_id: p2, username: u2}
 """)
-        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": first}))
+        _parse_tool_result(self.client.call_tool("load_phones", {"path": first}))
 
         second = self._write_profile("second.yaml", """
 defaults: {domain: 127.0.0.1, password: x, register: false}
 phones:
   - {phone_id: p3, username: u3}
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {
+        result = _parse_tool_result(self.client.call_tool("load_phones", {
             "path": second, "merge": True,
         }))
         assert result["mode"] == "merge"
@@ -1011,7 +1011,7 @@ phones:
   - {phone_id: p1, username: u1}
   - {phone_id: p2, username: u2}
 """)
-        _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": first}))
+        _parse_tool_result(self.client.call_tool("load_phones", {"path": first}))
 
         bad = self._write_profile("bad.yaml", """
 defaults: {domain: 127.0.0.1, register: false}
@@ -1019,7 +1019,7 @@ phones:
   - {phone_id: p3, username: u3}
   # password missing both from defaults and phone → validation fails
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": bad}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": bad}))
         assert result["status"] == "error"
 
         phones = _parse_tool_result(self.client.call_tool("list_phones"))
@@ -1032,7 +1032,7 @@ defaults: {domain: 127.0.0.1, password: x, register: false}
 phones:
   - {phone_id: p1, username: u1}
 """)
-        result = _parse_tool_result(self.client.call_tool("load_phone_profile", {"path": path}))
+        result = _parse_tool_result(self.client.call_tool("load_phones", {"path": path}))
         assert result["status"] == "ok"
         assert result["dropped"] == []
         assert len(result["added"]) == 1

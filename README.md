@@ -76,7 +76,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 | `drop_phone` | Hang up the phone's calls, unregister, close transport, unload its per-phone tools |
 | `get_phone` | Full info for one phone — credentials (sans password), reg state, active calls, `recording_enabled` |
 | `update_phone` | Mutate runtime settings — `auto_answer` / `recording_enabled` / `capture_enabled` (instant), `codecs`, or credentials (forces reregister) |
-| `load_phone_profile` | Bulk-add every phone listed in a YAML profile. Atomic replace by default (`merge=True` for upsert) |
+| `load_phones` | Bulk-add every phone listed in a YAML profile. Atomic replace by default (`merge=True` for upsert) |
 | `get_phone_profile_example` | Return a ready-to-edit YAML template, host/container paths, and next-step hints |
 
 #### Global diagnostics
@@ -99,7 +99,7 @@ On top of those atomic tools, the server ships an **event-driven scenario engine
 
 ### Per-phone dynamic (22 per active phone)
 
-Registered when `add_phone` (or `load_phone_profile`) brings a phone online; unregistered on `drop_phone`. Examples below use phone `a`:
+Registered when `add_phone` (or `load_phones`) brings a phone online; unregistered on `drop_phone`. Examples below use phone `a`:
 
 | Tool | Description |
 |------|-------------|
@@ -189,7 +189,7 @@ phones:
 ### 4. Load the profile and run scenarios
 
 ```
-mcp__pjsua__load_phone_profile()                   # reads /config/phones.yaml
+mcp__pjsua__load_phones()                   # reads /config/phones.yaml
 # → every phone registers; a_make_call, b_hangup, … appear via tools/list_changed.
 
 mcp__pjsua__a_make_call(dest_uri="sip:002@sip.example.com")
@@ -197,7 +197,7 @@ mcp__pjsua__a_get_call_info(call_id=0)
 mcp__pjsua__a_hangup(call_id=0)
 ```
 
-`load_phone_profile` is **atomic replace** by default: before loading, every existing phone's active calls are hung up and the phones are dropped. Pass `merge=True` to keep phones that aren't listed in the new profile.
+`load_phones` is **atomic replace** by default: before loading, every existing phone's active calls are hung up and the phones are dropped. Pass `merge=True` to keep phones that aren't listed in the new profile.
 
 For ad-hoc additions without touching the profile file:
 
@@ -643,7 +643,7 @@ tshark -Y 'rtp' -r captures/a/call_0_*.pcap -w rtp_only.pcap
 
 ## Dynamic Tool Registration
 
-`load_phone_profile` / `add_phone` / `drop_phone` call `mcp.add_tool()` and `mcp.remove_tool()` at runtime. The MCP server announces the change via `notifications/tools/list_changed`; compatible clients rescan the tool list immediately.
+`load_phones` / `add_phone` / `drop_phone` call `mcp.add_tool()` and `mcp.remove_tool()` at runtime. The MCP server announces the change via `notifications/tools/list_changed`; compatible clients rescan the tool list immediately.
 
 ```
 # Fresh server
@@ -684,7 +684,7 @@ The full suite runs in ~2 minutes (~90 tests).
 │  │                                                      ││
 │  │  pytest spawns ONE MCP server subprocess per test    ││
 │  │  class. That server adds several phones via          ││
-│  │  add_phone / load_phone_profile and drives them:     ││
+│  │  add_phone / load_phones and drives them:     ││
 │  │                                                      ││
 │  │     ┌──────────────────────────────────────┐         ││
 │  │     │  MCP Server (a, b, c managed inside) │         ││
@@ -811,7 +811,7 @@ pjsua_mcp/
 - **Recording** — per-phone `recording_enabled` flag (default off — opt in per phone). When on, writes to `/recordings/<phone_id>/call_<call_id>_<ts>_<us>.wav` plus a `.meta.json` sidecar with call context and the paired pcap path (when a capture is running for the phone). The recorder is connected AFTER player setup to avoid conference bridge disruption and reconnected on every `onCallMediaState`. Local + remote audio mixed into one mono WAV. Toggling `recording_enabled` mid-call via `update_phone` opens/closes distinct WAV segments — each with its own sidecar — so a single call can emit several recordings if the operator wants finer-grained capture.
 - **Auto-capture** — per-phone `capture_enabled` flag (default off). Opens a dedicated `tcpdump -i any udp` subprocess on the first audio-active call and closes it on the last disconnect. Filter stays broad so re-INVITE RTP port changes don't drop packets; split SIP and RTP with `tshark -Y` after the fact. Start/stop requests come from pj callback threads; actual subprocess launches run on the asyncio poll loop via a deque-based pending queue (same pattern as `process_auto_answers`). Conference (2+ calls on one phone) shares a single pcap, counted via `_active_calls_by_phone`.
 - **Re-INVITE** — audio player is reconnected to the new `aud_med` port after re-INVITE (codec change, conference conversion) so TX keeps flowing.
-- **Dynamic tool registration** — `tools_changed=True` capability enabled via `create_initialization_options` monkey-patch; `ctx.session.send_tool_list_changed()` fires after each phone add/drop (once per batch for `load_phone_profile`).
+- **Dynamic tool registration** — `tools_changed=True` capability enabled via `create_initialization_options` monkey-patch; `ctx.session.send_tool_list_changed()` fires after each phone add/drop (once per batch for `load_phones`).
 - **Stale call cleanup** — disconnected calls are removed from tracking; accounts are shut down before re-registration to prevent ghost sessions.
 - **Single point of failure** — one container crash now drops all N phones. Acceptable for a dev/test stand. Docker-compose can `restart: unless-stopped` if you need resilience.
 - **MOH** — Suite Espanola Op. 47 — Leyenda (Albeniz), classical guitar, CC0 public domain from FreeSWITCH/MUSOPEN.

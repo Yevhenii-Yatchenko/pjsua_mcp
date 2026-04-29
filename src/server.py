@@ -54,14 +54,14 @@ EXAMPLE_PROFILE_PATH = "/config/phones.example.yaml"
 # (not in a separate file) so the MCP tool is self-contained — callers don't
 # need filesystem access to the repo to discover the schema.
 PHONE_PROFILE_TEMPLATE = """\
-# Phone profile for load_phone_profile.
+# Phone profile for load_phones.
 #
 # Save this file on the host at ./config/phones.yaml (the docker-compose
 # bind mounts ./config to /config inside the container), fill in the
 # credentials for your SIP stand, then invoke the MCP tool:
 #
-#   mcp__pjsua__load_phone_profile()                               # /config/phones.yaml
-#   mcp__pjsua__load_phone_profile(path="/config/other.yaml")      # another profile
+#   mcp__pjsua__load_phones()                               # /config/phones.yaml
+#   mcp__pjsua__load_phones(path="/config/other.yaml")      # another profile
 #
 # Both recording and auto-capture default to OFF. Opt in per phone:
 #   - `recording_enabled: true` → /recordings/<phone_id>/call_<id>_<ts>.wav
@@ -192,7 +192,7 @@ def _validate_phone_id(phone_id: str) -> None:
     # Guard against phone_id producing a collision with static tool names.
     static_tool_names = {
         "add_phone", "drop_phone", "list_phones", "get_phone", "update_phone",
-        "load_phone_profile", "get_phone_profile_example",
+        "load_phones", "get_phone_profile_example",
         "get_codecs", "set_codecs", "get_sip_log",
         "start_capture", "stop_capture", "get_pcap", "list_recordings",
     }
@@ -571,11 +571,11 @@ def _load_profile_yaml(path: str) -> list[dict[str, Any]]:
 
 @mcp.tool()
 async def get_phone_profile_example() -> dict[str, Any]:
-    """Return a YAML template for `load_phone_profile`.
+    """Return a YAML template for `load_phones`.
 
     Use this when you don't know the phone-profile format — the returned
     `template` field is a ready-to-edit YAML. Save it as ./config/phones.yaml
-    on the host, fill in your SIP credentials, then call `load_phone_profile`.
+    on the host, fill in your SIP credentials, then call `load_phones`.
 
     Returns a dict with:
       - template: YAML string (copy to phones.yaml and edit)
@@ -590,19 +590,19 @@ async def get_phone_profile_example() -> dict[str, Any]:
             "host_path": "./config/phones.yaml (in the pjsua_mcp repo)",
             "container_path": DEFAULT_PROFILE_PATH,
         },
-        "next_step": f"mcp__pjsua__load_phone_profile(path='{DEFAULT_PROFILE_PATH}')",
+        "next_step": f"mcp__pjsua__load_phones(path='{DEFAULT_PROFILE_PATH}')",
         "example_file_in_container": EXAMPLE_PROFILE_PATH,
         "notes": [
             "phones.yaml is gitignored; phones.example.yaml is the tracked template.",
             "/config is mounted read-only — edit the file on the host, not in the container.",
-            "load_phone_profile defaults to replace mode (drops existing phones + calls).",
+            "load_phones defaults to replace mode (drops existing phones + calls).",
             "Pass merge=True to keep phones not listed in the profile.",
         ],
     }
 
 
 @mcp.tool()
-async def load_phone_profile(
+async def load_phones(
     path: str = DEFAULT_PROFILE_PATH,
     merge: bool = False,
 ) -> dict[str, Any]:
@@ -645,7 +645,7 @@ async def load_phone_profile(
     try:
         specs = _load_profile_yaml(path)
     except Exception as e:
-        log.exception("load_phone_profile: parse failed")
+        log.exception("load_phones: parse failed")
         return {"status": "error", "error": str(e), "path": path}
 
     dropped: list[str] = []
@@ -664,7 +664,7 @@ async def load_phone_profile(
                     _drop_phone_impl(pid, hangup_calls=True)
                     dropped.append(pid)
                 except Exception as e:
-                    log.exception("load_phone_profile: drop %s failed", pid)
+                    log.exception("load_phones: drop %s failed", pid)
                     errors.append({"phone_id": pid, "error": f"drop failed: {e}"})
 
     # 3. Add phones from the profile. _add_phone_impl handles per-phone_id
@@ -674,7 +674,7 @@ async def load_phone_profile(
             res = _add_phone_impl(**spec)
             results.append(res)
         except Exception as e:
-            log.exception("load_phone_profile[%s] failed", spec.get("phone_id"))
+            log.exception("load_phones[%s] failed", spec.get("phone_id"))
             errors.append({"phone_id": spec.get("phone_id"), "error": str(e)})
 
     # 4. Let REGISTER responses land, then refresh registration state in the report.

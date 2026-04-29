@@ -1,11 +1,11 @@
-# Phone profile for load_phone_profile.
+# Phone profile for load_phones.
 #
 # Save this file on the host at ./config/phones.yaml (the docker-compose
 # bind mounts ./config to /config inside the container), fill in the
 # credentials for your SIP stand, then invoke the MCP tool:
 #
-#   mcp__pjsua__load_phone_profile()                               # /config/phones.yaml
-#   mcp__pjsua__load_phone_profile(path="/config/other.yaml")      # another profile
+#   mcp__pjsua__load_phones()                               # /config/phones.yaml
+#   mcp__pjsua__load_phones(path="/config/other.yaml")      # another profile
 #
 # This file is the canonical template; get_phone_profile_example() returns
 # the same content over MCP for callers who don't have filesystem access.
