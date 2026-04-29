@@ -26,11 +26,17 @@
 defaults:
   domain: sip.example.com
   password: change_me
-  codecs: [PCMA]
   transport: udp
   auto_answer: false
   register: true
   srtp: false
+  # codecs is the per-phone SDP rewrite filter. Each phone advertises
+  # ONLY these codecs in its outgoing offers/answers, and pjsua's media
+  # activation picks from the SDP intersection — so RTP for this phone
+  # uses one of these codecs. Order matters: first entry is the highest
+  # preference. DTMF (`telephone-event`) is auto-preserved by the
+  # rewriter even when not explicitly listed.
+  codecs: [PCMA, telephone-event]
   # recording_enabled: false   # default — flip to true to record every
                                # call on every phone by default
   # capture_enabled: false     # default — flip to true to auto-run
@@ -45,6 +51,7 @@ phones:
   - phone_id: b
     username: "1002"
     auto_answer: true
+    codecs: [PCMU, telephone-event]    # per-phone override wins over defaults
 
   - phone_id: c
     username: "1003"

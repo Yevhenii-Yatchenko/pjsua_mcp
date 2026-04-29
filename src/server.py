@@ -84,6 +84,15 @@ async def lifespan(server: FastMCP):
 
     # Start engine up-front so add_phone works immediately.
     engine.initialize()
+
+    # Pin every codec the per-phone SDP rewriter might need so media
+    # activation never fails on "filter advertises codec X that endpoint
+    # disabled". From here on, set_codecs() is for TEMPORARY overrides
+    # only (e.g. mid-call re-INVITE in a scenario action). Per-phone
+    # codec preferences are enforced via SipCall.onCallSdpCreated, not
+    # endpoint state.
+    engine.enable_audio_codec_superset()
+
     _poll_task = asyncio.create_task(_poll_pjsip_events(engine))
 
     yield
@@ -170,10 +179,6 @@ def _add_phone_impl(
     if phone_id in _phone_tools:
         unregister_phone_tools(mcp, _phone_tools.pop(phone_id))
 
-    # Optionally apply endpoint-wide codec priorities before REGISTER.
-    if codecs:
-        engine.set_codecs(codecs)
-
     registry.add_phone(
         phone_id,
         domain=domain,
@@ -202,6 +207,7 @@ def _add_phone_impl(
         "auto_answer": auto_answer,
         "transport": transport,
         "transport_id": cfg.transport_id if cfg else None,
+        "codecs": cfg.codecs if cfg else codecs,
         "recording_enabled": cfg.recording_enabled if cfg else recording_enabled,
         "capture_enabled": cfg.capture_enabled if cfg else capture_enabled,
         "tools_registered": len(tool_names),
@@ -271,6 +277,14 @@ async def add_phone(
     After a successful add, new tools named `<phone_id>_make_call`,
     `<phone_id>_hangup`, etc. become visible via
     `notifications/tools/list_changed`.
+
+    `codecs` (optional, e.g. `["PCMA", "telephone-event"]`) sets the
+    phone's outbound SDP filter — every offer and 200-OK answer this
+    phone produces will list ONLY these codecs. Media activation then
+    picks from the SDP intersection, so RTP send/receive on this phone
+    matches the list. `None` (default) keeps the global endpoint
+    priorities (set via `set_codecs`). DTMF (`telephone-event`) is
+    auto-preserved by the SDP rewriter even when not in the list.
 
     Recording defaults to OFF: pass `recording_enabled=True` (or set it
     in the YAML profile) to write every call on this phone to
@@ -365,7 +379,11 @@ async def update_phone(
     """Mutate runtime-parameters of an existing phone.
 
     auto_answer — instantaneous.
-    codecs — endpoint-wide priorities (affects all phones).
+    codecs — instantaneous; updates this phone's SDP-rewrite filter.
+      Affects every NEW outbound INVITE / 200 OK / re-INVITE from this
+      phone. Active calls keep their negotiated codec until a re-INVITE.
+      Use `set_codecs` for endpoint-wide overrides or to re-INVITE a
+      specific active call.
     recording_enabled — instantaneous; flips recording on/off on every
       currently active call of this phone. off→on starts a new WAV (with
       a new microsecond-unique filename); on→off closes the current WAV
@@ -388,8 +406,7 @@ async def update_phone(
         if auto_answer is not None:
             cfg.auto_answer = auto_answer
         if codecs is not None:
-            engine.set_codecs(codecs)
-            cfg.codecs = codecs
+            cfg.codecs = list(codecs)
         if recording_enabled is not None:
             cfg.recording_enabled = recording_enabled
             affected_call_ids = call_mgr.set_recording_enabled(phone_id, recording_enabled)
@@ -413,6 +430,7 @@ async def update_phone(
             "status": "ok",
             "phone_id": phone_id,
             "reregistered": reregister_needed,
+            "codecs": cfg.codecs,
             "recording_enabled": cfg.recording_enabled,
             "capture_enabled": cfg.capture_enabled,
             **registry.get_registration_info(phone_id),
@@ -540,6 +558,7 @@ async def load_phones(
         phones:
           - phone_id: a
             username: "1001"
+            codecs: [PCMU, telephone-event]   # phone-level override wins
           - phone_id: b
             username: "1002"
             auto_answer: true

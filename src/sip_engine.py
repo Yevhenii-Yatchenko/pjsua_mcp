@@ -177,6 +177,29 @@ class SipEngine:
             for c in self._ep.codecEnum2()
         ]
 
+    # Codecs that any phone might want to advertise. Pinned at startup so
+    # the per-phone SDP rewriter can keep ANY of these in `m=audio` and
+    # pjsua's media activation will allocate the codec instance — without
+    # this pin, the last `set_codecs(...)` call wins endpoint-wide and
+    # any phone whose SDP advertises a different codec gets EUNSUP from
+    # `pjmedia_codec_mgr_alloc_codec`. Order in this list does NOT imply
+    # preference; per-phone SDP filter sets the actual ordering.
+    AUDIO_CODEC_SUPERSET = [
+        "PCMA",
+        "PCMU",
+        "G722",
+        "G729",
+        "opus",
+        "telephone-event",
+    ]
+
+    def enable_audio_codec_superset(self) -> list[dict]:
+        """Pin every codec we might want any phone to use to a non-zero
+        priority. Returns the resulting enabled-codec list. Idempotent."""
+        if not self._ep:
+            raise RuntimeError("SIP engine not initialized")
+        return self.set_codecs(self.AUDIO_CODEC_SUPERSET)
+
     def get_log_entries(
         self,
         last_n: int | None = None,

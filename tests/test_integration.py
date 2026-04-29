@@ -143,6 +143,27 @@ def _parse_tool_result(resp: dict) -> dict[str, Any]:
     return json.loads(text)
 
 
+def _extract_sdp_offers(client: McpClient, phone_id: str) -> list[str]:
+    """Return SDP bodies of every SIP message from `phone_id`'s log that
+    carries `application/sdp` content. Used to assert per-phone offer/
+    answer codec lists in integration tests."""
+    log_resp = _parse_tool_result(client.call_tool("get_sip_log", {
+        "phone_id": phone_id,
+    }))
+    bodies: list[str] = []
+    for entry in log_resp.get("entries", []):
+        msg = entry.get("msg", "")
+        if "application/sdp" not in msg:
+            continue
+        try:
+            _, body = msg.split("\r\n\r\n", 1)
+        except ValueError:
+            continue
+        if "v=0" in body:
+            bodies.append(body)
+    return bodies
+
+
 def _wait_phone_registered(client: McpClient, phone_id: str, timeout: float = 5.0) -> None:
     """Poll `<phone_id>_get_registration_status` until is_registered=True."""
     deadline = time.time() + timeout
@@ -165,16 +186,18 @@ def _add_phone(
     recording_enabled: bool = False,
     capture_enabled: bool = False,
 ) -> dict:
-    result = _parse_tool_result(client.call_tool("add_phone", {
+    args = {
         "phone_id": phone_id,
         "domain": SIP_DOMAIN,
         "username": username,
         "password": password,
         "auto_answer": auto_answer,
-        "codecs": codecs,
         "recording_enabled": recording_enabled,
         "capture_enabled": capture_enabled,
-    }))
+    }
+    if codecs is not None:
+        args["codecs"] = codecs
+    result = _parse_tool_result(client.call_tool("add_phone", args))
     assert result["status"] == "ok", f"add_phone failed: {result}"
     return result
 
@@ -275,6 +298,38 @@ class TestDynamicTools:
         assert result["status"] == "error"
         assert "invalid" in result["error"].lower()
 
+    def test_add_phone_with_codecs_round_trips(self):
+        """add_phone(codecs=[...]) must persist on cfg.codecs and surface
+        in the response and in get_phone."""
+        result = _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z",
+            "domain": "127.0.0.1",
+            "username": "u", "password": "p",
+            "register": False,
+            "codecs": ["PCMA", "telephone-event"],
+        }))
+        assert result["status"] == "ok"
+        assert result["codecs"] == ["PCMA", "telephone-event"]
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
+        assert info["codecs"] == ["PCMA", "telephone-event"]
+
+    def test_update_phone_codecs_persists(self):
+        """update_phone(codecs=...) updates cfg.codecs synchronously."""
+        _parse_tool_result(self.client.call_tool("add_phone", {
+            "phone_id": "z", "domain": "127.0.0.1",
+            "username": "u", "password": "p", "register": False,
+            "codecs": ["PCMA"],
+        }))
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "z", "codecs": ["PCMU", "telephone-event"],
+        }))
+        assert result["status"] == "ok"
+        assert result["codecs"] == ["PCMU", "telephone-event"]
+
+        info = _parse_tool_result(self.client.call_tool("get_phone", {"phone_id": "z"}))
+        assert info["codecs"] == ["PCMU", "telephone-event"]
+
 
 class TestRecordingLayout:
     """Recording layout — always-on, per-phone subdirs, sidecar meta.
@@ -326,6 +381,28 @@ phones:
         # Both phones loaded; legacy key silently dropped.
         loaded_ids = {p["phone_id"] for p in result["added"]}
         assert loaded_ids == {"p1", "p2"}
+
+    def test_load_phones_per_phone_codecs(self):
+        """`codecs:` is a first-class per-phone field again — defaults
+        merge into each phone, phone-level overrides win."""
+        profile = self.tmp_path / "codecs.yaml"
+        profile.write_text("""
+defaults:
+  domain: 127.0.0.1
+  password: x
+  register: false
+  codecs: [PCMA]
+phones:
+  - {phone_id: c1, username: u1}
+  - {phone_id: c2, username: u2, codecs: [PCMU, telephone-event]}
+""")
+        result = _parse_tool_result(self.client.call_tool(
+            "load_phones", {"path": str(profile)}
+        ))
+        assert result["status"] == "ok"
+        by_id = {p["phone_id"]: p for p in result["added"]}
+        assert by_id["c1"]["codecs"] == ["PCMA"]
+        assert by_id["c2"]["codecs"] == ["PCMU", "telephone-event"]
 
     def test_list_recordings_reads_new_layout(self):
         """/recordings/<phone_id>/call_<id>_<ts>.wav is parsed correctly."""
@@ -1417,11 +1494,16 @@ class TestCodecs:
             self.client = client
             yield
 
-    def test_configure_with_codecs(self):
-        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A, codecs=["PCMU"])
+    def test_endpoint_codecs_pin_call_codec(self):
+        """`set_codecs` is endpoint-wide — pinning PCMU before the call
+        forces the SDP to advertise it as the preferred codec."""
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
         _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
         _wait_phone_registered(self.client, "a")
         _wait_phone_registered(self.client, "b")
+
+        # Pin PCMU globally — there is no per-phone codec list.
+        self.client.call_tool("set_codecs", {"codecs": ["PCMU"]})
 
         result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
@@ -1444,10 +1526,12 @@ class TestCodecs:
         assert any("PCMU" in c for c in codec_names)
 
     def test_set_codecs_midcall(self):
-        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A, codecs=["PCMU", "PCMA"])
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A)
         _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B)
         _wait_phone_registered(self.client, "a")
         _wait_phone_registered(self.client, "b")
+        # Start with PCMU preferred, then re-INVITE to PCMA mid-call.
+        self.client.call_tool("set_codecs", {"codecs": ["PCMU", "PCMA"]})
 
         result = _parse_tool_result(self.client.call_tool("a_make_call", {
             "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
@@ -1468,3 +1552,201 @@ class TestCodecs:
         info = _parse_tool_result(self.client.call_tool("a_get_call_info", {"call_id": call_id}))
         assert "PCMA" in info.get("codec", "")
         self.client.call_tool("a_hangup", {"call_id": call_id})
+
+    # ---- per-phone SDP-rewrite tests --------------------------------
+
+    def test_per_phone_outbound_offer_pcma(self):
+        """phone_a (codecs=[PCMA]) — outgoing INVITE offer must list
+        only PCMA + telephone-event; pjsua's chosen RTP codec must be
+        PCMA (PT=8) in the captured pcap."""
+        from tests._rtp_helpers import rtp_payload_types_in_pcap
+        from pathlib import Path
+
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                   codecs=["PCMA", "telephone-event"],
+                   capture_enabled=True)
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                   auto_answer=True)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
+
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        time.sleep(2)
+
+        offers = _extract_sdp_offers(self.client, "a")
+        assert offers, "no SDP body in phone_a's SIP log"
+        outbound = next((s for s in offers if "INVITE" not in s and "PCMA" in s), offers[0])
+        assert "a=rtpmap:8 PCMA/8000" in outbound
+        assert "PCMU" not in outbound
+        assert "G722" not in outbound
+        assert "G729" not in outbound
+
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+        time.sleep(1)
+
+        pcap_dir = Path("/captures/a")
+        pcaps = sorted(pcap_dir.glob(f"call_{call_id}_*.pcap"))
+        assert pcaps, f"no pcap for call {call_id} in {pcap_dir}"
+        pts = rtp_payload_types_in_pcap(pcaps[-1])
+        assert 8 in pts, f"no PCMA RTP in pcap {pcaps[-1]} — saw PTs {pts}"
+        assert 0 not in pts, f"PCMU leaked into RTP: {pts}"
+        assert 9 not in pts, f"G722 leaked into RTP: {pts}"
+
+    def test_per_phone_inbound_answer_pcmu(self):
+        """phone_b (codecs=[PCMU], auto_answer=True) — incoming INVITE
+        offers PCMU+PCMA, our 200 OK must answer with PCMU only; RTP
+        must be PCMU (PT=0)."""
+        from tests._rtp_helpers import rtp_payload_types_in_pcap
+        from pathlib import Path
+
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                   codecs=["PCMA", "PCMU", "telephone-event"])
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                   codecs=["PCMU", "telephone-event"],
+                   auto_answer=True,
+                   capture_enabled=True)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
+
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        time.sleep(3)
+
+        answers = _extract_sdp_offers(self.client, "b")
+        assert answers, "no SDP body in phone_b's SIP log"
+        b_answer = next(
+            (s for s in answers if "PCMU" in s and "a=rtpmap:8 PCMA" not in s),
+            None,
+        )
+        assert b_answer is not None, (
+            f"phone_b's 200 OK answer should NOT contain PCMA — saw: {answers}"
+        )
+
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+        time.sleep(1)
+
+        pcap_dir = Path("/captures/b")
+        pcaps = sorted(pcap_dir.glob("call_*.pcap"))
+        assert pcaps, f"no pcap in {pcap_dir}"
+        pts = rtp_payload_types_in_pcap(pcaps[-1])
+        assert 0 in pts, f"no PCMU RTP in pcap — saw {pts}"
+        assert 8 not in pts, f"PCMA leaked into RTP: {pts}"
+
+    def test_concurrent_calls_isolated_codecs(self):
+        """phone_a (PCMA) and phone_b (PCMU) — each must keep its own
+        codec in SDP and RTP regardless of any global priority drift."""
+        from tests._rtp_helpers import rtp_payload_types_in_pcap
+        from pathlib import Path
+
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                   codecs=["PCMA", "telephone-event"],
+                   capture_enabled=True)
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                   codecs=["PCMU", "telephone-event"],
+                   capture_enabled=True)
+        _add_phone(self.client, "c", SIP_USER_C, SIP_PASS_C,
+                   auto_answer=True)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
+        _wait_phone_registered(self.client, "c")
+
+        ra = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
+        }))
+        rb = _parse_tool_result(self.client.call_tool("b_make_call", {
+            "dest_uri": f"sip:{SIP_USER_C}@{SIP_DOMAIN}",
+        }))
+        time.sleep(3)
+
+        a_offers = _extract_sdp_offers(self.client, "a")
+        b_offers = _extract_sdp_offers(self.client, "b")
+        assert any("PCMA" in s and "PCMU" not in s for s in a_offers), (
+            f"phone_a offered something other than PCMA: {a_offers}"
+        )
+        assert any("PCMU" in s and "PCMA" not in s for s in b_offers), (
+            f"phone_b offered something other than PCMU: {b_offers}"
+        )
+
+        self.client.call_tool("a_hangup", {"call_id": ra["call_id"]})
+        self.client.call_tool("b_hangup", {"call_id": rb["call_id"]})
+        time.sleep(1)
+
+        a_pcap = sorted(Path("/captures/a").glob("call_*.pcap"))[-1]
+        b_pcap = sorted(Path("/captures/b").glob("call_*.pcap"))[-1]
+        a_pts = rtp_payload_types_in_pcap(a_pcap)
+        b_pts = rtp_payload_types_in_pcap(b_pcap)
+        assert 8 in a_pts, f"phone_a missing PCMA RTP: {a_pts}"
+        assert 0 in b_pts, f"phone_b missing PCMU RTP: {b_pts}"
+
+    def test_hold_unhold_preserves_codec(self):
+        """phone_a places call on hold, then unholds. Every re-INVITE
+        from phone_a must keep PCMA only."""
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                   codecs=["PCMA", "telephone-event"])
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                   codecs=["PCMA", "telephone-event"],
+                   auto_answer=True)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
+
+        result = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        call_id = result["call_id"]
+        time.sleep(2)
+
+        self.client.call_tool("a_hold", {"call_id": call_id})
+        time.sleep(1)
+        self.client.call_tool("a_unhold", {"call_id": call_id})
+        time.sleep(1)
+
+        offers = _extract_sdp_offers(self.client, "a")
+        # _extract_sdp_offers returns BOTH our outgoing SDP (s=pjmedia)
+        # and incoming SDP from the remote (e.g. s=Asterisk). Filter to
+        # only the SDP we generated.
+        our_offers = [s for s in offers if "s=pjmedia" in s]
+        assert len(our_offers) >= 3, (
+            f"expected ≥3 outgoing pjmedia SDPs, got {len(our_offers)} "
+            f"(total {len(offers)})"
+        )
+        for sdp in our_offers:
+            assert "a=rtpmap:8 PCMA" in sdp, f"PCMA missing from offer: {sdp}"
+            assert "a=rtpmap:0 PCMU" not in sdp, f"PCMU leaked into offer: {sdp}"
+
+        self.client.call_tool("a_hangup", {"call_id": call_id})
+
+    def test_update_phone_codecs_applies_to_next_call(self):
+        """update_phone(codecs=...) changes what the NEXT outgoing
+        INVITE offers."""
+        _add_phone(self.client, "a", SIP_USER_A, SIP_PASS_A,
+                   codecs=["PCMA", "telephone-event"])
+        _add_phone(self.client, "b", SIP_USER_B, SIP_PASS_B,
+                   auto_answer=True)
+        _wait_phone_registered(self.client, "a")
+        _wait_phone_registered(self.client, "b")
+
+        result = _parse_tool_result(self.client.call_tool("update_phone", {
+            "phone_id": "a",
+            "codecs": ["PCMU", "telephone-event"],
+        }))
+        assert result["status"] == "ok"
+        assert result["codecs"] == ["PCMU", "telephone-event"]
+
+        ra = _parse_tool_result(self.client.call_tool("a_make_call", {
+            "dest_uri": f"sip:{SIP_USER_B}@{SIP_DOMAIN}",
+        }))
+        time.sleep(2)
+
+        offers = _extract_sdp_offers(self.client, "a")
+        assert offers
+        assert "PCMU" in offers[-1], f"PCMU missing from latest offer: {offers[-1]}"
+        assert "a=rtpmap:8 PCMA" not in offers[-1], (
+            f"PCMA leaked into offer after update: {offers[-1]}"
+        )
+
+        self.client.call_tool("a_hangup", {"call_id": ra["call_id"]})
